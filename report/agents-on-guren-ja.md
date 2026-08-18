@@ -26,30 +26,7 @@ https://guren.dev
 
 https://x.com/gurenjs/status/2088966517383974956
 
-`guren context`は、プロジェクトの地図をMarkdownで出力します。モデル・ルート・ページ・コントローラの一覧に加えて、末尾にフレームワークAPIの署名ダイジェスト(検証済みの早見表)が付きます。
-
-```
-# Project Context
-
-## Stack
-- Framework: Guren ^1.6.1
-- Runtime: Bun
-- ORM: Drizzle
-- Frontend: React + Inertia.js
-
-## Models (2)
-### Post
-- Table: `posts`
-- belongsTo: `author` → PostAuthorSummary
-...
-## Guren API Signatures (digest)
-
-Verified quick reference — trust this and `.claude/rules/*.md` over grepping `node_modules/@guren/*`.
-
-### Models (@guren/orm)
-- Statics: `find(id)` → record | null · `findOrFail(id)` (throws, renders 404) · `first(where?)` ·
-  `all()` · `create(data)` · `update(where, data)` · `delete(where)` · `paginate(options?)` ·
-```
+`guren context`は、プロジェクトの地図をMarkdownで出力します(動画の前半)。モデル・ルート・ページ・コントローラの一覧に加えて、末尾にフレームワークAPIの署名ダイジェスト(検証済みの早見表)が付きます。本文で「ダイジェスト」と言っているのはこれのことです。
 
 `guren check`は、ルートとコントローラとページの配線、生成ファイルの有無、ルートファイルが実際にマウントされているか、といった整合性を検査します。たとえば後述するバグ入りのアプリで実行すると、こう指摘してくれます。
 
