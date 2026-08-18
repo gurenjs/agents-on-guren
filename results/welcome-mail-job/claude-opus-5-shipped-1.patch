@@ -1,0 +1,466 @@
+diff --git a/.env.example b/.env.example
+index 2850e51..19a908f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -25,7 +25,14 @@ QUEUE_CONNECTION=sync
+ 
+ MAIL_MAILER=log
+ # MAIL_MAILER=resend
++# MAIL_MAILER=smtp
+ RESEND_API_KEY=
++# Only read when MAIL_MAILER=smtp.
++# MAIL_HOST=localhost
++# MAIL_PORT=587
++# MAIL_ENCRYPTION=tls
++# MAIL_USERNAME=
++# MAIL_PASSWORD=
+ MAIL_FROM_ADDRESS=hello@example.com
+ MAIL_FROM_NAME="${APP_NAME}"
+ 
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..a09c22f 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -23,6 +24,11 @@ export default class RegisterController extends Controller {
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
++    // Queued rather than sent here: the request hands the message off and
++    // returns, so sign-up never waits on — or fails with — the mail provider.
++    // Only a registration that got this far queues anything.
++    await SendWelcomeEmailJob.dispatch({ userId: user.id, name: user.name, email: user.email })
++
+     return this.redirect('/dashboard')
+   }
+ }
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..d2e993f
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,45 @@
++import { getMailManager, Job } from '@guren/core'
++import { appMailManager } from '../../config/mail.js'
++import { WelcomeMail } from '../Mail/WelcomeMail.js'
++
++export interface SendWelcomeEmailJobPayload {
++  userId: number
++  name: string
++  email: string
++}
++
++/**
++ * Sends the welcome email out of band, so registration never waits on — or
++ * fails with — the mail provider. Registration dispatches it; delivery happens
++ * wherever the queue runs it (inline under QUEUE_CONNECTION=sync, in a worker
++ * under redis).
++ *
++ * The payload carries the name and address the account was registered with
++ * rather than only the id, so the message does not depend on reading the row
++ * back at delivery time.
++ */
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailJobPayload> {
++  // Pinned so queued messages survive a class rename or a bundler mangling
++  // identifiers — the worker resolves the class back from this name.
++  static override jobName = 'SendWelcomeEmailJob'
++  static override queue = 'default'
++  static override maxAttempts = 3
++
++  async handle(payload: SendWelcomeEmailJobPayload): Promise<void> {
++    // Resolved when the job runs, not when it is dispatched: the worker may be
++    // a different process than the one that queued the message, and its
++    // mailer — a real provider, the log transport, a test's recording one — is
++    // whatever is configured there.
++    const manager = getMailManager() ?? appMailManager()
++    const result = await new WelcomeMail(manager, { name: payload.name, email: payload.email }).send()
++
++    if (!result.success) {
++      // Throwing hands the message back to the queue's retry/backoff policy.
++      throw new Error(result.error ?? `Failed to send the welcome email to ${payload.email}`)
++    }
++  }
++
++  async failed(payload: SendWelcomeEmailJobPayload, error: Error): Promise<void> {
++    console.error(`SendWelcomeEmailJob failed for user ${payload.userId}:`, error.message)
++  }
++}
+diff --git a/app/Mail/WelcomeMail.ts b/app/Mail/WelcomeMail.ts
+new file mode 100644
+index 0000000..b5b8a91
+--- /dev/null
++++ b/app/Mail/WelcomeMail.ts
+@@ -0,0 +1,40 @@
++import { Mail, type MailManager } from '@guren/core'
++import { appName } from '../../config/app.js'
++import { mailFrom } from '../../config/mail.js'
++
++export interface WelcomeMailData {
++  /** The name the account was registered under. */
++  name: string
++  /** The address the account was registered with. */
++  email: string
++}
++
++/**
++ * The first message a new account gets. `build()` runs when the message is
++ * sent — inside the queued job, not the registration request.
++ */
++export class WelcomeMail extends Mail {
++  constructor(
++    manager: MailManager,
++    public readonly data: WelcomeMailData,
++  ) {
++    super(manager)
++  }
++
++  override build(): this {
++    const app = appName()
++
++    return this.from(mailFrom())
++      .to(this.data.email)
++      .subject(`Welcome to ${app}, ${this.data.name}!`)
++      .text(
++        [
++          `Hi ${this.data.name},`,
++          '',
++          `Welcome to ${app}! Your account is ready — sign in any time to write your first post.`,
++          '',
++          `— The ${app} team`,
++        ].join('\n'),
++      )
++  }
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..7604b6c
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,23 @@
++import { getMailManager, ServiceProvider, setMailManager } from '@guren/core'
++import { appMailManager } from '../../config/mail.js'
++
++/**
++ * Binds the mail manager configured in config/mail.ts — the framework's own
++ * provider would build an unconfigured one, with no transports and no sender.
++ *
++ * The same instance is published globally, because queued mail is sent outside
++ * a request, where there is no container to resolve it from.
++ */
++export default class MailProvider extends ServiceProvider {
++  register(): void {
++    this.container.singleton('mail', () => appMailManager())
++  }
++
++  boot(): void {
++    // A worker process — or a test pointing the app at a recording transport —
++    // may have installed its own manager already; leave it alone.
++    if (!getMailManager()) {
++      setMailManager(appMailManager())
++    }
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..6184f70
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,28 @@
++import { getQueueDriver, registerJob, ServiceProvider } from '@guren/core'
++import { appQueueManager } from '../../config/queue.js'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++/**
++ * Binds the queue manager configured in config/queue.ts and installs its
++ * default driver as the one `Job.dispatch()` pushes to.
++ *
++ * Every job class is registered here as well: a worker receives only the job's
++ * name over the queue and resolves the class back from this registry, so a job
++ * that is never registered can be dispatched but never run.
++ */
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    this.container.singleton('queue', () => appQueueManager())
++  }
++
++  boot(): void {
++    registerJob(SendWelcomeEmailJob)
++
++    // Resolving the default driver installs it globally. A worker process — or
++    // a test holding dispatched jobs instead of running them — may have
++    // installed its own driver already; leave it alone.
++    if (!getQueueDriver()) {
++      appQueueManager().driver()
++    }
++  }
++}
+diff --git a/config/app.ts b/config/app.ts
+index ba658cc..4db1185 100644
+--- a/config/app.ts
++++ b/config/app.ts
+@@ -6,6 +6,15 @@ import { configureOrm, seedDatabase } from './database.js'
+ let bootstrapped = false
+ const MIGRATIONS_FOLDER = fileURLToPath(new URL('../db/migrations', import.meta.url))
+ 
++/**
++ * The application's display name (APP_NAME in .env). Anything user-facing that
++ * names the app — email subjects, for one — reads it from here rather than
++ * hard-coding it, so renaming the app is an .env edit.
++ */
++export function appName(): string {
++  return process.env.APP_NAME?.trim() || 'Guren'
++}
++
+ function hasMigrations(): boolean {
+   if (!existsSync(MIGRATIONS_FOLDER)) {
+     return false
+diff --git a/config/mail.ts b/config/mail.ts
+new file mode 100644
+index 0000000..24a0a05
+--- /dev/null
++++ b/config/mail.ts
+@@ -0,0 +1,59 @@
++import { createMailManager, type MailAddress, type MailConfig, type MailManager } from '@guren/core'
++import { appName } from './app.js'
++
++/**
++ * The sender every message goes out as (MAIL_FROM_ADDRESS / MAIL_FROM_NAME).
++ *
++ * Mailables set it on the message explicitly rather than leaning on the
++ * manager's default, so the sender is the configured one no matter which
++ * manager sends the message — a worker's, or a test's recording one.
++ */
++export function mailFrom(): MailAddress {
++  return {
++    email: process.env.MAIL_FROM_ADDRESS?.trim() || 'hello@example.com',
++    name: process.env.MAIL_FROM_NAME?.trim() || appName(),
++  }
++}
++
++/**
++ * Transports are registered under their driver name and MAIL_MAILER picks the
++ * default, so switching development's `log` (messages printed to the server
++ * output) for a real provider is an .env edit — no code changes.
++ *
++ * Registration is lazy: a transport is only constructed when a message
++ * actually goes through it, so the unused ones never read their credentials.
++ */
++export function mailConfig(): MailConfig {
++  return {
++    default: process.env.MAIL_MAILER?.trim() || 'log',
++    from: mailFrom(),
++    transports: {
++      log: { driver: 'log' },
++      // Records messages instead of delivering them — for tests.
++      memory: { driver: 'memory' },
++      resend: { driver: 'resend', apiKey: process.env.RESEND_API_KEY ?? '' },
++      smtp: {
++        driver: 'smtp',
++        host: process.env.MAIL_HOST ?? 'localhost',
++        port: Number.parseInt(process.env.MAIL_PORT ?? '587', 10),
++        secure: process.env.MAIL_ENCRYPTION === 'tls',
++        auth:
++          process.env.MAIL_USERNAME || process.env.MAIL_PASSWORD
++            ? { user: process.env.MAIL_USERNAME ?? '', pass: process.env.MAIL_PASSWORD ?? '' }
++            : undefined,
++      },
++    },
++  }
++}
++
++let manager: MailManager | null = null
++
++/**
++ * The application's mail manager. MailProvider binds it into the container and
++ * publishes it as the global manager queued work sends through; a worker that
++ * only imports a job still gets the same configured manager from here.
++ */
++export function appMailManager(): MailManager {
++  manager ??= createMailManager(mailConfig())
++  return manager
++}
+diff --git a/config/queue.ts b/config/queue.ts
+new file mode 100644
+index 0000000..0e9b44a
+--- /dev/null
++++ b/config/queue.ts
+@@ -0,0 +1,35 @@
++import { createQueueManager, MemoryDriver, RedisDriver, SyncDriver, type QueueConfig, type QueueManager } from '@guren/core'
++import { createRedisClient } from '@guren/core/redis'
++
++/**
++ * QUEUE_CONNECTION picks the driver, so what dispatching a job means is an
++ * .env setting and never a code change:
++ *
++ * - `sync`   — runs the job inline, in the same process (development).
++ * - `memory` — keeps jobs in process memory until a worker pops them (tests).
++ * - `redis`  — hands them to Redis for a separate `guren queue:work` process.
++ *
++ * Drivers are constructed lazily by the manager, so the Redis client is only
++ * created when Redis is actually the connection in use.
++ */
++export function queueConfig(): QueueConfig {
++  return {
++    default: process.env.QUEUE_CONNECTION?.trim() || 'sync',
++    drivers: {
++      sync: () => new SyncDriver(),
++      memory: () => new MemoryDriver(),
++      redis: () => new RedisDriver(createRedisClient({ url: process.env.REDIS_URL })),
++    },
++  }
++}
++
++let manager: QueueManager | null = null
++
++/**
++ * The application's queue manager. QueueProvider binds it into the container
++ * and installs its default driver as the one `Job.dispatch()` pushes to.
++ */
++export function appQueueManager(): QueueManager {
++  manager ??= createQueueManager(queueConfig())
++  return manager
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..1b13722 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, QueueProvider, MailProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..727f535
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,109 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import {
++  createMailManager,
++  getMailManager,
++  getQueueDriver,
++  setMailManager,
++  setQueueDriver,
++  Worker,
++  type MailManager,
++  type QueueDriver,
++} from '@guren/core'
++import { fakeMail, fakeQueue, TestApp, type FakeMail, type FakeQueue } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { SendWelcomeEmailJob } from '../app/Jobs/SendWelcomeEmailJob.js'
++
++// Registration hands the welcome email to the queue instead of sending it, so
++// the two halves are exercised the way production splits them: the request
++// only queues, and a worker run afterwards is what delivers.
++describe('register', () => {
++  let http: TestApp
++  let queue: FakeQueue
++  let mails: FakeMail
++  let previousDriver: QueueDriver | null
++  let previousMailManager: MailManager | null
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++
++    previousDriver = getQueueDriver()
++    previousMailManager = getMailManager()
++  })
++
++  beforeEach(() => {
++    // Holds dispatched jobs instead of running them, so a request's own effects
++    // stay separable from the worker's.
++    queue = fakeQueue()
++    setQueueDriver(queue.getDriver())
++
++    // A manager with no default sender, so the message has to carry the
++    // configured one itself.
++    mails = fakeMail()
++    const manager = createMailManager({ default: 'fake' })
++    manager.registerTransport('fake', () => mails.getTransport())
++    setMailManager(manager)
++  })
++
++  afterAll(() => {
++    if (previousDriver) setQueueDriver(previousDriver)
++    if (previousMailManager) setMailManager(previousMailManager)
++  })
++
++  it('queues a welcome email that a worker delivers to the new account', async () => {
++    const csrf = await http.withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'analytical-engine',
++        passwordConfirmation: 'analytical-engine',
++      })
++      .assertRedirect('/dashboard')
++
++    // The request itself sent nothing — it only queued the work.
++    mails.assertNothingSent()
++    queue.assertPushedTimes(SendWelcomeEmailJob, 1)
++    expect(queue.all()).toHaveLength(1)
++
++    await new Worker(queue.getDriver(), { queues: ['default'], stopWhenEmpty: true }).start()
++
++    const sent = mails.sent()
++    expect(sent).toHaveLength(1)
++
++    const message = sent[0]!.message
++    expect(message.to.map((address) => address.email)).toEqual(['ada@example.com'])
++    expect(message.subject).toBe('Welcome to Guren, Ada Lovelace!')
++    expect(message.text).toContain('Hi Ada Lovelace,')
++    expect(message.from).toEqual({ email: 'hello@example.com', name: 'Guren' })
++  })
++
++  it('queues nothing when the registration is refused', async () => {
++    const csrf = await http.withCsrf()
++
++    // Invalid input: the passwords do not match.
++    await csrf
++      .post('/register', {
++        name: 'Grace Hopper',
++        email: 'grace@example.com',
++        password: 'nanosecond',
++        passwordConfirmation: 'nanoseconds',
++      })
++      .assertUnprocessable()
++
++    // And an email that is already registered.
++    await csrf
++      .post('/register', {
++        name: 'Ada Again',
++        email: 'ada@example.com',
++        password: 'analytical-engine',
++        passwordConfirmation: 'analytical-engine',
++      })
++      .assertUnprocessable()
++
++    queue.assertNothingPushed()
++    mails.assertNothingSent()
++  })
++})

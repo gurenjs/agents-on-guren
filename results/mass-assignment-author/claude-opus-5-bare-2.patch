@@ -1,0 +1,126 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..d13764e 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -89,8 +89,10 @@ export default class PostController extends Controller {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+-
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    const data = await this.validateBody(PostPayloadSchema)
++    // Post.update (not forceUpdate) so mass assignment stays bound to
++    // Post.fillable: `authorId` is owned by the session, never by the request.
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..ca7b20d 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,8 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +22,94 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// posts.update writes only what PostPayloadSchema validates, through
++// Post.update — so `authorId` (absent from Post.fillable) stays whatever the
++// session set at creation time, whatever the request body claims.
++describe('posts.update', () => {
++  let http: TestApp
++  let author: UserRecord
++  let stranger: UserRecord
++
++  const VALID = { title: 'Original', excerpt: 'Original excerpt.', body: 'Original body.' }
++
++  async function createPost() {
++    return await Post.forceCreate({ ...VALID, authorId: author.id })
++  }
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    const suffix = `${process.pid}-${performance.now().toString().replace('.', '')}`
++    author = await User.create({ name: 'Author', email: `author-${suffix}@example.com`, password: 'secret123' })
++    stranger = await User.create({ name: 'Stranger', email: `stranger-${suffix}@example.com`, password: 'secret123' })
++  })
++
++  it('applies a valid edit by the author', async () => {
++    const post = await createPost()
++    const agent = await http.actingAs(author).withCsrf(`/posts/${post.id}/edit`)
++
++    await agent.put(`/posts/${post.id}`, {
++      title: 'Renamed',
++      excerpt: 'New excerpt.',
++      body: 'New body.',
++    }).assertRedirect(`/posts/${post.id}`)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe('Renamed')
++    expect(updated.excerpt).toBe('New excerpt.')
++    expect(updated.body).toBe('New body.')
++    expect(updated.authorId).toBe(author.id)
++  })
++
++  it('ignores an authorId in the body', async () => {
++    const post = await createPost()
++    const agent = await http.actingAs(author).withCsrf(`/posts/${post.id}/edit`)
++
++    await agent.put(`/posts/${post.id}`, {
++      title: 'Renamed',
++      excerpt: 'Still mine?',
++      body: 'New body.',
++      authorId: stranger.id,
++    }).assertRedirect(`/posts/${post.id}`)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.authorId).toBe(author.id)
++    expect(updated.title).toBe('Renamed')
++  })
++
++  it('ignores fields outside the edit form', async () => {
++    const post = await createPost()
++    const agent = await http.actingAs(author).withCsrf(`/posts/${post.id}/edit`)
++
++    await agent.put(`/posts/${post.id}`, {
++      ...VALID,
++      createdAt: '1999-01-01T00:00:00.000Z',
++    }).assertRedirect(`/posts/${post.id}`)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.createdAt).toBe(post.createdAt)
++  })
++
++  it('refuses an invalid edit and leaves the post untouched', async () => {
++    const post = await createPost()
++    const agent = await http.actingAs(author).withCsrf(`/posts/${post.id}/edit`)
++
++    await agent.json().put(`/posts/${post.id}`, { title: '', excerpt: 'x', body: 'y' }).assertUnprocessable()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe(VALID.title)
++    expect(updated.excerpt).toBe(VALID.excerpt)
++    expect(updated.body).toBe(VALID.body)
++  })
++
++  it('refuses an edit by a non-author', async () => {
++    const post = await createPost()
++    const agent = await http.actingAs(stranger).withCsrf(`/posts/${post.id}`)
++
++    await agent.json().put(`/posts/${post.id}`, { ...VALID, title: 'Hijacked' }).assertForbidden()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe(VALID.title)
++    expect(updated.authorId).toBe(author.id)
++  })
++})

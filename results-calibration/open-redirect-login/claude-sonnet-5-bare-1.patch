@@ -1,0 +1,113 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..e146556 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,4 +1,4 @@
+-import { Controller, ValidationException } from '@guren/core'
++import { Controller, ValidationException, sanitizeOAuthRedirect } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+@@ -20,8 +20,13 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in. The
++    // value is attacker-controlled (it round-trips through the login form),
++    // so only an app-relative path is honored — anything pointing off-site
++    // (an absolute URL, `//host`, or a `/\host` backslash trick) falls back
++    // to the default destination.
++    const destination = sanitizeOAuthRedirect(redirect || this.request.query('redirect'))
++    return this.redirect(destination ?? '/dashboard')
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..6be243d
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,81 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// The login page accepts a `redirect` param so a signed-in user lands back on
++// the page that sent them to /login. That value is attacker-controlled (it
++// round-trips through the login form, or can be set directly via the query
++// string), so LoginController must only ever honor an app-relative path and
++// fall back to '/dashboard' for anything else — an open-redirect regression
++// here is a phishing vector.
++describe('login redirect handling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++    await User.create({ name: 'Ada Lovelace', email: 'ada@example.com', password: 'correct horse battery' })
++  })
++
++  it('sends the user to an app-relative redirect after a successful login', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct horse battery', redirect: '/posts/3/edit' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('falls back to the default destination for an absolute off-site redirect', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct horse battery', redirect: 'https://evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('falls back to the default destination for a protocol-relative redirect', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct horse battery', redirect: '//evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('falls back to the default destination for a backslash redirect trick', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct horse battery', redirect: '/\\evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('sends the user to the default destination when no redirect is given', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct horse battery' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('honors an app-relative redirect supplied via the query string', async () => {
++    const csrf = await http.withCsrf('/login?redirect=/posts/3/edit')
++    await csrf
++      .post('/login?redirect=/posts/3/edit', { email: 'ada@example.com', password: 'correct horse battery' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('falls back to the default destination for an off-site redirect supplied via the query string', async () => {
++    const csrf = await http.withCsrf('/login?redirect=https://evil.example')
++    await csrf
++      .post('/login?redirect=https://evil.example', { email: 'ada@example.com', password: 'correct horse battery' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('rejects a wrong password and does not authenticate the session', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'wrong', redirect: '/posts/3/edit' })
++      .assertUnprocessable()
++
++    // The same (still-a-guest) session cookie is reused, so a redirect away
++    // from /dashboard confirms the failed attempt never signed it in.
++    await csrf.get('/dashboard').assertRedirect('/login')
++  })
++})

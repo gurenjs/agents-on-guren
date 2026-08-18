@@ -1,0 +1,251 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..5bd3666 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -18,6 +18,10 @@ export interface ApiRoutes {
+     method: 'GET'
+     path: '/dashboard'
+   }
++  'health': {
++    method: 'GET'
++    path: '/health'
++  }
+   'home': {
+     method: 'GET'
+     path: '/'
+@@ -304,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ 
+ const routes: Record<string, { method: string; path: string }> = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..1105f0a 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -3,6 +3,7 @@
+ 
+ export const routeManifest = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+@@ -68,6 +69,7 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ 
+ export const routes = {
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
++  health: (query?: RouteQuery) => route('health', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+     (query?: RouteQuery) => route('login', query),
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..74e9cc7
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,28 @@
++import { Controller } from '@guren/core'
++import { healthManager } from '../../../config/health.js'
++
++export default class HealthController extends Controller {
++  /**
++   * Load balancers and uptime monitors route on the status code alone: 200
++   * while every check passes, 503 as soon as one fails. Each check catches its
++   * own errors, so a dead database is reported as unhealthy rather than
++   * escaping as a 500. The JSON body is what the ops dashboard reads.
++   */
++  async index(): Promise<Response> {
++    const report = await healthManager().check()
++
++    return this.json(
++      {
++        status: report.status,
++        timestamp: report.timestamp.toISOString(),
++        checks: report.checks.map((check) => ({
++          name: check.name,
++          status: check.status,
++          message: check.message,
++          durationMs: check.duration,
++        })),
++      },
++      { status: report.status === 'healthy' ? 200 : 503 },
++    )
++  }
++}
+diff --git a/config/health.ts b/config/health.ts
+new file mode 100644
+index 0000000..07221d3
+--- /dev/null
++++ b/config/health.ts
+@@ -0,0 +1,43 @@
++import { DatabaseCheck, createHealthManager, type DatabaseConnection, type HealthManager } from '@guren/core'
++import { sql } from 'drizzle-orm'
++import { getDatabase } from './database.js'
++
++/** A probe that hangs is as bad as one that throws — fail it instead of holding the request open. */
++const CHECK_TIMEOUT_MS = 3000
++
++/**
++ * `DatabaseCheck` wants a minimal `{ query(sql) }` connection while
++ * `getDatabase()` hands back the raw Drizzle handle, so bridge the two here.
++ * The handle is resolved on every call rather than captured once, so a
++ * connection that cannot be opened at all fails the check too — the whole
++ * point of the probe is that it never reports from a cached flag.
++ */
++const databaseConnection: DatabaseConnection = {
++  async query(statement: string): Promise<unknown> {
++    const db = (await getDatabase()) as { get(query: unknown): unknown }
++    return await db.get(sql.raw(statement))
++  },
++}
++
++/**
++ * The checks behind `GET /health`. `critical: true` makes a database failure
++ * turn the whole report unhealthy, which the endpoint answers with a 503 so
++ * the load balancer drains the instance instead of keeping a broken deploy in
++ * rotation. Pass a connection to exercise the failure path in tests.
++ */
++export function createAppHealthManager(
++  connection: DatabaseConnection = databaseConnection,
++  timeout: number = CHECK_TIMEOUT_MS,
++): HealthManager {
++  return createHealthManager().register(new DatabaseCheck(connection, { name: 'database' }), {
++    critical: true,
++    timeout,
++  })
++}
++
++const manager = createAppHealthManager()
++
++/** The application-wide manager — registering checks does not touch the database. */
++export function healthManager(): HealthManager {
++  return manager
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..1f1a5a6 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. It probes
++  // the database on every request and answers 503 when that fails, so a deploy
++  // that cannot reach its database is drained instead of kept in rotation.
++  router.get('/health', [HealthController, 'index']).name('health')
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..088a757
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,96 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { closeDatabase, configureOrm } from '../config/database.js'
++import { createAppHealthManager } from '../config/health.js'
++import app from '../src/app.js'
++
++describe('health', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('reports the database as healthy when the probe query succeeds', async () => {
++    const response = await http.get('/health').assertOk()
++    const body = await response.json<{
++      status: string
++      checks: Array<{ name: string; status: string }>
++    }>()
++
++    expect(body.status).toBe('healthy')
++    expect(body.checks).toContainEqual(expect.objectContaining({ name: 'database', status: 'healthy' }))
++  })
++
++  it('touches the database on every probe rather than caching the verdict', async () => {
++    let queries = 0
++    const manager = createAppHealthManager({
++      async query() {
++        queries += 1
++        return null
++      },
++    })
++
++    await manager.check()
++    await manager.check()
++
++    expect(queries).toBe(2)
++  })
++
++  it('reports unhealthy when the database query throws', async () => {
++    const manager = createAppHealthManager({
++      query() {
++        return Promise.reject(new Error('unable to open database file'))
++      },
++    })
++
++    const report = await manager.check()
++
++    expect(report.status).toBe('unhealthy')
++    expect(report.checks[0]).toMatchObject({ name: 'database', status: 'unhealthy' })
++  })
++
++  it('reports unhealthy when the database query never settles', async () => {
++    const manager = createAppHealthManager(
++      {
++        query() {
++          return new Promise<unknown>(() => {})
++        },
++      },
++      50,
++    )
++
++    const report = await manager.check()
++
++    expect(report.status).toBe('unhealthy')
++  })
++
++  // The whole point of the change: a deploy whose database cannot even be
++  // opened must fall out of the load balancer pool, so drop the connection and
++  // point it at a path SQLite cannot create.
++  it('answers 503 when the database connection cannot be opened', async () => {
++    const previous = process.env.TEST_DATABASE_URL
++    await closeDatabase()
++    process.env.TEST_DATABASE_URL = '/dev/null/unopenable/guren.db'
++
++    try {
++      const response = await http.get('/health').assertStatus(503)
++      const body = await response.json<{
++        status: string
++        checks: Array<{ name: string; status: string }>
++      }>()
++
++      expect(body.status).toBe('unhealthy')
++      expect(body.checks).toContainEqual(expect.objectContaining({ name: 'database', status: 'unhealthy' }))
++    } finally {
++      if (previous === undefined) {
++        delete process.env.TEST_DATABASE_URL
++      } else {
++        process.env.TEST_DATABASE_URL = previous
++      }
++      await closeDatabase()
++      // Rebind the ORM to the reopened handle for whatever runs next.
++      await configureOrm()
++    }
++  })
++})

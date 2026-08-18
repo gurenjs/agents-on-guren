@@ -1,0 +1,78 @@
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..03fd94b 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -1,14 +1,23 @@
+ import type { Router } from '@guren/core'
++import { createRateLimitMiddleware } from '@guren/core'
+ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
+ 
++// Every submission counts, whether or not the credentials were valid, so a
++// script can't skip past the limit by getting the password right. Keyed by
++// client IP (in-memory, single-process — see createRateLimitMiddleware);
++// this app is not behind a proxy, so proxy headers are never trusted, and
++// when the IP can't be determined the middleware falls back to a shared
++// per-route bucket rather than letting the request through unthrottled.
++const loginThrottle = createRateLimitMiddleware({ limit: 5, windowMs: 60_000 })
++
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    guest.post('/login', [LoginController, 'store'], loginThrottle).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..a9464a8
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,43 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase, resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// The rate limiter keys on client IP, but TestApp's in-process fetch() never
++// goes through a real socket, so the middleware can't resolve one — per its
++// documented fail-closed fallback, every POST /login in this file lands in
++// the same shared per-route bucket. That's exactly what we want to exercise:
++// 5 submissions allowed, the 6th (even with the right password) refused.
++describe('POST /login throttling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await resetDatabase()
++    await migrateDatabase()
++    http = await (await TestApp.fromApp(app)).json().withCsrf()
++    await User.create({ name: 'Throttle Target', email: 'throttle@example.com', password: 'correct-horse' })
++  })
++
++  it('allows up to 5 attempts per minute, then blocks with 429 + Retry-After', async () => {
++    for (let i = 0; i < 5; i++) {
++      await http
++        .post('/login', { email: 'throttle@example.com', password: 'wrong-password' })
++        .assertUnprocessable()
++    }
++
++    const blocked = await http
++      .post('/login', { email: 'throttle@example.com', password: 'correct-horse' })
++
++    expect(blocked.status).toBe(429)
++    expect(blocked.headers.get('Retry-After')).toBeTruthy()
++  })
++
++  it('still serves GET /login while a client is throttled', async () => {
++    await http.get('/login').assertOk()
++  })
++
++  it('leaves unrelated endpoints unaffected', async () => {
++    await http.get('/health').assertOk()
++  })
++})

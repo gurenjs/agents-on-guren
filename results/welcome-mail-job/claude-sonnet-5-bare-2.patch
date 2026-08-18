@@ -1,0 +1,275 @@
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..d79af8d 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -20,6 +21,10 @@ export default class RegisterController extends Controller {
+     // `passwordHash` before persisting — see app/Models/User.ts.
+     const user = await User.create({ name, email, password })
+ 
++    // Queued rather than sent inline — a slow or down mail provider must
++    // never delay or fail this response.
++    await SendWelcomeEmailJob.dispatch({ email: user.email, name: user.name })
++
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..d4b68c0
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,30 @@
++import { Job, getMailManager, mail } from '@guren/core'
++
++export interface SendWelcomeEmailJobPayload {
++  email: string
++  name: string
++}
++
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailJobPayload> {
++  static override queue = 'default'
++  static override maxAttempts = 3
++
++  async handle({ email, name }: SendWelcomeEmailJobPayload): Promise<void> {
++    const manager = getMailManager()
++    if (!manager) {
++      throw new Error('Mail manager not configured — call setMailManager() before dispatching this job.')
++    }
++
++    const appName = process.env.APP_NAME ?? 'Guren'
++
++    await mail(manager)
++      .to(email)
++      .subject(`Welcome to ${appName}, ${name}!`)
++      .text(`Hi ${name},\n\nWelcome to ${appName}! We're glad you're here.`)
++      .send()
++  }
++
++  async failed(payload: SendWelcomeEmailJobPayload, error: Error): Promise<void> {
++    console.error(`SendWelcomeEmailJob failed for ${payload.email}:`, error.message)
++  }
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..d9a5214
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,15 @@
++import { ServiceProvider, createMailManager, setMailManager, type MailManager } from '@guren/core'
++import { mailConfig } from '../../config/mail.js'
++
++export default class MailProvider extends ServiceProvider {
++  register(): void {
++    this.container.singleton('mail', () => createMailManager(mailConfig))
++  }
++
++  boot(): void {
++    // Queued mail (Mail.queue() / mail jobs) resolves the manager through
++    // this global rather than the container, since a worker process boots
++    // independently of any request's DI container.
++    setMailManager(this.container.make<MailManager>('mail'))
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..7f58363
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,20 @@
++import { ServiceProvider, registerJob, createQueueManager, type QueueManager } from '@guren/core'
++import { queueConfig } from '../../config/queue.js'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    this.container.singleton('queue', () => createQueueManager(queueConfig))
++  }
++
++  boot(): void {
++    // Job classes must be registered before anything dispatches — the sync
++    // driver runs a job inline on push and needs to resolve it by name, and
++    // a worker process resolves it the same way when popping from Redis.
++    registerJob(SendWelcomeEmailJob)
++
++    // Resolving the default driver also makes it the global driver that
++    // Job.dispatch() reads — see QueueManager.driver().
++    this.container.make<QueueManager>('queue').driver()
++  }
++}
+diff --git a/config/mail.ts b/config/mail.ts
+new file mode 100644
+index 0000000..6d18fb7
+--- /dev/null
++++ b/config/mail.ts
+@@ -0,0 +1,24 @@
++import type { MailConfig } from '@guren/core'
++
++// MAIL_MAILER=log (default) writes outgoing mail to the server console —
++// nothing to configure for local development. MAIL_MAILER=resend sends for
++// real through RESEND_API_KEY. MAIL_MAILER=memory keeps messages in memory
++// instead of sending them, for tests that assert on what was sent.
++function resolveDefaultTransport(): string {
++  if (process.env.MAIL_MAILER === 'resend') return 'resend'
++  if (process.env.MAIL_MAILER === 'memory') return 'memory'
++  return 'log'
++}
++
++export const mailConfig: MailConfig = {
++  default: resolveDefaultTransport(),
++  from: {
++    email: process.env.MAIL_FROM_ADDRESS ?? 'noreply@example.com',
++    name: process.env.MAIL_FROM_NAME ?? process.env.APP_NAME ?? 'Guren',
++  },
++  transports: {
++    log: { driver: 'log' },
++    memory: { driver: 'memory' },
++    resend: { driver: 'resend', apiKey: process.env.RESEND_API_KEY ?? '' },
++  },
++}
+diff --git a/config/queue.ts b/config/queue.ts
+new file mode 100644
+index 0000000..8b26b1d
+--- /dev/null
++++ b/config/queue.ts
+@@ -0,0 +1,22 @@
++import { MemoryDriver, SyncDriver, RedisDriver, createRedisClient, type QueueConfig } from '@guren/core'
++
++// QUEUE_CONNECTION=sync (default) runs queued work inline, in the same
++// process that dispatched it — nothing else to run locally, and failures
++// surface immediately. QUEUE_CONNECTION=redis defers work to REDIS_URL for a
++// separate worker process to pick up. QUEUE_CONNECTION=memory holds
++// dispatched work without running it, for tests that assert on what got
++// queued before running it themselves.
++function resolveDefaultDriver(): string {
++  if (process.env.QUEUE_CONNECTION === 'redis') return 'redis'
++  if (process.env.QUEUE_CONNECTION === 'memory') return 'memory'
++  return 'sync'
++}
++
++export const queueConfig: QueueConfig = {
++  default: resolveDefaultDriver(),
++  drivers: {
++    sync: () => new SyncDriver(),
++    memory: () => new MemoryDriver(),
++    redis: () => new RedisDriver(createRedisClient({ url: process.env.REDIS_URL })),
++  },
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..e179e36 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, MailProvider, QueueProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..623a3f3
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,83 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import {
++  MemoryDriver,
++  MemoryTransport,
++  createMailManager,
++  processJob,
++  setMailManager,
++  setQueueDriver,
++} from '@guren/core'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++
++describe('registration', () => {
++  let http: TestApp
++  let queueDriver: MemoryDriver
++  let mailTransport: MemoryTransport
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    // Point the queue at a holding driver (records dispatches without
++    // running them) and the mailer at a transport that records what's sent,
++    // instead of the sync/log drivers the app boots with for development.
++    queueDriver = new MemoryDriver()
++    setQueueDriver(queueDriver)
++
++    const mailManager = createMailManager({
++      default: 'memory',
++      from: { email: 'hello@example.com', name: 'Guren' },
++      transports: { memory: { driver: 'memory' } },
++    })
++    mailTransport = mailManager.transport('memory') as MemoryTransport
++    setMailManager(mailManager)
++  })
++
++  it('queues a welcome email without sending it, then delivers it once the job runs', async () => {
++    const csrf = await http.withCsrf('/register')
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertRedirect('/dashboard')
++
++    expect(await queueDriver.size('default')).toBe(1)
++    expect(mailTransport.getMessages()).toHaveLength(0)
++
++    const processed = await processJob(queueDriver, 'default')
++    expect(processed).toBe(true)
++
++    const messages = mailTransport.getMessages()
++    expect(messages).toHaveLength(1)
++    const [message] = messages
++    expect(message.to).toEqual([{ email: 'ada@example.com' }])
++    expect(message.subject).toBe('Welcome to Guren, Ada Lovelace!')
++    expect(message.from?.email).toBe('hello@example.com')
++    expect(message.text).toContain('Ada Lovelace')
++  })
++
++  it('queues nothing and sends nothing when registration is refused', async () => {
++    const csrf = await http.withCsrf('/register')
++
++    await csrf
++      .post('/register', {
++        name: 'Grace Hopper',
++        email: 'not-an-email',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertUnprocessable()
++
++    expect(await queueDriver.size('default')).toBe(0)
++    expect(mailTransport.getMessages()).toHaveLength(0)
++  })
++})

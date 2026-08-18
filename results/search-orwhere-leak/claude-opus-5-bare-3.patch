@@ -1,0 +1,112 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..fa47884 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -35,12 +35,15 @@ export default class PostController extends Controller {
+ 
+     const posts = await Post.newQuery()
+       .with('author')
++      .where('published', true)
++      // The keyword matches are OR-ed inside their own group, so the
++      // `published` filter above stays AND-ed with the whole group and can
++      // never be satisfied by a keyword match alone.
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
+       .orderBy('id', 'desc')
+       .limit(limit)
+diff --git a/tests/PostSearch.test.ts b/tests/PostSearch.test.ts
+new file mode 100644
+index 0000000..fb7a675
+--- /dev/null
++++ b/tests/PostSearch.test.ts
+@@ -0,0 +1,85 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++import { User } from '../app/Models/User.js'
++
++// posts.search must never leak unpublished posts: they are kept out of /posts
++// and 404 on /posts/<id>, so the search box has to hold the same line. The
++// fixtures below use nonsense words so they cannot collide with seeded posts.
++describe('posts.search excludes unpublished posts', () => {
++  let http: TestApp
++  let authorId: number
++  const createdPostIds: number[] = []
++
++  async function makePost(title: string, excerpt: string, published: boolean): Promise<number> {
++    // forceCreate, because `authorId` and `published` are deliberately absent
++    // from Post.fillable — a fixture is trusted server-side data.
++    const post = await Post.forceCreate({ title, excerpt, body: 'Fixture body.', authorId, published })
++    createdPostIds.push(post.id)
++    return post.id
++  }
++
++  async function search(keywords: string[]): Promise<PostResourceData[]> {
++    const response = await http.query('/posts/search', { keywords }).assertOk()
++    const payload = (await response.json()) as { data: PostResourceData[] }
++    return payload.data
++  }
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    const author = await User.forceCreate({
++      name: 'Search Fixture Author',
++      email: `search-fixture-${process.pid}@example.com`,
++      passwordHash: 'fixture',
++    })
++    authorId = author.id
++
++    await makePost('A zephyrquill in the title', 'Published and matching.', true)
++    await makePost('Draft zephyrquill', 'Unpublished and matching.', false)
++    await makePost('Draft about marmalade', 'Unpublished, second keyword.', false)
++    await makePost('Nothing to see here', 'A published post with no keyword.', true)
++  })
++
++  afterAll(async () => {
++    for (const id of createdPostIds) {
++      await Post.delete({ id })
++    }
++    await User.delete({ id: authorId })
++  })
++
++  it('returns only the published post for a single keyword', async () => {
++    const data = await search(['zephyrquill'])
++
++    expect(data.map((post) => post.title)).toEqual(['A zephyrquill in the title'])
++  })
++
++  it('returns only published posts for several keywords', async () => {
++    const data = await search(['zephyrquill', 'marmalade'])
++
++    expect(data.map((post) => post.title)).toEqual(['A zephyrquill in the title'])
++  })
++
++  it('returns nothing for a keyword that only unpublished posts contain', async () => {
++    const data = await search(['marmalade'])
++
++    expect(data).toEqual([])
++  })
++
++  it('does not pad the results with posts that match no keyword', async () => {
++    const data = await search(['zephyrquill'])
++
++    expect(data.some((post) => post.title === 'Nothing to see here')).toBe(false)
++  })
++
++  it('matches the excerpt as well as the title', async () => {
++    const excerptOnlyId = await makePost('An unremarkable heading', 'Contains grumbleflask in the excerpt.', true)
++    await makePost('Draft heading', 'Also contains grumbleflask, but unpublished.', false)
++
++    const data = await search(['grumbleflask'])
++
++    expect(data.map((post) => post.id)).toEqual([excerptOnlyId])
++  })
++})

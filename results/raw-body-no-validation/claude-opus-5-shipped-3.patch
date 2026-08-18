@@ -1,0 +1,119 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..1e2905a
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,76 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    user = await User.create({
++      name: 'Ada Lovelace',
++      email: 'ada@example.com',
++      password: 'analytical-engine',
++    })
++  })
++
++  it('saves a valid update', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', { name: 'Ada King', email: 'Ada.King@Example.com', password: '' })
++      .assertOk()
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.name).toBe('Ada King')
++    expect(refreshed.email).toBe('ada.king@example.com')
++  })
++
++  it('rejects a malformed email and changes nothing', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.json().put('/profile', { name: 'Ada Lovelace', email: 'not-an-email' })
++      .assertUnprocessable()
++      .assertJsonPath('errors.email.0', 'Enter a valid email address.')
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.email).toBe('ada@example.com')
++  })
++
++  it('rejects an empty name', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.json().put('/profile', { name: '   ', email: 'ada@example.com' })
++      .assertUnprocessable()
++      .assertJsonPath('errors.name.0', 'Name is required.')
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.name).toBe('Ada Lovelace')
++  })
++
++  it('rejects a too-short password but keeps it when blank', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.json().put('/profile', { name: 'Ada Lovelace', email: 'ada@example.com', password: 'short' })
++      .assertUnprocessable()
++      .assertJsonPath('errors.password.0', 'Password must be at least 8 characters.')
++  })
++
++  it('ignores fields the profile form does not have', async () => {
++    const before = await User.findOrFail(user.id)
++
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', {
++      name: 'Ada Lovelace',
++      email: 'ada@example.com',
++      id: 9999,
++      passwordHash: 'injected',
++    }).assertOk()
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.id).toBe(before.id)
++    expect(refreshed.passwordHash).toBe(before.passwordHash)
++  })
++})

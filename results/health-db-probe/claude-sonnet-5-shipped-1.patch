@@ -1,0 +1,146 @@
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..76d8336 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,9 +1,29 @@
+-import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import { Router, requireAuthenticated, requireGuest, HealthManager, DatabaseCheck, type DatabaseConnection } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
++import { getDatabase } from '../config/database.js'
++
++// `getDatabase()` is typed `Promise<unknown>` at the `createSqliteDatabase()`
++// boundary; `run()` is the one method every Drizzle SQL driver exposes for a
++// raw query, so that's all this adapter assumes about the concrete instance.
++interface RunnableDatabase {
++  run(query: string): unknown
++}
++
++const databaseConnection: DatabaseConnection = {
++  async query(sql) {
++    const db = (await getDatabase()) as RunnableDatabase
++    return db.run(sql)
++  },
++}
++
++// `critical: true` — without it a failing DB check only degrades the overall
++// report (still HTTP 200 from HealthManager's status mapping); ops needs a
++// 503 so the load balancer actually drains traffic from a bad deploy.
++const healthManager = new HealthManager().register(new DatabaseCheck(databaseConnection), { critical: true })
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
+   // Named rather than inline so `guren audit` can see which routes are
+@@ -14,8 +34,24 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors — actually
++  // probes the database on every request so a deploy with a broken DB
++  // connection reports unhealthy (503) instead of a static 200.
++  router.get('/health', async (c) => {
++    const report = await healthManager.check()
++    return c.json(
++      {
++        status: report.status,
++        checks: Object.fromEntries(
++          report.checks.map((check) => [
++            check.name,
++            { status: check.status, message: check.message, duration: check.duration },
++          ]),
++        ),
++      },
++      report.status === 'unhealthy' ? 503 : 200,
++    )
++  })
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/health.test.ts b/tests/health.test.ts
+new file mode 100644
+index 0000000..457e8fe
+--- /dev/null
++++ b/tests/health.test.ts
+@@ -0,0 +1,78 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { DatabaseCheck, HealthManager } from '@guren/core'
++import app from '../src/app.js'
++
++describe('GET /health', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('reports healthy and includes a database check when the db is reachable', async () => {
++    const res = await http.get('/health')
++    res.assertOk()
++    const body = await res.json<{ status: string; checks: Record<string, { status: string }> }>()
++
++    expect(body.status).toBe('healthy')
++    expect(body.checks.database?.status).toBe('healthy')
++  })
++})
++
++// The route wires HealthManager + DatabaseCheck with `critical: true` so a
++// failing database query drains traffic instead of staying "ok" — this is
++// what shipped broken last time. Exercised directly against the same
++// primitives the route uses, since forcing the real SQLite connection to
++// fail without leaving it broken for later tests is impractical.
++describe('health check wiring (critical database check)', () => {
++  it('maps a failing database query to an unhealthy report', async () => {
++    const manager = new HealthManager().register(
++      new DatabaseCheck({
++        async query() {
++          throw new Error('connection refused')
++        },
++      }),
++      { critical: true },
++    )
++
++    const report = await manager.check()
++
++    expect(report.status).toBe('unhealthy')
++    expect(report.checks).toHaveLength(1)
++    expect(report.checks[0]).toMatchObject({ name: 'database', status: 'unhealthy' })
++  })
++
++  it('would drive a 503 from the route, matching its status-code mapping', async () => {
++    const manager = new HealthManager().register(
++      new DatabaseCheck({
++        async query() {
++          throw new Error('timeout')
++        },
++      }),
++      { critical: true },
++    )
++
++    const report = await manager.check()
++    const statusCode = report.status === 'unhealthy' ? 503 : 200
++
++    expect(statusCode).toBe(503)
++  })
++
++  it('stays healthy (200) when the database query succeeds', async () => {
++    const manager = new HealthManager().register(
++      new DatabaseCheck({
++        async query() {
++          return { ok: true }
++        },
++      }),
++      { critical: true },
++    )
++
++    const report = await manager.check()
++    const statusCode = report.status === 'unhealthy' ? 503 : 200
++
++    expect(report.status).toBe('healthy')
++    expect(statusCode).toBe(200)
++  })
++})

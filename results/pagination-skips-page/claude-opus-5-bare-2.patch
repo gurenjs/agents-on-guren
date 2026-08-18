@@ -1,0 +1,125 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/tests/PostsPagination.test.ts b/tests/PostsPagination.test.ts
+new file mode 100644
+index 0000000..a96a78e
+--- /dev/null
++++ b/tests/PostsPagination.test.ts
+@@ -0,0 +1,106 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp, readInertiaResponse } from '@guren/testing'
++import type { PaginatedPageProps } from '@guren/core'
++import { eq } from 'drizzle-orm'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++import { getDatabase, migrateDatabase } from '../config/database.js'
++import { posts, users } from '../db/schema.js'
++import app from '../src/app.js'
++
++const TOTAL_POSTS = 25
++const PER_PAGE = 10
++const AUTHOR_EMAIL = 'pagination@example.com'
++
++// `/posts` lists the newest posts first, ten to a page. These tests pin the
++// off-by-one that made page 1 start at the 11th newest post: the page the
++// query reads must be the page the request asked for, and the pager meta must
++// describe the slice actually rendered.
++describe('posts.index pagination', () => {
++  let http: TestApp
++  let authorId: number
++
++  beforeAll(async () => {
++    // Boot first, so the on-boot seeder cannot re-fill `posts` behind the
++    // fixtures this file installs. The list is asserted post by post, so the
++    // table has to hold exactly the 25 fixtures and nothing else.
++    http = await TestApp.fromApp(app)
++
++    await migrateDatabase()
++    const db = await getDatabase()
++    await db.delete(posts)
++    await db.delete(users).where(eq(users.email, AUTHOR_EMAIL))
++
++    const [author] = await db
++      .insert(users)
++      .values({ name: 'Pagination Author', email: AUTHOR_EMAIL, passwordHash: 'x' })
++      .returning()
++    authorId = author!.id
++
++    await db.insert(posts).values(
++      Array.from({ length: TOTAL_POSTS }, (_, index) => ({
++        title: `Post ${index + 1}`,
++        excerpt: `Excerpt ${index + 1}`,
++        body: `Body ${index + 1}`,
++        authorId,
++      })),
++    )
++  })
++
++  afterAll(async () => {
++    const db = await getDatabase()
++    await db.delete(posts).where(eq(posts.authorId, authorId))
++    await db.delete(users).where(eq(users.id, authorId))
++  })
++
++  async function listPage(path: string): Promise<PaginatedPageProps<PostResourceData>> {
++    const response = await http.get(path).assertOk()
++    const { payload } = await readInertiaResponse(response.raw)
++    return payload.props as unknown as PaginatedPageProps<PostResourceData>
++  }
++
++  it('starts at the newest post without an explicit page', async () => {
++    const props = await listPage('/posts')
++
++    expect(props.data.map((post) => post.title)).toEqual(
++      Array.from({ length: PER_PAGE }, (_, index) => `Post ${TOTAL_POSTS - index}`),
++    )
++    expect(props.pagination.meta).toMatchObject({
++      currentPage: 1,
++      lastPage: 3,
++      perPage: PER_PAGE,
++      total: TOTAL_POSTS,
++      from: 1,
++      to: 10,
++    })
++    expect(props.pagination.links.pages.find((page) => page.active)?.page).toBe(1)
++    expect(props.pagination.links.prev).toBeNull()
++  })
++
++  it('treats ?page=1 as the same first page', async () => {
++    const first = await listPage('/posts')
++    const explicit = await listPage('/posts?page=1')
++
++    expect(explicit.data.map((post) => post.id)).toEqual(first.data.map((post) => post.id))
++    expect(explicit.pagination.meta.currentPage).toBe(1)
++  })
++
++  it('walks every post exactly once across the pages', async () => {
++    const seen: number[] = []
++    for (const page of [1, 2, 3]) {
++      const props = await listPage(`/posts?page=${page}`)
++      expect(props.pagination.meta.currentPage).toBe(page)
++      seen.push(...props.data.map((post) => post.id))
++    }
++
++    expect(seen).toHaveLength(TOTAL_POSTS)
++    expect(new Set(seen).size).toBe(TOTAL_POSTS)
++  })
++
++  it('describes the last page with the right window', async () => {
++    const props = await listPage('/posts?page=3')
++
++    expect(props.data.map((post) => post.title)).toEqual(['Post 5', 'Post 4', 'Post 3', 'Post 2', 'Post 1'])
++    expect(props.pagination.meta).toMatchObject({ currentPage: 3, from: 21, to: 25 })
++    expect(props.pagination.links.next).toBeNull()
++  })
++})

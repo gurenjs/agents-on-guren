@@ -1,0 +1,138 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..5bd3666 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -18,6 +18,10 @@ export interface ApiRoutes {
+     method: 'GET'
+     path: '/dashboard'
+   }
++  'health': {
++    method: 'GET'
++    path: '/health'
++  }
+   'home': {
+     method: 'GET'
+     path: '/'
+@@ -304,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ 
+ const routes: Record<string, { method: string; path: string }> = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..1105f0a 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -3,6 +3,7 @@
+ 
+ export const routeManifest = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+@@ -68,6 +69,7 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ 
+ export const routes = {
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
++  health: (query?: RouteQuery) => route('health', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+     (query?: RouteQuery) => route('login', query),
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..687924d
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,42 @@
++import { Controller } from '@guren/core'
++import { sql } from 'drizzle-orm'
++import type { SQLiteBunDatabase } from 'drizzle-orm/bun-sqlite'
++import { getDatabase } from '../../../config/database.js'
++
++const DB_CHECK_TIMEOUT_MS = 3000
++
++// bun:sqlite queries run synchronously, so this guards against a hang inside
++// `fn` itself rather than a pending Promise — a defensive backstop, not the
++// common case for a local SQLite file.
++function runWithTimeout<T>(fn: () => T, ms: number): Promise<T> {
++  return new Promise<T>((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
++    try {
++      resolve(fn())
++    } catch (error) {
++      reject(error)
++    } finally {
++      clearTimeout(timer)
++    }
++  })
++}
++
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    try {
++      // Real round trip on every probe — a stale "ok" here is exactly the
++      // failure mode this endpoint exists to catch (see task background).
++      const db = (await getDatabase()) as SQLiteBunDatabase
++      await runWithTimeout(() => db.get(sql`select 1`), DB_CHECK_TIMEOUT_MS)
++
++      return this.json({ status: 'ok', checks: { db: { status: 'ok' } } })
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error)
++
++      return this.json(
++        { status: 'error', checks: { db: { status: 'error', message } } },
++        { status: 503 },
++      )
++    }
++  }
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..b5657f5 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors — verifies
++  // the database is actually reachable rather than answering a static 200.
++  router.get('/health', [HealthController, 'index']).name('health')
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..94fc29e
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,19 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++
++describe('HealthController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('reports ok with a per-check database status when the database is reachable', async () => {
++    await http
++      .get('/health')
++      .assertOk()
++      .assertJsonPath('status', 'ok')
++      .assertJsonPath('checks.db.status', 'ok')
++  })
++})

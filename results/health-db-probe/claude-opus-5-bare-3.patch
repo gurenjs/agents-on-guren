@@ -1,0 +1,219 @@
+diff --git a/app/Health/HealthCheck.ts b/app/Health/HealthCheck.ts
+new file mode 100644
+index 0000000..3906a42
+--- /dev/null
++++ b/app/Health/HealthCheck.ts
+@@ -0,0 +1,109 @@
++import { sql } from 'drizzle-orm'
++import { getDatabase } from '../../config/database.js'
++
++/**
++ * A probe that never answers is as broken as one that throws: the platform
++ * gives up on the request long before a stuck driver does, and an unanswered
++ * probe leaves the deploy in the load-balancer pool. Bound it here instead.
++ */
++const DB_PROBE_TIMEOUT_MS = 2_000
++
++export type CheckStatus = 'ok' | 'error'
++
++export interface CheckResult {
++  status: CheckStatus
++  durationMs: number
++  /** Only set when the check failed — the ops dashboard shows it verbatim. */
++  message?: string
++}
++
++export interface HealthReport {
++  status: CheckStatus
++  checks: { db: CheckResult }
++  timestamp: string
++}
++
++/**
++ * Drizzle handles differ per driver: the sqlite dialect runs a raw statement
++ * through `run()`, the async drivers (postgres, mysql) through `execute()`.
++ * Typed structurally so swapping the driver in config/database.ts needs no
++ * change here — `getDatabase()` itself is only typed as `unknown`.
++ */
++type RawStatementRunner = {
++  run?: (statement: unknown) => unknown
++  execute?: (statement: unknown) => unknown
++}
++
++/**
++ * Opens the connection (the first call also applies pending migrations) and
++ * runs the cheapest statement there is. Deliberately no caching: the probe is
++ * only worth anything if it touches the database on every request.
++ */
++export async function probeDatabase(): Promise<void> {
++  const db = (await getDatabase()) as RawStatementRunner
++  const statement = sql`select 1`
++
++  if (typeof db.run === 'function') {
++    await db.run(statement)
++    return
++  }
++
++  if (typeof db.execute === 'function') {
++    await db.execute(statement)
++    return
++  }
++
++  throw new Error('The database handle exposes neither run() nor execute().')
++}
++
++async function withTimeout(probe: Promise<void>, ms: number): Promise<void> {
++  let timer: ReturnType<typeof setTimeout> | undefined
++
++  try {
++    await Promise.race([
++      probe,
++      new Promise<never>((_resolve, reject) => {
++        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
++      }),
++    ])
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++/**
++ * Runs `probe` and turns anything that goes wrong — a throw, a rejection, a
++ * connection that cannot be opened, a hang — into a failed check rather than
++ * an exception, so the endpoint answers 503 instead of 500.
++ */
++export async function checkDatabase(probe: () => Promise<void> = probeDatabase): Promise<CheckResult> {
++  const startedAt = Date.now()
++
++  try {
++    await withTimeout(Promise.resolve().then(probe), DB_PROBE_TIMEOUT_MS)
++    return { status: 'ok', durationMs: Date.now() - startedAt }
++  } catch (error) {
++    return {
++      status: 'error',
++      durationMs: Date.now() - startedAt,
++      message: error instanceof Error ? error.message : String(error),
++    }
++  }
++}
++
++/** The database is the only dependency worth draining traffic over, for now. */
++export async function runHealthChecks(probe?: () => Promise<void>): Promise<HealthReport> {
++  const checks = { db: await checkDatabase(probe) }
++  const failed = Object.values(checks).some((check) => check.status !== 'ok')
++
++  return {
++    status: failed ? 'error' : 'ok',
++    checks,
++    timestamp: new Date().toISOString(),
++  }
++}
++
++/** 503 is what drains a deploy from the pool; a failed check must never read as 200 or 500. */
++export function healthStatusCode(report: HealthReport): 200 | 503 {
++  return report.status === 'ok' ? 200 : 503
++}
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..e56cc30
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,10 @@
++import { Controller } from '@guren/core'
++import { healthStatusCode, runHealthChecks } from '../../Health/HealthCheck.js'
++
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    const report = await runHealthChecks()
++
++    return this.json(report, { status: healthStatusCode(report) })
++  }
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..9cfdf4c 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. It probes
++  // the database on every request and answers 503 when that fails, so a
++  // deploy that cannot reach its database is drained from the pool.
++  router.get('/health', [HealthController, 'index'])
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..0301f57
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,59 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { checkDatabase, healthStatusCode, runHealthChecks } from '../app/Health/HealthCheck.js'
++
++describe('GET /health', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('answers 200 with a per-check status while the database is reachable', async () => {
++    const response = await http.get('/health').assertOk().assertJsonPath('status', 'ok')
++
++    await response.assertJsonPath('checks.db.status', 'ok')
++  })
++})
++
++describe('health checks', () => {
++  it('reports the database as ok when the probe succeeds', async () => {
++    const report = await runHealthChecks(async () => {})
++
++    expect(report.status).toBe('ok')
++    expect(report.checks.db.status).toBe('ok')
++    expect(healthStatusCode(report)).toBe(200)
++  })
++
++  it('reports 503 rather than a throw when the query fails', async () => {
++    const report = await runHealthChecks(async () => {
++      throw new Error('unable to open database file')
++    })
++
++    expect(report.status).toBe('error')
++    expect(report.checks.db.status).toBe('error')
++    expect(report.checks.db.message).toBe('unable to open database file')
++    expect(healthStatusCode(report)).toBe(503)
++  })
++
++  it('fails the check when the connection cannot even be opened', async () => {
++    const check = await checkDatabase(() => {
++      throw new Error('connection refused')
++    })
++
++    expect(check.status).toBe('error')
++  })
++
++  it('touches the database on every probe rather than caching the result', async () => {
++    let probes = 0
++    const probe = async () => {
++      probes += 1
++    }
++
++    await runHealthChecks(probe)
++    await runHealthChecks(probe)
++
++    expect(probes).toBe(2)
++  })
++})

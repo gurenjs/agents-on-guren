@@ -1,0 +1,147 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..04685a0 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,7 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:date{.+}'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +312,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..95261c1 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..f2b7783 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -31,8 +31,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
++    // `:date*` is a plain named segment in this router (it only matches one
++    // path component, param key "date*"), not a multi-segment wildcard — use
++    // a regex param to capture the rest of the path, slash included.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:date{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..eccd3b4 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import { DEMO_EMAIL } from '../db/seeders/001_users.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,79 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// posts.archive lists posts created in a given year, or year+month, as JSON.
++// Fixtures use a title prefix so re-running the suite against a persisted
++// test database stays idempotent (old fixture rows are cleared first) and
++// years far from "today" so they never collide with other seeded posts.
++describe('posts.archive', () => {
++  let http: TestApp
++
++  const FIXTURE_PREFIX = 'Archive fixture:'
++  const augNew = `${FIXTURE_PREFIX} Aug new`
++  const augOld = `${FIXTURE_PREFIX} Aug old`
++  const feb = `${FIXTURE_PREFIX} Feb`
++  const prevYearAug = `${FIXTURE_PREFIX} prev year Aug`
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    await Post.newQuery().where('title', 'like', `${FIXTURE_PREFIX}%`).delete()
++
++    const author = await User.first({ email: DEMO_EMAIL })
++    if (!author) {
++      throw new Error(`Expected the demo user (${DEMO_EMAIL}) to be seeded before this test runs.`)
++    }
++
++    // Inserted oldest to newest so ascending id order matches ascending
++    // createdAt — the controller orders by id desc, so this keeps "newest
++    // first" assertions meaningful.
++    for (const [title, createdAt] of [
++      [prevYearAug, '2030-08-15T00:00:00.000Z'],
++      [feb, '2031-02-01T00:00:00.000Z'],
++      [augOld, '2031-08-05T10:00:00.000Z'],
++      [augNew, '2031-08-31T23:59:59.000Z'],
++    ] as const) {
++      await Post.forceCreate({
++        title,
++        excerpt: 'Archive fixture post.',
++        body: 'Archive fixture post.',
++        authorId: author.id,
++        createdAt,
++      })
++    }
++  })
++
++  it('lists posts created in a given month, zero-padded', async () => {
++    const response = await http.get('/posts/archive/2031/08').assertOk()
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    // Newest first.
++    expect(body.data.map((post) => post.title)).toEqual([augNew, augOld])
++  })
++
++  it('lists posts created in a given month, no leading zero', async () => {
++    const response = await http.get('/posts/archive/2031/8').assertOk()
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data.map((post) => post.title)).toEqual([augNew, augOld])
++  })
++
++  it('lists every post created in a given year', async () => {
++    const response = await http.get('/posts/archive/2031').assertOk()
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data.map((post) => post.title)).toEqual([augNew, augOld, feb])
++  })
++
++  it('does not leak posts from a different year sharing the same month', async () => {
++    const response = await http.get('/posts/archive/2030/08').assertOk()
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data.map((post) => post.title)).toEqual([prevYearAug])
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await http.get('/posts/archive/2099').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/2031/13').assertStatus(422)
++  })
++})

@@ -1,0 +1,105 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..5c5e20b 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -2,6 +2,26 @@ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const DEFAULT_REDIRECT = '/dashboard'
++
++// Only accept a same-app absolute path as a post-login destination. Resolves
++// the value against a throwaway base with the WHATWG URL parser — the same
++// normalization browsers apply — so absolute URLs with a scheme,
++// protocol-relative values ("//evil.example"), and backslash variants
++// ("/\evil.example", browsers treat "\" like "/") all resolve to a
++// different origin and get rejected, instead of trying to out-guess every
++// bypass with string checks.
++function safeRedirectPath(value: string | undefined): string | null {
++  if (!value || !value.startsWith('/')) return null
++
++  const base = 'http://redirect.invalid'
++  try {
++    return new URL(value, base).origin === base ? value : null
++  } catch {
++    return null
++  }
++}
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+@@ -21,7 +41,7 @@ export default class LoginController extends Controller {
+     }
+ 
+     // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    return this.redirect(safeRedirectPath(redirect) ?? DEFAULT_REDIRECT)
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..f2972fa
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,59 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++
++const PASSWORD = 'correct horse battery staple'
++
++describe('login', () => {
++  let http: TestApp
++  let email: string
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    email = `login-test-${crypto.randomUUID()}@example.com`
++    await User.create({ name: 'Login Test User', email, password: PASSWORD })
++  })
++
++  it('redirects to the default destination when no redirect value is given', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: PASSWORD })
++      .assertRedirect('/dashboard')
++  })
++
++  it('redirects back to a same-app path passed via redirect', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: PASSWORD, redirect: '/posts/3/edit' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('ignores an absolute URL and falls back to the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: PASSWORD, redirect: 'https://evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a protocol-relative redirect and falls back to the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: PASSWORD, redirect: '//evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a backslash redirect and falls back to the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: PASSWORD, redirect: '/\\evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('still rejects a wrong password without creating a session', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: 'not the password' })
++      .assertUnprocessable()
++  })
++})

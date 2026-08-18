@@ -1,0 +1,95 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,8 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
++
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostDestroy.test.ts b/tests/PostDestroy.test.ts
+new file mode 100644
+index 0000000..825d517
+--- /dev/null
++++ b/tests/PostDestroy.test.ts
+@@ -0,0 +1,76 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import app from '../src/app.js'
++
++// PostPolicy.delete only lets the author remove a post; these tests drive the
++// real DELETE /posts/:id route so the controller's authorize() call stays in
++// place. Rows are created directly through the models — the route under test
++// is the delete, not the create.
++describe('posts.destroy', () => {
++  let http: TestApp
++  let author: { id: number }
++  let stranger: { id: number }
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++
++    author = (await User.create({
++      name: 'Author',
++      email: `author-${Date.now()}@example.com`,
++      password: 'secret',
++    })) as { id: number }
++    stranger = (await User.create({
++      name: 'Stranger',
++      email: `stranger-${Date.now()}@example.com`,
++      password: 'secret',
++    })) as { id: number }
++  })
++
++  // The suite shares one SQLite file, so the rows the refused deletes left
++  // behind are cleaned up rather than piling up run after run.
++  afterAll(async () => {
++    await Post.delete({ authorId: author.id })
++    await User.delete({ id: author.id })
++    await User.delete({ id: stranger.id })
++  })
++
++  async function createPost(): Promise<{ id: number }> {
++    const post = await Post.forceCreate({
++      title: 'A post with an owner',
++      excerpt: 'Only its author may delete it.',
++      body: 'Body.',
++      authorId: author.id,
++    })
++
++    return post as { id: number }
++  }
++
++  it('refuses a signed-in user who is not the author and keeps the post', async () => {
++    const post = await createPost()
++    const csrf = await (await http.actingAs(stranger).withCsrf()).json()
++
++    await csrf.delete(`/posts/${post.id}`).assertForbidden()
++    expect(await Post.find(post.id)).not.toBeNull()
++  })
++
++  it('refuses a guest and keeps the post', async () => {
++    const post = await createPost()
++    const csrf = await http.withCsrf()
++
++    const response = await csrf.delete(`/posts/${post.id}`)
++    expect(response.status).not.toBe(200)
++    expect(await Post.find(post.id)).not.toBeNull()
++  })
++
++  it('lets the author delete their own post', async () => {
++    const post = await createPost()
++    const csrf = await (await http.actingAs(author).withCsrf()).json()
++
++    await csrf.delete(`/posts/${post.id}`).assertRedirect('/posts')
++    expect(await Post.find(post.id)).toBeNull()
++  })
++})

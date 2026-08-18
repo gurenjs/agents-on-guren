@@ -1,0 +1,137 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
+index fb3ddf8..ae9b060 100644
+--- a/resources/js/pages/posts/Index.tsx
++++ b/resources/js/pages/posts/Index.tsx
+@@ -115,7 +115,10 @@ export default function PostsIndex({ data, pagination }: Props) {
+               <Link
+                 key={page.page}
+                 href={page.url ?? '#'}
+-                className="rounded border border-slate-800 px-3 py-1 text-sm text-slate-300 transition hover:border-emerald-500 hover:text-emerald-200"
++                aria-current={page.active ? 'page' : undefined}
++                className={`rounded border px-3 py-1 text-sm transition hover:border-emerald-500 hover:text-emerald-200 ${
++                  page.active ? 'border-emerald-500 text-emerald-200' : 'border-slate-800 text-slate-300'
++                }`}
+               >
+                 {page.page}
+               </Link>
+diff --git a/tests/PostsIndexPagination.test.ts b/tests/PostsIndexPagination.test.ts
+new file mode 100644
+index 0000000..57370f0
+--- /dev/null
++++ b/tests/PostsIndexPagination.test.ts
+@@ -0,0 +1,102 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++const TOTAL_POSTS = 25
++const PER_PAGE = 10
++
++// The list is newest first (`id desc`), ten to a page: page 1 must start at
++// the newest post, and every post has to appear on exactly one page.
++describe('posts.index pagination', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    // Boot first: the app's DatabaseProvider configures the ORM the models use.
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++
++    const author = await User.create({
++      name: 'Pagination Author',
++      email: 'pagination@example.com',
++      password: 'secret',
++    })
++    if (!author) {
++      throw new Error('failed to create the fixture author')
++    }
++
++    for (let index = 1; index <= TOTAL_POSTS; index += 1) {
++      await Post.forceCreate({
++        title: `Post ${index}`,
++        excerpt: `Excerpt ${index}`,
++        body: `Body ${index}`,
++        authorId: author.id,
++      })
++    }
++  })
++
++  async function pageProps(url: string) {
++    const response = await http.withHeaders({ 'X-Inertia': 'true', 'X-Inertia-Version': '' }).get(url)
++    response.assertOk()
++    const payload = await response.json<{
++      component: string
++      props: {
++        data: Array<{ id: number; title: string }>
++        pagination: { meta: Record<string, unknown> }
++      }
++    }>()
++    return payload.props
++  }
++
++  it('starts the first page at the newest post', async () => {
++    const props = await pageProps('/posts')
++
++    expect(props.data.map((post) => post.title)).toEqual([
++      'Post 25',
++      'Post 24',
++      'Post 23',
++      'Post 22',
++      'Post 21',
++      'Post 20',
++      'Post 19',
++      'Post 18',
++      'Post 17',
++      'Post 16',
++    ])
++    expect(props.pagination.meta).toMatchObject({
++      currentPage: 1,
++      perPage: PER_PAGE,
++      total: TOTAL_POSTS,
++      lastPage: 3,
++      from: 1,
++      to: 10,
++    })
++  })
++
++  it('treats ?page=1 as the same first page', async () => {
++    const first = await pageProps('/posts')
++    const explicit = await pageProps('/posts?page=1')
++
++    expect(explicit.data.map((post) => post.id)).toEqual(first.data.map((post) => post.id))
++  })
++
++  it('walks every post exactly once across the pages', async () => {
++    const seen: number[] = []
++    for (const page of [1, 2, 3]) {
++      const props = await pageProps(`/posts?page=${page}`)
++      expect(props.pagination.meta).toMatchObject({ currentPage: page })
++      seen.push(...props.data.map((post) => post.id))
++    }
++
++    expect(seen.length).toBe(TOTAL_POSTS)
++    expect(new Set(seen).size).toBe(TOTAL_POSTS)
++  })
++
++  it('reports the last page as the partial one', async () => {
++    const last = await pageProps('/posts?page=3')
++    expect(last.data).toHaveLength(TOTAL_POSTS - 2 * PER_PAGE)
++    expect(last.pagination.meta).toMatchObject({ currentPage: 3, lastPage: 3, from: 21, to: 25 })
++  })
++})

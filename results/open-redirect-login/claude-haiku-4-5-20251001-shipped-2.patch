@@ -1,0 +1,208 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..cac1845 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
++import { isSafeRedirect } from '../../../Utils/SafeRedirect.js'
+ 
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+@@ -20,8 +21,16 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in,
++    // but only if it's a safe same-origin redirect.
++    const queryRedirect = this.request.query('redirect')
++    const safeRedirect = (redirect && isSafeRedirect(redirect))
++      ? redirect
++      : (queryRedirect && isSafeRedirect(queryRedirect))
++        ? queryRedirect
++        : '/dashboard'
++
++    return this.redirect(safeRedirect)
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Utils/SafeRedirect.ts b/app/Utils/SafeRedirect.ts
+new file mode 100644
+index 0000000..aec3760
+--- /dev/null
++++ b/app/Utils/SafeRedirect.ts
+@@ -0,0 +1,32 @@
++/**
++ * Validates that a redirect URL is safe — only same-origin, same-app paths.
++ * Rejects absolute URLs, protocol-relative URLs, and backslash variants.
++ */
++export function isSafeRedirect(url: string): boolean {
++  // Empty or whitespace — use default
++  if (!url || !url.trim()) {
++    return false
++  }
++
++  // Protocol-relative URL (//example.com)
++  if (url.startsWith('//')) {
++    return false
++  }
++
++  // Absolute URL with scheme (https://example.com)
++  if (url.includes('://')) {
++    return false
++  }
++
++  // Backslash characters (both leading and inside)
++  if (url.includes('\\')) {
++    return false
++  }
++
++  // Must start with / for a same-app path
++  if (!url.startsWith('/')) {
++    return false
++  }
++
++  return true
++}
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..173d4c5
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,88 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { resetDatabase } from '../config/database.js'
++
++describe('LoginController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  it('accepts valid same-origin redirects', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: '/posts/1/edit' }).assertRedirect('/posts/1/edit')
++  })
++
++  it('accepts root-relative redirects', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: '/dashboard' }).assertRedirect('/dashboard')
++  })
++
++  it('rejects absolute URLs with schemes', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: 'https://evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('rejects protocol-relative URLs', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: '//evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('rejects backslash variants', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: '/\\evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('defaults to dashboard when redirect is missing', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password' }).assertRedirect('/dashboard')
++  })
++
++  it('defaults to dashboard when redirect is invalid query param', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: 'https://evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('still authenticates user even when redirect is invalid', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    const response = await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: 'https://evil.example' })
++    // Even though redirect was rejected, the user should be authenticated
++    // and directed to /dashboard
++    await response.assertRedirect('/dashboard')
++  })
++
++  it('rejects login with invalid credentials', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { email: 'test@example.com', password: 'wrongpassword', redirect: '/posts/1' }).assertStatus(422)
++  })
++
++  it('uses query param redirect when body redirect is empty', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    // When body redirect is empty but query param is set, should use query param
++    await csrf.post('/login?redirect=/posts/5', { email: 'test@example.com', password: 'password', redirect: '' }).assertRedirect('/posts/5')
++  })
++
++  it('rejects redirect with multiple leading slashes', async () => {
++    await User.create({ name: 'Test User', email: 'test@example.com', password: 'password' })
++    const csrf = await http.withCsrf()
++    // /\/... should be treated as an unsafe URL
++    await csrf.post('/login', { email: 'test@example.com', password: 'password', redirect: '/\\/posts' }).assertRedirect('/dashboard')
++  })
++})
+diff --git a/tests/SafeRedirect.test.ts b/tests/SafeRedirect.test.ts
+new file mode 100644
+index 0000000..cc588b3
+--- /dev/null
++++ b/tests/SafeRedirect.test.ts
+@@ -0,0 +1,39 @@
++import { describe, it } from 'bun:test'
++import { isSafeRedirect } from '../app/Utils/SafeRedirect.js'
++import { expect } from 'bun:test'
++
++describe('isSafeRedirect', () => {
++  it('accepts root-relative paths', () => {
++    expect(isSafeRedirect('/posts')).toBe(true)
++    expect(isSafeRedirect('/posts/1')).toBe(true)
++    expect(isSafeRedirect('/posts/1/edit')).toBe(true)
++    expect(isSafeRedirect('/dashboard')).toBe(true)
++    expect(isSafeRedirect('/')).toBe(true)
++  })
++
++  it('rejects absolute URLs with schemes', () => {
++    expect(isSafeRedirect('https://evil.example')).toBe(false)
++    expect(isSafeRedirect('http://evil.example')).toBe(false)
++    expect(isSafeRedirect('ftp://evil.example')).toBe(false)
++  })
++
++  it('rejects protocol-relative URLs', () => {
++    expect(isSafeRedirect('//evil.example')).toBe(false)
++  })
++
++  it('rejects backslash variants', () => {
++    expect(isSafeRedirect('/\\evil.example')).toBe(false)
++    expect(isSafeRedirect('\\evil.example')).toBe(false)
++    expect(isSafeRedirect('/posts\\admin')).toBe(false)
++  })
++
++  it('rejects empty strings', () => {
++    expect(isSafeRedirect('')).toBe(false)
++    expect(isSafeRedirect('   ')).toBe(false)
++  })
++
++  it('rejects relative paths without leading slash', () => {
++    expect(isSafeRedirect('posts')).toBe(false)
++    expect(isSafeRedirect('posts/1')).toBe(false)
++  })
++})

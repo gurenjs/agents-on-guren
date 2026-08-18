@@ -1,0 +1,199 @@
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..d75a996 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -20,6 +21,11 @@ export default class RegisterController extends Controller {
+     // `passwordHash` before persisting — see app/Models/User.ts.
+     const user = await User.create({ name, email, password })
+ 
++    // Queued rather than sent here: a slow mail server must never hold up
++    // the registration response. The worker (or the sync driver in
++    // development) delivers the welcome mail after we return.
++    await SendWelcomeEmailJob.dispatch({ userId: user.id })
++
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..146f9ae
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,39 @@
++import { Job, getMailManager } from '@guren/core'
++import { WelcomeMail } from '../Mail/WelcomeMail.js'
++import { User } from '../Models/User.js'
++
++export interface SendWelcomeEmailJobPayload {
++  userId: number
++}
++
++/**
++ * Sends the welcome mail to a freshly registered user.
++ *
++ * Dispatched from RegisterController.store so the HTTP response never waits
++ * on the mail transport; the queue worker (or the sync driver in
++ * development) runs handle() afterwards.
++ */
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailJobPayload> {
++  static override queue = 'default'
++  static override maxAttempts = 3
++
++  async handle({ userId }: SendWelcomeEmailJobPayload): Promise<void> {
++    const user = await User.find(userId)
++    // The account may have been removed between dispatch and delivery; there
++    // is nobody left to welcome, and retrying would not change that.
++    if (!user) return
++
++    // MailProvider.boot() publishes the configured manager for queue jobs,
++    // which run outside a request and have no controller container.
++    const mail = getMailManager()
++    if (!mail) {
++      throw new Error('Mail manager is not configured — is MailProvider registered in src/app.ts?')
++    }
++
++    await new WelcomeMail(mail, { name: user.name, email: user.email }).send()
++  }
++
++  async failed({ userId }: SendWelcomeEmailJobPayload, error: Error): Promise<void> {
++    console.error(`SendWelcomeEmailJob failed for user ${userId}:`, error.message)
++  }
++}
+diff --git a/app/Mail/WelcomeMail.ts b/app/Mail/WelcomeMail.ts
+new file mode 100644
+index 0000000..49af57f
+--- /dev/null
++++ b/app/Mail/WelcomeMail.ts
+@@ -0,0 +1,39 @@
++import { Mail, type MailManager } from '@guren/core'
++
++export interface WelcomeMailRecipient {
++  name: string
++  email: string
++}
++
++/**
++ * The welcome message a new account receives after registering.
++ *
++ * Subject: "Welcome to <APP_NAME>, <name>!" — the app name comes from
++ * APP_NAME in .env so a rename never touches this file.
++ */
++export class WelcomeMail extends Mail {
++  constructor(
++    manager: MailManager,
++    public readonly recipient: WelcomeMailRecipient,
++  ) {
++    super(manager)
++  }
++
++  build(): this {
++    const appName = process.env.APP_NAME?.trim() || 'Guren'
++    const { name, email } = this.recipient
++
++    return this
++      .to({ email, name })
++      .subject(`Welcome to ${appName}, ${name}!`)
++      .text(
++        [
++          `Hi ${name},`,
++          '',
++          `Thanks for joining ${appName}. Your account is ready — sign in any time to write your first post.`,
++          '',
++          `— The ${appName} team`,
++        ].join('\n'),
++      )
++  }
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..411a4e4
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,26 @@
++import { ServiceProvider, createMailManager, setMailManager, type MailManager } from '@guren/core'
++
++export default class MailProvider extends ServiceProvider {
++  register(): void {
++    const manager = createMailManager({
++      // MAIL_MAILER=log writes messages to the server output (default);
++      // 'memory' keeps them inspectable in tests.
++      default: process.env.MAIL_MAILER === 'memory' ? 'memory' : 'log',
++      from: {
++        email: process.env.MAIL_FROM_ADDRESS?.trim() || 'hello@example.com',
++        name: process.env.MAIL_FROM_NAME?.trim() || process.env.APP_NAME?.trim() || 'Guren',
++      },
++      transports: {
++        log: { driver: 'log' },
++        memory: { driver: 'memory' },
++      },
++    })
++
++    this.container.instance('mail', manager)
++  }
++
++  boot(): void {
++    const manager = this.container.make<MailManager>('mail')
++    setMailManager(manager)
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..89c3cc1
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,25 @@
++import { ServiceProvider, MemoryDriver, SyncDriver, createQueueManager, registerJob, type QueueManager } from '@guren/core'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    const queue = createQueueManager({
++      // QUEUE_CONNECTION=sync executes jobs inline on dispatch (default,
++      // no worker process needed); 'memory' queues them for a Worker.
++      default: process.env.QUEUE_CONNECTION === 'memory' ? 'memory' : 'sync',
++      drivers: {
++        sync: () => new SyncDriver(),
++        memory: () => new MemoryDriver(),
++      },
++    })
++
++    this.container.instance('queue', queue)
++  }
++
++  boot(): void {
++    // Register job classes before the driver so sync dispatches can resolve them.
++    registerJob(SendWelcomeEmailJob)
++    const queue = this.container.make<QueueManager>('queue')
++    queue.driver()
++  }
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..1b13722 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, QueueProvider, MailProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().

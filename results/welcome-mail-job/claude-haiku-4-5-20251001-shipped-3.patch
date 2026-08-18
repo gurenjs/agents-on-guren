@@ -1,0 +1,290 @@
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..e5748bc 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -2,6 +2,7 @@ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ 
+ export default class RegisterController extends Controller {
+   async show(): Promise<Response> {
+@@ -23,6 +24,8 @@ export default class RegisterController extends Controller {
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
++    await SendWelcomeEmailJob.dispatch({ userId: user.id })
++
+     return this.redirect('/dashboard')
+   }
+ }
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..33751b5
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,24 @@
++import { Job } from '@guren/server/queue'
++import { getMailManager } from '@guren/server/mail'
++import { User } from '../Models/User.js'
++import { sendWelcomeEmail } from '../Mail/WelcomeMail.js'
++
++interface SendWelcomeEmailPayload {
++  userId: string | number
++}
++
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailPayload> {
++  static queue = 'default'
++  static maxAttempts = 3
++
++  async handle({ userId }: SendWelcomeEmailPayload): Promise<void> {
++    const user = await User.findOrFail(userId)
++    const mailManager = getMailManager()
++
++    if (!mailManager) {
++      throw new Error('Mail manager not configured')
++    }
++
++    await sendWelcomeEmail(mailManager, user)
++  }
++}
+diff --git a/app/Mail/WelcomeMail.ts b/app/Mail/WelcomeMail.ts
+new file mode 100644
+index 0000000..71355eb
+--- /dev/null
++++ b/app/Mail/WelcomeMail.ts
+@@ -0,0 +1,13 @@
++import { mail } from '@guren/server/mail'
++import type { MailManager } from '@guren/server/mail'
++import type { UserRecord } from '../Models/User.js'
++
++export async function sendWelcomeEmail(manager: MailManager, user: UserRecord): Promise<void> {
++  const appName = process.env.APP_NAME || 'App'
++
++  await mail(manager)
++    .to({ email: user.email, name: user.name })
++    .subject(`Welcome to ${appName}, ${user.name}!`)
++    .text(`Hello ${user.name},\n\nWelcome to ${appName}! We're excited to have you on board.\n\nBest regards,\nThe ${appName} Team`)
++    .send()
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..429f86e
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,33 @@
++import { ServiceProvider } from '@guren/core'
++import { createMailManager, setMailManager } from '@guren/server/mail'
++
++export default class MailProvider extends ServiceProvider {
++  register(): void {}
++
++  async boot(): Promise<void> {
++    const mailer = process.env.MAIL_MAILER || 'log'
++
++    const transports: Record<string, any> = {
++      log: { driver: 'log' },
++      memory: { driver: 'memory' },
++    }
++
++    if (process.env.RESEND_API_KEY) {
++      transports.resend = {
++        driver: 'resend',
++        apiKey: process.env.RESEND_API_KEY,
++      }
++    }
++
++    const mailManager = createMailManager({
++      default: mailer,
++      from: {
++        email: process.env.MAIL_FROM_ADDRESS || 'hello@example.com',
++        name: process.env.MAIL_FROM_NAME || process.env.APP_NAME || 'App',
++      },
++      transports,
++    })
++
++    setMailManager(mailManager)
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..41705f6
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,33 @@
++import { ServiceProvider } from '@guren/core'
++import { createQueueManager, setQueueDriver, MemoryDriver, SyncDriver, RedisDriver, registerJob } from '@guren/server/queue'
++import { createRedisClient } from '@guren/server/redis'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    registerJob(SendWelcomeEmailJob)
++  }
++
++  async boot(): Promise<void> {
++    const connection = process.env.QUEUE_CONNECTION || 'sync'
++    const drivers: Record<string, () => any> = {
++      sync: () => new SyncDriver(),
++      memory: () => new MemoryDriver(),
++    }
++
++    if (connection === 'redis' || process.env.REDIS_URL) {
++      drivers.redis = () => {
++        const redis = createRedisClient({ url: process.env.REDIS_URL })
++        return new RedisDriver(redis)
++      }
++    }
++
++    const queueManager = createQueueManager({
++      default: connection,
++      drivers,
++    })
++
++    const driver = queueManager.driver(connection)
++    setQueueDriver(driver)
++  }
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..e179e36 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, MailProvider, QueueProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..0837935
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,114 @@
++import { describe, it, beforeEach, afterEach } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { fakeQueue, fakeMail } from '@guren/testing'
++import { setQueueDriver, registerJob } from '@guren/server/queue'
++import { setMailManager, createMailManager } from '@guren/server/mail'
++import { resetDatabase } from '../config/database.js'
++import app from '../src/app.js'
++import { SendWelcomeEmailJob } from '../app/Jobs/SendWelcomeEmailJob.js'
++import { User } from '../app/Models/User.js'
++
++describe('RegisterController', () => {
++  let http: TestApp
++  let queue: ReturnType<typeof fakeQueue>
++  let mail: ReturnType<typeof fakeMail>
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    http = await TestApp.fromApp(app)
++
++    queue = fakeQueue()
++    mail = fakeMail()
++
++    setQueueDriver(queue.getDriver())
++    registerJob(SendWelcomeEmailJob)
++
++    const mailManager = createMailManager({
++      default: 'fake',
++    })
++    mailManager.registerTransport('fake', () => mail.getTransport())
++    setMailManager(mailManager)
++  })
++
++  afterEach(async () => {
++    await resetDatabase()
++  })
++
++  it('registers a user successfully', async () => {
++    const csrf = await http.withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertRedirect('/dashboard')
++  })
++
++  it('queues welcome email after registration', async () => {
++    const csrf = await http.withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertRedirect('/dashboard')
++
++    queue.assertPushed(SendWelcomeEmailJob)
++  })
++
++  it('sends welcome email when job is processed', async () => {
++    const csrf = await http.withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertRedirect('/dashboard')
++
++    const jobs = queue.getDriver().getJobsOf(SendWelcomeEmailJob)
++    if (jobs.length > 0) {
++      const job = jobs[0]
++      const jobInstance = new SendWelcomeEmailJob()
++      await jobInstance.handle(job.queuedJob.payload)
++    }
++
++    mail.assertSent((m) => {
++      return (
++        m.to?.some((addr) => addr.email === 'ada@example.com') &&
++        m.subject === 'Welcome to Guren, Ada Lovelace!'
++      )
++    })
++  })
++
++  it('rejects duplicate email during registration', async () => {
++    const csrf = await http.withCsrf()
++
++    await User.create({
++      name: 'Existing User',
++      email: 'existing@example.com',
++      password: 'password123',
++    })
++
++    await csrf
++      .post('/register', {
++        name: 'New User',
++        email: 'existing@example.com',
++        password: 'password123',
++        passwordConfirmation: 'password123',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.email.0', 'An account with this email already exists.')
++
++    queue.assertNotPushed(SendWelcomeEmailJob)
++  })
++})

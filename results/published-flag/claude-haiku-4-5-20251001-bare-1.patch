@@ -1,0 +1,494 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..9c36a65 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; published?: boolean }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; published?: boolean }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..e6d6ebc 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -14,6 +14,7 @@ export namespace Data {
+   title: string
+   excerpt: string
+   body: string
++  published: boolean
+   authorId: number
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..5e1cf41 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -29,7 +29,6 @@ export function isPageId(value: string): value is PageId {
+   return Object.prototype.hasOwnProperty.call(pageManifest, value)
+ }
+ 
+-type PostFormData = ApiRoutes['posts.store']['body']
+ /**
+  * Auto-extracted Props types from page components.
+  */
+@@ -48,7 +47,7 @@ export interface PagePropsMap {
+   latest: PostResourceData[]
+ }
+   'posts/Edit': {
+-  post: PostFormData & { id: number }
++  post: PostResourceData
+ }
+   'posts/Index': PaginatedPageProps<PostResourceData> & {}
+   'posts/Show': {
+diff --git a/app/Http/Controllers/HomeController.ts b/app/Http/Controllers/HomeController.ts
+index fc8ac0b..0bc7646 100644
+--- a/app/Http/Controllers/HomeController.ts
++++ b/app/Http/Controllers/HomeController.ts
+@@ -9,6 +9,7 @@ export default class HomeController extends Controller {
+   async index(): Promise<Response> {
+     const latest = await Post.newQuery()
+       .with('author')
++      .where('published', true)
+       .orderBy('id', 'desc')
+       .limit(LATEST_POST_COUNT)
+       .get()
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..36bc1a4 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,4 +1,5 @@
+ import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { HttpException } from '@guren/server'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+@@ -10,8 +11,15 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
++    const user = await this.auth.user<UserRecord>()
+     const result = await Post.newQuery()
+       .with('author')
++      .where((q) => {
++        q.where('published', true)
++        if (user) {
++          q.orWhere('authorId', Number(user.id))
++        }
++      })
+       .orderBy('id', 'desc')
+       .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+@@ -34,6 +42,7 @@ export default class PostController extends Controller {
+   // being OR'd away.
+   async search(): Promise<Response> {
+     const { keywords, limit } = await this.validateBody(PostSearchSchema)
++    const user = await this.auth.user<UserRecord>()
+ 
+     const posts = await Post.newQuery()
+       .with('author')
+@@ -43,6 +52,12 @@ export default class PostController extends Controller {
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+       })
++      .where((q) => {
++        q.where('published', true)
++        if (user) {
++          q.orWhere('authorId', Number(user.id))
++        }
++      })
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+@@ -52,8 +67,13 @@ export default class PostController extends Controller {
+ 
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
++    const user = await this.auth.user<UserRecord>()
+     const post = await Post.findWithOrFail(id, 'author')
+ 
++    if (!post.published && post.authorId !== Number(user?.id)) {
++      throw HttpException.notFound()
++    }
++
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+     })
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index f798f49..f3856be 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -9,6 +9,7 @@ export interface PostResourceData extends Record<string, unknown> {
+   title: string
+   excerpt: string
+   body: string
++  published: boolean
+   authorId: number
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+@@ -25,6 +26,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor> {
+       title: post.title as string,
+       excerpt: post.excerpt as string,
+       body: post.body as string,
++      published: post.published as boolean,
+       authorId: post.authorId as number,
+       createdAt: new Date(post.createdAt as string | Date).toISOString(),
+       author: this.whenLoaded('author', () => ({
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..388a8b5 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,7 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
++  published: z.boolean().optional().default(false),
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index 4c4a643..a70ca15 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -8,7 +8,7 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts) {
+   // `authorId` is set from the signed-in user, never from request input.
+-  static fillable = ['title', 'excerpt', 'body']
++  static fillable = ['title', 'excerpt', 'body', 'published']
+ 
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+diff --git a/db/migrations/20260818000000_add_published_to_posts/migration.sql b/db/migrations/20260818000000_add_published_to_posts/migration.sql
+new file mode 100644
+index 0000000..c0d99b4
+--- /dev/null
++++ b/db/migrations/20260818000000_add_published_to_posts/migration.sql
+@@ -0,0 +1 @@
++ALTER TABLE `posts` ADD COLUMN `published` integer NOT NULL DEFAULT 1;
+diff --git a/db/migrations/20260818000000_add_published_to_posts/snapshot.json b/db/migrations/20260818000000_add_published_to_posts/snapshot.json
+new file mode 100644
+index 0000000..1d405c3
+--- /dev/null
++++ b/db/migrations/20260818000000_add_published_to_posts/snapshot.json
+@@ -0,0 +1,201 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "164ebde9-8b69-42ff-8515-64f20f1250c8",
++  "prevIds": [
++    "064ebde9-8b69-42ff-8515-64f20f1250c8"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": 1,
++      "generated": null,
++      "name": "published",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..5a55aaa 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -15,6 +15,7 @@ export const posts = sqliteTable('posts', {
+   title: text('title').notNull(),
+   excerpt: text('excerpt').notNull(),
+   body: text('body').notNull(),
++  published: integer('published', { mode: 'boolean' }).notNull().default(false),
+   authorId: integer('author_id')
+     .notNull()
+     .references(() => users.id),
+diff --git a/db/seeders/002_posts.ts b/db/seeders/002_posts.ts
+index 8a2f2cf..81164aa 100644
+--- a/db/seeders/002_posts.ts
++++ b/db/seeders/002_posts.ts
+@@ -28,5 +28,5 @@ export default defineSeeder(async ({ db }: AppSeederContext) => {
+     return
+   }
+ 
+-  await db.insert(posts).values(SAMPLE_POSTS.map((post) => ({ ...post, authorId: author.id })))
++  await db.insert(posts).values(SAMPLE_POSTS.map((post) => ({ ...post, authorId: author.id, published: true })))
+ })
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..c7b8772 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -1,12 +1,13 @@
+ import { Head, useForm } from '@inertiajs/react'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
++import type { PostResourceData } from '@/app/Http/Resources/PostResource'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
+ type PostFormData = ApiRoutes['posts.store']['body']
+ 
+ interface Props {
+-  post: PostFormData & { id: number }
++  post: PostResourceData
+ }
+ 
+ const fieldClass =
+@@ -17,6 +18,7 @@ export default function EditPost({ post }: Props) {
+     title: post.title,
+     excerpt: post.excerpt,
+     body: post.body,
++    published: post.published ?? false,
+   })
+ 
+   return (
+@@ -65,6 +67,19 @@ export default function EditPost({ post }: Props) {
+             {form.errors.body ? <p className="mt-1 text-sm text-rose-300">{form.errors.body}</p> : null}
+           </div>
+ 
++          <div className="flex items-center gap-2">
++            <input
++              type="checkbox"
++              id="published"
++              checked={form.data.published || false}
++              onChange={(event) => form.setData('published', event.target.checked)}
++              className="rounded border border-slate-700 bg-slate-950 text-emerald-500 outline-none ring-emerald-400 transition focus:ring"
++            />
++            <label htmlFor="published" className="text-sm font-medium text-slate-200">
++              Published
++            </label>
++          </div>
++
+           <button
+             type="submit"
+             disabled={form.processing}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..4d1a790 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -9,7 +9,7 @@ const fieldClass =
+   'mt-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none ring-emerald-400 transition focus:border-emerald-400 focus:ring'
+ 
+ export default function NewPost() {
+-  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
++  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '', published: false })
+ 
+   return (
+     <Layout>
+@@ -57,12 +57,25 @@ export default function NewPost() {
+             {form.errors.body ? <p className="mt-1 text-sm text-rose-300">{form.errors.body}</p> : null}
+           </div>
+ 
++          <div className="flex items-center gap-2">
++            <input
++              type="checkbox"
++              id="published"
++              checked={form.data.published || false}
++              onChange={(event) => form.setData('published', event.target.checked)}
++              className="rounded border border-slate-700 bg-slate-950 text-emerald-500 outline-none ring-emerald-400 transition focus:ring"
++            />
++            <label htmlFor="published" className="text-sm font-medium text-slate-200">
++              Published
++            </label>
++          </div>
++
+           <button
+             type="submit"
+             disabled={form.processing}
+             className="rounded bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:opacity-50"
+           >
+-            Publish
++            Save
+           </button>
+         </form>
+       </section>

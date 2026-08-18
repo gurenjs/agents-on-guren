@@ -1,0 +1,206 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..3c06fb1 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,11 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:year'
++  }
++  'posts.archive.month': {
++    method: 'GET'
++    path: '/posts/archive/:year/:month'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +316,8 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
++  'posts.archive.month': { method: 'GET', path: '/posts/archive/:year/:month' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..f3a9147 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,8 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
++  'posts.archive.month': { method: 'GET', path: '/posts/archive/:year/:month' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+@@ -78,7 +79,12 @@ export const routes = {
+   ),
+   logout: (query?: RouteQuery) => route('logout', query),
+   posts: {
+-    archive: (params: RouteParams<'posts.archive'>, query?: RouteQuery) => route('posts.archive', params, query),
++    archive: Object.assign(
++      (params: RouteParams<'posts.archive'>, query?: RouteQuery) => route('posts.archive', params, query),
++      {
++      month: (params: RouteParams<'posts.archive.month'>, query?: RouteQuery) => route('posts.archive.month', params, query)
++    }
++    ),
+     create: (query?: RouteQuery) => route('posts.create', query),
+     destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
+     edit: (params: RouteParams<'posts.edit'>, query?: RouteQuery) => route('posts.edit', params, query),
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index d15bcbb..ac61e48 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,7 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import {
+-  ArchiveParamSchema,
++  ArchiveParamsSchema,
+   PostIdParamSchema,
+   PostPayloadSchema,
+   PostSearchSchema,
+@@ -60,8 +60,7 @@ export default class PostController extends Controller {
+   // that period, newest first. `created_at` is stored as an ISO 8601 string, so
+   // a `YYYY-MM-` (or `YYYY-`) prefix match selects the period without parsing.
+   async archive(): Promise<Response> {
+-    const { date } = this.validateParams(ArchiveParamSchema)
+-    const [year, month] = date.split('/')
++    const { year, month } = this.validateParams(ArchiveParamsSchema)
+     const prefix = month ? `${year}-${month.padStart(2, '0')}-` : `${year}-`
+ 
+     const posts = await Post.newQuery()
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 83d0495..c113d40 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -24,8 +24,14 @@ export const PostPayloadSchema = z.object({
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+ 
+-// The archive route captures everything after /posts/archive/ into one `date`
+-// param: "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
+-export const ArchiveParamSchema = z.object({
+-  date: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
++// Both archive routes — /posts/archive/:year and /posts/archive/:year/:month —
++// land on the same controller action, so `month` is optional here: it is simply
++// absent from the params of the year-only route. Written with a leading zero or
++// without it, "08" and "8" are both accepted.
++export const ArchiveParamsSchema = z.object({
++  year: z.string().regex(/^\d{4}$/, 'Expected a four-digit year.'),
++  month: z
++    .string()
++    .regex(/^(0?[1-9]|1[0-2])$/, 'Expected a month between 1 and 12.')
++    .optional(),
+ })
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..e8205ea 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -32,7 +32,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    // Two patterns rather than one catch-all param: a `:param` only ever matches
++    // a single path segment, so the month URL needs a route of its own.
++    posts.get('/archive/:year/:month', [PostController, 'archive']).name('posts.archive.month')
++    posts.get('/archive/:year', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostArchive.test.ts b/tests/PostArchive.test.ts
+new file mode 100644
+index 0000000..72735a7
+--- /dev/null
++++ b/tests/PostArchive.test.ts
+@@ -0,0 +1,83 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// The archive is served by two routes (/posts/archive/:year and
++// /posts/archive/:year/:month) that share one controller action, so both URL
++// shapes are exercised here. Fixtures sit in 2019 so they cannot collide with
++// posts created "now", and set `created_at` explicitly — the stored ISO
++// timestamp is what the period filter matches, in UTC.
++describe('posts.archive', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await resetDatabase()
++    http = await TestApp.fromApp(app)
++
++    const author = await User.create({
++      name: 'Archive Author',
++      email: 'archive@example.com',
++      password: 'secret',
++    })
++
++    const fixtures: Array<[string, string]> = [
++      ['July 2019', '2019-07-31T23:00:00.000Z'],
++      ['August 2019, early', '2019-08-01T00:00:00.000Z'],
++      ['August 2019, late', '2019-08-31T23:59:59.000Z'],
++      ['September 2019', '2019-09-01T12:00:00.000Z'],
++      ['August 2018', '2018-08-15T12:00:00.000Z'],
++    ]
++
++    for (const [title, createdAt] of fixtures) {
++      // forceCreate: `createdAt` and `authorId` are deliberately not fillable.
++      await Post.forceCreate({
++        title,
++        excerpt: `${title} excerpt`,
++        body: `${title} body`,
++        authorId: author?.id as number,
++        createdAt,
++      })
++    }
++  })
++
++  async function titles(path: string): Promise<string[]> {
++    const res = await http.get(path).assertOk()
++    const body = await res.json<{ data: Array<{ id: number; title: string }> }>()
++
++    return body.data.map((post) => post.title)
++  }
++
++  it('lists the posts of a month, newest first', async () => {
++    expect(await titles('/posts/archive/2019/08')).toEqual(['August 2019, late', 'August 2019, early'])
++  })
++
++  it('accepts a month written without a leading zero', async () => {
++    expect(await titles('/posts/archive/2019/8')).toEqual(['August 2019, late', 'August 2019, early'])
++  })
++
++  it('lists every post of a year', async () => {
++    expect(await titles('/posts/archive/2019')).toEqual([
++      'September 2019',
++      'August 2019, late',
++      'August 2019, early',
++      'July 2019',
++    ])
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await http.get('/posts/archive/1999').assertOk().assertJson({ data: [] })
++    await http.get('/posts/archive/2019/03').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/2019/13').assertStatus(422)
++    await http.get('/posts/archive/2019/00').assertStatus(422)
++  })
++
++  it('rejects a malformed year', async () => {
++    await http.get('/posts/archive/20xx').assertStatus(422)
++  })
++})

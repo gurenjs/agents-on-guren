@@ -1,0 +1,122 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..0e402d9
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,79 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// profile.update validates its body with ProfileUpdateSchema before touching
++// the database, so a bad email or an empty name comes back as a 422 with the
++// field errors resources/js/pages/profile/Edit.tsx renders — and keys that are
++// not part of the form (id, passwordHash, …) are dropped by the schema instead
++// of reaching User.update().
++describe('profile.update', () => {
++  const email = 'profile-controller-test@example.com'
++  const renamedEmail = 'profile-controller-renamed@example.com'
++  let user: UserRecord
++
++  const authed = async () => (await TestApp.fromApp(app)).actingAs(user).withCsrf('/profile')
++
++  // The suite writes to the shared test database, so both addresses it can
++  // leave behind are cleared before and after the run.
++  const removeFixtures = async () => {
++    for (const address of [email, renamedEmail]) {
++      for (const existing of await User.where({ email: address })) {
++        await User.delete({ id: existing.id })
++      }
++    }
++  }
++
++  beforeAll(async () => {
++    // Boots src/app.ts, which is what binds the models to the connection.
++    await TestApp.fromApp(app)
++    await migrateDatabase()
++    await removeFixtures()
++
++    user = await User.create({ name: 'Original Name', email, password: 'secret-password' })
++  })
++
++  afterAll(removeFixtures)
++
++  it('rejects a badly formatted email', async () => {
++    const csrf = await authed()
++    await csrf.put('/profile', { name: 'Original Name', email: 'not-an-email' }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    expect(stored?.email).toBe(user.email)
++  })
++
++  it('rejects an empty name', async () => {
++    const csrf = await authed()
++    await csrf.put('/profile', { name: '   ', email: user.email }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Original Name')
++  })
++
++  it('rejects a password shorter than 8 characters', async () => {
++    const csrf = await authed()
++    await csrf.put('/profile', { name: 'Original Name', email: user.email, password: 'short' }).assertStatus(422)
++  })
++
++  it('ignores fields the profile form does not have', async () => {
++    const csrf = await authed()
++    await csrf
++      .put('/profile', {
++        name: 'Renamed',
++        email: renamedEmail.toUpperCase(),
++        id: user.id + 4321,
++        passwordHash: 'overwritten',
++      })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.id).toBe(user.id)
++    expect(stored?.name).toBe('Renamed')
++    // Stored in lowercase, exactly as the registration form stores it.
++    expect(stored?.email).toBe(renamedEmail)
++    expect((stored as unknown as { passwordHash?: string } | null)?.passwordHash).not.toBe('overwritten')
++  })
++})

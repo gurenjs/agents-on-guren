@@ -1,0 +1,93 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,8 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
++
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostDestroy.test.ts b/tests/PostDestroy.test.ts
+new file mode 100644
+index 0000000..9abb19d
+--- /dev/null
++++ b/tests/PostDestroy.test.ts
+@@ -0,0 +1,74 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { UserRecord } from '../app/Models/User.js'
++
++// PostController.destroy authorizes with PostPolicy.delete, so only the
++// author can remove a post — everyone else is refused and the row survives.
++describe('posts.destroy authorization', () => {
++  let http: TestApp
++  let author: UserRecord
++  let stranger: UserRecord
++
++  beforeAll(async () => {
++    // NODE_ENV=test points config/database.ts at its own SQLite file, which
++    // outlives a run — migrate it and reuse the fixtures rather than wiping
++    // whatever else the suite has put there.
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++
++    author = await fixtureUser('Author', 'author@destroy.test')
++    stranger = await fixtureUser('Stranger', 'stranger@destroy.test')
++  })
++
++  async function fixtureUser(name: string, email: string): Promise<UserRecord> {
++    const existing = await User.newQuery().where('email', email).first<UserRecord>()
++    if (existing) {
++      return existing
++    }
++
++    return (await User.create({ name, email, password: 'password123' })) as UserRecord
++  }
++
++  async function createPost(): Promise<number> {
++    const post = await Post.forceCreate({
++      title: 'Owned post',
++      excerpt: 'Only its author may delete it.',
++      body: 'body',
++      authorId: author.id,
++    })
++
++    return Number(post?.id)
++  }
++
++  it('refuses a signed-in user who is not the author', async () => {
++    const id = await createPost()
++    const acting = await http.actingAs(stranger).withCsrf(`/posts/${id}`)
++
++    await acting.delete(`/posts/${id}`).assertStatus(403)
++
++    expect(await Post.find(id)).not.toBeNull()
++  })
++
++  it('refuses a guest', async () => {
++    const id = await createPost()
++    const guest = await http.withCsrf(`/posts/${id}`)
++
++    const response = await guest.delete(`/posts/${id}`)
++    expect(response.status).not.toBe(200)
++
++    expect(await Post.find(id)).not.toBeNull()
++  })
++
++  it('lets the author delete their own post', async () => {
++    const id = await createPost()
++    const acting = await http.actingAs(author).withCsrf(`/posts/${id}`)
++
++    await acting.delete(`/posts/${id}`)
++
++    expect(await Post.find(id)).toBeNull()
++  })
++})

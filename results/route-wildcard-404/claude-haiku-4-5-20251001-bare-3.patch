@@ -1,0 +1,158 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..a2c8dee 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,7 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:year'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +312,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..e2913c1 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index d15bcbb..0b1b52e 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,7 +4,8 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import {
+-  ArchiveParamSchema,
++  ArchiveYearMonthParamSchema,
++  ArchiveYearParamSchema,
+   PostIdParamSchema,
+   PostPayloadSchema,
+   PostSearchSchema,
+@@ -60,9 +61,22 @@ export default class PostController extends Controller {
+   // that period, newest first. `created_at` is stored as an ISO 8601 string, so
+   // a `YYYY-MM-` (or `YYYY-`) prefix match selects the period without parsing.
+   async archive(): Promise<Response> {
+-    const { date } = this.validateParams(ArchiveParamSchema)
+-    const [year, month] = date.split('/')
+-    const prefix = month ? `${year}-${month.padStart(2, '0')}-` : `${year}-`
++    // Handle both /archive/:year/:month and /archive/:year routes
++    const params = this.request.param()
++    let year: number
++    let month: number | undefined
++
++    if (params.month !== undefined) {
++      const validated = this.validateParams(ArchiveYearMonthParamSchema)
++      year = validated.year
++      month = validated.month
++    } else {
++      const validated = this.validateParams(ArchiveYearParamSchema)
++      year = validated.year
++    }
++
++    const monthStr = month ? String(month).padStart(2, '0') : undefined
++    const prefix = monthStr ? `${year}-${monthStr}-` : `${year}-`
+ 
+     const posts = await Post.newQuery()
+       .with('author')
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 83d0495..4ffcb29 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -24,8 +24,12 @@ export const PostPayloadSchema = z.object({
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+ 
+-// The archive route captures everything after /posts/archive/ into one `date`
+-// param: "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
+-export const ArchiveParamSchema = z.object({
+-  date: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
++// Year and month archive routes: /posts/archive/2026 and /posts/archive/2026/08
++export const ArchiveYearParamSchema = z.object({
++  year: z.coerce.number().int().min(1000).max(9999),
++})
++
++export const ArchiveYearMonthParamSchema = z.object({
++  year: z.coerce.number().int().min(1000).max(9999),
++  month: z.coerce.number().int().min(1).max(12),
+ })
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..9416cfd 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -32,7 +32,8 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:year/:month', [PostController, 'archive'])
++    posts.get('/archive/:year', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..639d330 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -20,3 +20,43 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.archive', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('handles yearly archive requests', async () => {
++    const response = await http.get('/posts/archive/2026')
++    response.assertStatus(200)
++    const body = await response.json()
++    if (typeof body !== 'object' || body === null || !('data' in body)) {
++      throw new Error(`Expected { data: [...] }, got ${JSON.stringify(body)}`)
++    }
++  })
++
++  it('handles monthly archive requests', async () => {
++    const response = await http.get('/posts/archive/2026/08')
++    response.assertStatus(200)
++    const body = await response.json()
++    if (typeof body !== 'object' || body === null || !('data' in body)) {
++      throw new Error(`Expected { data: [...] }, got ${JSON.stringify(body)}`)
++    }
++  })
++
++  it('handles monthly archive with single digit month', async () => {
++    const response = await http.get('/posts/archive/2026/8')
++    response.assertStatus(200)
++    const body = await response.json()
++    if (typeof body !== 'object' || body === null || !('data' in body)) {
++      throw new Error(`Expected { data: [...] }, got ${JSON.stringify(body)}`)
++    }
++  })
++
++  it('rejects invalid month numbers', async () => {
++    await http.get('/posts/archive/2026/13').assertStatus(422)
++    await http.get('/posts/archive/2026/0').assertStatus(422)
++  })
++})

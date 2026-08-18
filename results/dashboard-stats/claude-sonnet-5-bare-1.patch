@@ -1,0 +1,175 @@
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..845dcef 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -43,6 +43,8 @@ export interface PagePropsMap {
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+   'Home': {
+   latest: PostResourceData[]
+diff --git a/app/Http/Controllers/DashboardController.ts b/app/Http/Controllers/DashboardController.ts
+index dcaddfc..5b7c5c7 100644
+--- a/app/Http/Controllers/DashboardController.ts
++++ b/app/Http/Controllers/DashboardController.ts
+@@ -1,5 +1,6 @@
+ import { Controller } from '@guren/core'
+ import type { UserRecord } from '../../Models/User.js'
++import { Post } from '../../Models/Post.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class DashboardController extends Controller {
+@@ -12,6 +13,20 @@ export default class DashboardController extends Controller {
+           email: currentUser.email,
+         }
+       : null
+-    return this.inertia(pages.dashboard.Index, { user }, { title: 'Dashboard' })
++
++    const postCount = currentUser ? await Post.newQuery().where('authorId', currentUser.id).count() : 0
++    const recentPosts = currentUser
++      ? await Post.newQuery().where('authorId', currentUser.id).orderBy('createdAt', 'desc').limit(5).get()
++      : []
++
++    return this.inertia(
++      pages.dashboard.Index,
++      {
++        user,
++        postCount,
++        recentPosts: recentPosts.map((post) => ({ id: post.id, title: post.title })),
++      },
++      { title: 'Dashboard' },
++    )
+   }
+ }
+diff --git a/resources/js/pages/dashboard/Index.tsx b/resources/js/pages/dashboard/Index.tsx
+index 8c5748b..94220ae 100644
+--- a/resources/js/pages/dashboard/Index.tsx
++++ b/resources/js/pages/dashboard/Index.tsx
+@@ -2,9 +2,11 @@ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+ 
+-export default function Dashboard({ user }: Props) {
++export default function Dashboard({ user, postCount, recentPosts }: Props) {
+   return (
+     <Layout>
+       <section className="space-y-6">
+@@ -23,6 +25,33 @@ export default function Dashboard({ user }: Props) {
+             You are not signed in.
+           </div>
+         )}
++
++        <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6 shadow-lg shadow-emerald-500/10">
++          <p className="text-sm text-slate-300">
++            You have {postCount} {postCount === 1 ? 'post' : 'posts'}
++          </p>
++
++          <h3 className="mt-4 text-lg font-medium text-slate-100">Recent posts</h3>
++          {recentPosts.length > 0 ? (
++            <ul className="mt-2 space-y-1">
++              {recentPosts.map((post) => (
++                <li key={post.id}>
++                  <a href={`/posts/${post.id}`} className="text-emerald-300 hover:underline">
++                    {post.title}
++                  </a>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="mt-2 text-sm text-slate-400">
++              You haven&apos;t written any posts yet.{' '}
++              <a href="/posts/create" className="text-emerald-300 hover:underline">
++                Write your first post
++              </a>
++              .
++            </p>
++          )}
++        </div>
+       </section>
+     </Layout>
+   )
+diff --git a/tests/DashboardController.test.ts b/tests/DashboardController.test.ts
+new file mode 100644
+index 0000000..fd13434
+--- /dev/null
++++ b/tests/DashboardController.test.ts
+@@ -0,0 +1,72 @@
++import { beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
++
++describe('dashboard', () => {
++  let http: TestApp
++
++  beforeEach(async () => {
++    await resetDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  it('redirects a guest to the login page', async () => {
++    await http.get('/dashboard').assertRedirect('/login')
++  })
++
++  it("reports the signed-in user's post count and 5 most recent posts, newest first", async () => {
++    const owner = await User.forceCreate({ name: 'Owner', email: 'owner@example.com', password: 'password' })
++    const other = await User.forceCreate({ name: 'Other', email: 'other@example.com', password: 'password' })
++
++    await Post.forceCreate({
++      title: 'Someone else post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: other.id,
++      createdAt: '2024-01-10T00:00:00.000Z',
++    })
++
++    const ownPosts = []
++    for (let i = 1; i <= 6; i++) {
++      ownPosts.push(
++        await Post.forceCreate({
++          title: `Post ${i}`,
++          excerpt: 'excerpt',
++          body: 'body',
++          authorId: owner.id,
++          createdAt: `2024-01-0${i}T00:00:00.000Z`,
++        }),
++      )
++    }
++
++    await http
++      .actingAs(owner)
++      .json()
++      .get('/dashboard')
++      .assertOk()
++      .assertInertia('dashboard/Index', {
++        postCount: 6,
++        recentPosts: [
++          { id: ownPosts[5].id, title: 'Post 6' },
++          { id: ownPosts[4].id, title: 'Post 5' },
++          { id: ownPosts[3].id, title: 'Post 4' },
++          { id: ownPosts[2].id, title: 'Post 3' },
++          { id: ownPosts[1].id, title: 'Post 2' },
++        ],
++      })
++  })
++
++  it('shows an empty state for a user with no posts', async () => {
++    const user = await User.forceCreate({ name: 'Empty', email: 'empty@example.com', password: 'password' })
++
++    await http
++      .actingAs(user)
++      .json()
++      .get('/dashboard')
++      .assertOk()
++      .assertInertia('dashboard/Index', { postCount: 0, recentPosts: [] })
++  })
++})

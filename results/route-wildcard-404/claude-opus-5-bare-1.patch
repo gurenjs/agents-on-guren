@@ -1,0 +1,209 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..3c06fb1 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,11 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:year'
++  }
++  'posts.archive.month': {
++    method: 'GET'
++    path: '/posts/archive/:year/:month'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +316,8 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
++  'posts.archive.month': { method: 'GET', path: '/posts/archive/:year/:month' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..f3a9147 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,8 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:year' },
++  'posts.archive.month': { method: 'GET', path: '/posts/archive/:year/:month' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+@@ -78,7 +79,12 @@ export const routes = {
+   ),
+   logout: (query?: RouteQuery) => route('logout', query),
+   posts: {
+-    archive: (params: RouteParams<'posts.archive'>, query?: RouteQuery) => route('posts.archive', params, query),
++    archive: Object.assign(
++      (params: RouteParams<'posts.archive'>, query?: RouteQuery) => route('posts.archive', params, query),
++      {
++      month: (params: RouteParams<'posts.archive.month'>, query?: RouteQuery) => route('posts.archive.month', params, query)
++    }
++    ),
+     create: (query?: RouteQuery) => route('posts.create', query),
+     destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
+     edit: (params: RouteParams<'posts.edit'>, query?: RouteQuery) => route('posts.edit', params, query),
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index d15bcbb..44eddcb 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,7 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import {
+-  ArchiveParamSchema,
++  ArchiveParamsSchema,
+   PostIdParamSchema,
+   PostPayloadSchema,
+   PostSearchSchema,
+@@ -57,11 +57,12 @@ export default class PostController extends Controller {
+   }
+ 
+   // Monthly / yearly archive as JSON: `{ data: [...] }` of the posts created in
+-  // that period, newest first. `created_at` is stored as an ISO 8601 string, so
+-  // a `YYYY-MM-` (or `YYYY-`) prefix match selects the period without parsing.
++  // that period, newest first. Serves both `posts.archive` and
++  // `posts.archive.month`, which differ only in whether `:month` is present.
++  // `created_at` is stored as an ISO 8601 string, so a `YYYY-MM-` (or `YYYY-`)
++  // prefix match selects the period as stored (UTC) without parsing.
+   async archive(): Promise<Response> {
+-    const { date } = this.validateParams(ArchiveParamSchema)
+-    const [year, month] = date.split('/')
++    const { year, month } = this.validateParams(ArchiveParamsSchema)
+     const prefix = month ? `${year}-${month.padStart(2, '0')}-` : `${year}-`
+ 
+     const posts = await Post.newQuery()
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 83d0495..3e13910 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -24,8 +24,13 @@ export const PostPayloadSchema = z.object({
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+ 
+-// The archive route captures everything after /posts/archive/ into one `date`
+-// param: "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
+-export const ArchiveParamSchema = z.object({
+-  date: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
++// Shared by both archive routes — /posts/archive/:year lists a whole year and
++// /posts/archive/:year/:month a single month, so `month` is absent on the
++// former and either "08" or "8" on the latter.
++export const ArchiveParamsSchema = z.object({
++  year: z.string().regex(/^\d{4}$/, 'Expected a four-digit year.'),
++  month: z
++    .string()
++    .regex(/^(0?[1-9]|1[0-2])$/, 'Expected a month between 1 and 12.')
++    .optional(),
+ })
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..0e3b742 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -31,8 +31,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
++    // Two routes rather than one pattern: a `:param` matches exactly one path
++    // segment, so nothing spanning "2026/08" can also match a bare "2026".
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:year/:month', [PostController, 'archive']).name('posts.archive.month')
++    posts.get('/archive/:year', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostArchiveController.test.ts b/tests/PostArchiveController.test.ts
+new file mode 100644
+index 0000000..5ad75d0
+--- /dev/null
++++ b/tests/PostArchiveController.test.ts
+@@ -0,0 +1,79 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++
++// Unlike the other starter tests, the archive is a database read, so this file
++// migrates the test database and creates its own fixtures. They sit in years no
++// seeder uses, so the assertions count only these posts however often the suite
++// has run before.
++const AUTHOR_EMAIL = 'archive-fixture@example.com'
++const FIXTURES = [
++  { title: 'Early March', excerpt: 'March', body: 'March', createdAt: '1998-03-04T09:00:00.000Z' },
++  { title: 'Late March', excerpt: 'March', body: 'March', createdAt: '1998-03-27T21:30:00.000Z' },
++  { title: 'November', excerpt: 'November', body: 'November', createdAt: '1998-11-02T00:00:00.000Z' },
++]
++
++async function archivedTitles(http: TestApp, path: string): Promise<string[]> {
++  const response = await http.get(path).assertOk()
++  const { data } = (await response.json()) as { data: PostResourceData[] }
++  return data.map((post) => post.title)
++}
++
++describe('posts.archive', () => {
++  let http: TestApp
++  let authorId: number
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++
++    const author =
++      (await User.where({ email: AUTHOR_EMAIL }).first()) ??
++      (await User.create({ name: 'Archive Fixture', email: AUTHOR_EMAIL, password: 'secret' }))
++    authorId = author!.id as number
++
++    // forceCreate: `authorId` and `createdAt` are both outside Post.fillable.
++    for (const fixture of FIXTURES) {
++      await Post.forceCreate({ ...fixture, authorId })
++    }
++  })
++
++  afterAll(async () => {
++    await Post.delete({ authorId })
++    await User.delete({ id: authorId })
++  })
++
++  it('lists the posts of a month, newest first', async () => {
++    expect(await archivedTitles(http, '/posts/archive/1998/03')).toEqual(['Late March', 'Early March'])
++  })
++
++  it('accepts a month without its leading zero', async () => {
++    expect(await archivedTitles(http, '/posts/archive/1998/3')).toEqual(['Late March', 'Early March'])
++  })
++
++  it('lists the posts of a whole year', async () => {
++    expect(await archivedTitles(http, '/posts/archive/1998')).toEqual([
++      'November',
++      'Late March',
++      'Early March',
++    ])
++  })
++
++  it('answers a period with no posts with an empty list', async () => {
++    expect(await archivedTitles(http, '/posts/archive/1998/07')).toEqual([])
++    expect(await archivedTitles(http, '/posts/archive/1997')).toEqual([])
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/1998/13').assertStatus(422)
++    await http.get('/posts/archive/1998/00').assertStatus(422)
++  })
++
++  it('rejects a year that is not four digits', async () => {
++    await http.get('/posts/archive/98').assertStatus(422)
++  })
++})

@@ -1,0 +1,198 @@
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..845dcef 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -43,6 +43,8 @@ export interface PagePropsMap {
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+   'Home': {
+   latest: PostResourceData[]
+diff --git a/app/Http/Controllers/DashboardController.ts b/app/Http/Controllers/DashboardController.ts
+index dcaddfc..467ea39 100644
+--- a/app/Http/Controllers/DashboardController.ts
++++ b/app/Http/Controllers/DashboardController.ts
+@@ -1,7 +1,10 @@
+ import { Controller } from '@guren/core'
++import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const RECENT_POSTS_LIMIT = 5
++
+ export default class DashboardController extends Controller {
+   async index(): Promise<Response> {
+     const currentUser = await this.auth.user<UserRecord | null>()
+@@ -12,6 +15,28 @@ export default class DashboardController extends Controller {
+           email: currentUser.email,
+         }
+       : null
+-    return this.inertia(pages.dashboard.Index, { user }, { title: 'Dashboard' })
++
++    // Both queries are scoped to the signed-in author, so another writer's
++    // posts can never reach the dashboard however recent they are.
++    const postCount = currentUser
++      ? await Post.newQuery().where({ authorId: currentUser.id }).count()
++      : 0
++    // `createdAt` is an ISO string, so ties (same-second inserts) are possible —
++    // the id tiebreak keeps "newest first" stable.
++    const recent = currentUser
++      ? await Post.newQuery()
++          .where({ authorId: currentUser.id })
++          .orderBy('createdAt', 'desc')
++          .orderBy('id', 'desc')
++          .limit(RECENT_POSTS_LIMIT)
++          .get()
++      : []
++    const recentPosts = recent.map((post) => ({ id: post.id, title: post.title }))
++
++    return this.inertia(
++      pages.dashboard.Index,
++      { user, postCount, recentPosts },
++      { title: 'Dashboard' },
++    )
+   }
+ }
+diff --git a/resources/js/pages/dashboard/Index.tsx b/resources/js/pages/dashboard/Index.tsx
+index 8c5748b..a3311d7 100644
+--- a/resources/js/pages/dashboard/Index.tsx
++++ b/resources/js/pages/dashboard/Index.tsx
+@@ -1,10 +1,13 @@
++import { Link } from '@inertiajs/react'
+ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+ 
+-export default function Dashboard({ user }: Props) {
++export default function Dashboard({ user, postCount, recentPosts }: Props) {
+   return (
+     <Layout>
+       <section className="space-y-6">
+@@ -23,6 +26,33 @@ export default function Dashboard({ user }: Props) {
+             You are not signed in.
+           </div>
+         )}
++
++        <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6">
++          <p className="text-sm text-slate-300">
++            You have {postCount} {postCount === 1 ? 'post' : 'posts'}
++          </p>
++
++          <h2 className="mt-6 text-lg font-medium text-slate-100">Recent posts</h2>
++          {recentPosts.length > 0 ? (
++            <ul className="mt-3 space-y-2">
++              {recentPosts.map((post) => (
++                <li key={post.id}>
++                  <Link href={`/posts/${post.id}`} className="text-emerald-300 hover:underline">
++                    {post.title}
++                  </Link>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="mt-3 text-sm text-slate-400">
++              You haven't written any posts yet.{' '}
++              <Link href="/posts/create" className="text-emerald-300 hover:underline">
++                Write your first post
++              </Link>
++              .
++            </p>
++          )}
++        </div>
+       </section>
+     </Layout>
+   )
+diff --git a/tests/DashboardController.test.ts b/tests/DashboardController.test.ts
+new file mode 100644
+index 0000000..aa93781
+--- /dev/null
++++ b/tests/DashboardController.test.ts
+@@ -0,0 +1,81 @@
++import { beforeAll, beforeEach, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { UserRecord } from '../app/Models/User.js'
++
++async function createUser(email: string): Promise<UserRecord> {
++  const user = await User.create({ name: email.split('@')[0]!, email, password: 'password123' })
++  return user as UserRecord
++}
++
++// createdAt is an ISO string with second-or-better resolution; stamping it
++// explicitly keeps "newest first" deterministic regardless of insert speed.
++async function createPost(authorId: number, title: string, createdAt: string) {
++  return Post.forceCreate({ title, excerpt: title, body: title, authorId, createdAt })
++}
++
++// The X-Inertia header makes the page respond with its JSON payload instead
++// of the HTML shell, so the props the component receives can be asserted directly.
++async function inertiaProps<T>(client: TestApp): Promise<T> {
++  const response = await client.withHeader('X-Inertia', 'true').get('/dashboard')
++  response.assertOk()
++  const payload = await response.json<{ component: string; props: T }>()
++  expect(payload.component).toBe('dashboard/Index')
++  return payload.props
++}
++
++describe('dashboard', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  it('redirects guests to the login page', async () => {
++    await http.get('/dashboard').assertRedirect('/login')
++  })
++
++  it('reports the signed-in user post count and their 5 newest posts', async () => {
++    const author = await createUser('author@example.com')
++    const other = await createUser('other@example.com')
++
++    for (let index = 1; index <= 7; index += 1) {
++      await createPost(author.id, `Mine ${index}`, `2026-01-0${index}T00:00:00.000Z`)
++    }
++    await createPost(other.id, 'Theirs', '2026-02-01T00:00:00.000Z')
++
++    const props = await inertiaProps<{
++      postCount: number
++      recentPosts: Array<{ id: number; title: string }>
++    }>(http.actingAs(author))
++
++    expect(props.postCount).toBe(7)
++    expect(props.recentPosts.map((post) => post.title)).toEqual([
++      'Mine 7',
++      'Mine 6',
++      'Mine 5',
++      'Mine 4',
++      'Mine 3',
++    ])
++    expect(props.recentPosts.every((post) => typeof post.id === 'number')).toBe(true)
++  })
++
++  it('shows an empty list for a user without posts', async () => {
++    const author = await createUser('empty@example.com')
++    await createPost((await createUser('busy@example.com')).id, 'Not mine', '2026-03-01T00:00:00.000Z')
++
++    const props = await inertiaProps<{ postCount: number; recentPosts: unknown[] }>(
++      http.actingAs(author),
++    )
++
++    expect(props.postCount).toBe(0)
++    expect(props.recentPosts).toEqual([])
++  })
++})

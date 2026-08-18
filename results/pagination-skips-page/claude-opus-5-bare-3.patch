@@ -1,0 +1,114 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/tests/PostPagination.test.ts b/tests/PostPagination.test.ts
+new file mode 100644
+index 0000000..fd4d696
+--- /dev/null
++++ b/tests/PostPagination.test.ts
+@@ -0,0 +1,95 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { readInertiaResponse, TestApp } from '@guren/testing'
++import type { PaginatedPageProps } from '@guren/core'
++import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++
++// The post list is paginated by the controller, so page 1 of /posts must be
++// the first slice of the newest-first ordering — no post may be skipped and
++// none may repeat across pages. Booting the real app also migrates and seeds
++// the test database (config/database.ts points NODE_ENV=test at its own
++// SQLite file), so these tests top the seeded posts up to more than two pages
++// and compare each page against the same newest-first list the model returns.
++const PER_PAGE = 10
++const MINIMUM_POSTS = 25
++
++type PostsIndexProps = PaginatedPageProps<PostResourceData>
++
++async function fetchPage(http: TestApp, path: string): Promise<PostsIndexProps> {
++  const response = await http.get(path).assertOk()
++  const { payload } = await readInertiaResponse(response.raw)
++  return payload.props as PostsIndexProps
++}
++
++describe('posts.index pagination', () => {
++  let http: TestApp
++  let newestFirstIds: number[]
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    const author = (await User.first()) ?? (await User.create({ name: 'Pagination Author', email: 'pagination@example.com', password: 'secret' }))
++    const existing = await Post.all()
++    for (let index = existing.length; index < MINIMUM_POSTS; index += 1) {
++      await Post.forceCreate({
++        title: `Pagination post ${index + 1}`,
++        excerpt: `Excerpt ${index + 1}`,
++        body: `Body ${index + 1}`,
++        authorId: author.id,
++      })
++    }
++
++    const posts = await Post.newQuery().orderBy('id', 'desc').get()
++    newestFirstIds = posts.map((post) => post.id)
++  })
++
++  it('starts at the newest post', async () => {
++    const props = await fetchPage(http, '/posts')
++
++    expect(props.data.map((post) => post.id)).toEqual(newestFirstIds.slice(0, PER_PAGE))
++    expect(props.pagination.meta).toMatchObject({
++      currentPage: 1,
++      perPage: PER_PAGE,
++      total: newestFirstIds.length,
++      lastPage: Math.ceil(newestFirstIds.length / PER_PAGE),
++      from: 1,
++      to: PER_PAGE,
++    })
++  })
++
++  it('treats ?page=1 as the same first page', async () => {
++    const first = await fetchPage(http, '/posts')
++    const explicit = await fetchPage(http, '/posts?page=1')
++
++    expect(explicit.data.map((post) => post.id)).toEqual(first.data.map((post) => post.id))
++  })
++
++  it('walks every post exactly once across the pages', async () => {
++    const lastPage = Math.ceil(newestFirstIds.length / PER_PAGE)
++    const seen: number[] = []
++
++    for (let page = 1; page <= lastPage; page += 1) {
++      const props = await fetchPage(http, `/posts?page=${page}`)
++      const expected = newestFirstIds.slice((page - 1) * PER_PAGE, page * PER_PAGE)
++
++      expect(props.data.map((post) => post.id)).toEqual(expected)
++      expect(props.pagination.meta.currentPage).toBe(page)
++      expect(props.pagination.meta.from).toBe((page - 1) * PER_PAGE + 1)
++      expect(props.pagination.meta.to).toBe((page - 1) * PER_PAGE + expected.length)
++      seen.push(...expected)
++    }
++
++    expect(seen).toEqual(newestFirstIds)
++  })
++
++  it('marks the page being shown as the active pager link', async () => {
++    const props = await fetchPage(http, '/posts?page=2')
++    const active = props.pagination.links.pages.filter((link) => link.active)
++
++    expect(active.map((link) => link.page)).toEqual([2])
++    expect(props.pagination.links.prev).toContain('page=1')
++    expect(props.pagination.links.first).toContain('page=1')
++  })
++})

@@ -1,0 +1,125 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..ddfa7bb 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -35,12 +35,12 @@ export default class PostController extends Controller {
+ 
+     const posts = await Post.newQuery()
+       .with('author')
++      .where('published', true)
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
+       .orderBy('id', 'desc')
+       .limit(limit)
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..ca11682 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,14 +1,16 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+ // to the route feeds codegen and `guren audit`, while body parsing stays in
+ // the controller so the request stream is read once — so an invalid payload
+-// gets a 422 without the database ever being touched. That keeps this starter
+-// test green without migrations or fixtures; cover the happy path with real
+-// feature tests once your test database is set up.
++// gets a 422 without the database ever being touched.
+ describe('posts.search', () => {
+   let http: TestApp
+ 
+@@ -20,3 +22,81 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// Nonsense keywords, so these fixtures can never collide with seeded posts.
++const FIXTURE_EMAIL = 'search-fixture@example.com'
++const PUBLISHED_ZEPHYRQUILL = 'zephyrquill in the open'
++const DRAFT_ZEPHYRQUILL = 'zephyrquill behind the curtain'
++const PUBLISHED_MARMALADE = 'marmalade in the open'
++const DRAFT_MARMALADE = 'marmalade behind the curtain'
++const PUBLISHED_UNRELATED = 'nothing to search for here'
++const DRAFT_ONLY_WORD = 'quillhaven, drafted and never published'
++
++const FIXTURE_TITLES = [
++  PUBLISHED_ZEPHYRQUILL,
++  DRAFT_ZEPHYRQUILL,
++  PUBLISHED_MARMALADE,
++  DRAFT_MARMALADE,
++  PUBLISHED_UNRELATED,
++  DRAFT_ONLY_WORD,
++]
++
++describe('posts.search results', () => {
++  let http: TestApp
++
++  async function searchTitles(keywords: string[]): Promise<string[]> {
++    const response = await http.query('/posts/search', { keywords }).assertOk()
++    const body = await response.json<{ data: PostResourceData[] }>()
++
++    return body.data.map((post) => post.title).sort()
++  }
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++
++    const author =
++      (await User.newQuery().where('email', FIXTURE_EMAIL).first()) ??
++      (await User.create({ name: 'Search Fixture Author', email: FIXTURE_EMAIL, password: 'secret' }))
++
++    for (const [title, published] of [
++      [PUBLISHED_ZEPHYRQUILL, true],
++      [DRAFT_ZEPHYRQUILL, false],
++      [PUBLISHED_MARMALADE, true],
++      [DRAFT_MARMALADE, false],
++      // Published, but matches no keyword: it must never pad the results.
++      [PUBLISHED_UNRELATED, true],
++      [DRAFT_ONLY_WORD, false],
++    ] as const) {
++      await Post.forceCreate({
++        title,
++        excerpt: published ? 'published fixture' : 'unpublished fixture',
++        body: 'Fixture body.',
++        authorId: author!.id,
++        published,
++      })
++    }
++  })
++
++  afterAll(async () => {
++    for (const title of FIXTURE_TITLES) {
++      await Post.delete({ title })
++    }
++    await User.delete({ email: FIXTURE_EMAIL })
++  })
++
++  it('returns only the published posts matching the keyword', async () => {
++    expect(await searchTitles(['zephyrquill'])).toEqual([PUBLISHED_ZEPHYRQUILL])
++  })
++
++  it('returns only the published posts matching any of several keywords', async () => {
++    expect(await searchTitles(['zephyrquill', 'marmalade'])).toEqual(
++      [PUBLISHED_ZEPHYRQUILL, PUBLISHED_MARMALADE].sort(),
++    )
++  })
++
++  it('returns nothing for a keyword only unpublished posts contain', async () => {
++    expect(await searchTitles(['quillhaven'])).toEqual([])
++    expect(await searchTitles(['quillhaven', 'behind the curtain'])).toEqual([])
++  })
++})

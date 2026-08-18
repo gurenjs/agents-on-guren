@@ -1,0 +1,460 @@
+diff --git a/README.md b/README.md
+index daca2ea..e05c3ce 100644
+--- a/README.md
++++ b/README.md
+@@ -52,7 +52,11 @@ Write/Dashboard/Log out controls.
+ - `app/Http/Resources/` — the shapes controllers hand to pages
+ - `app/Models/` — ORM models (`Post` belongs to `User`)
+ - `app/Policies/` — authorization rules
+-- `app/Providers/` — the auth model binding, shared page props, and the policy binding
++- `app/Jobs/` — background work, dispatched to the queue and run by a worker
++- `app/Mail/` — the messages the app sends
++- `app/Providers/` — the auth model binding, shared page props, the policy
++  binding, and the queue/mail wiring (configured in `config/queue.ts` and
++  `config/mail.ts` from `QUEUE_CONNECTION` / `MAIL_MAILER`)
+ - `resources/js/pages/` — React pages (rendered via Inertia.js)
+ - `db/schema.ts` — Drizzle table definitions
+ - `db/seeders/` — the demo user and sample posts
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..44729d2 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -23,6 +24,12 @@ export default class RegisterController extends Controller {
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
++    // Queued rather than sent here: the mail provider is slow and sometimes
++    // down, and sign-up must neither wait on it nor fail with it. The message
++    // goes out when the queued work runs — see app/Jobs/SendWelcomeEmailJob.ts.
++    // A refused registration never reaches this line, so it queues nothing.
++    await SendWelcomeEmailJob.dispatch({ name: user.name, email: user.email })
++
+     return this.redirect('/dashboard')
+   }
+ }
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..2178974
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,37 @@
++import { Job, getMailManager } from '@guren/core'
++import { sendWelcomeMail } from '../Mail/WelcomeMail.js'
++
++export interface SendWelcomeEmailPayload {
++  name: string
++  email: string
++}
++
++/**
++ * Delivers the welcome email out of band. Registration only dispatches this,
++ * so a slow or unreachable mail provider cannot make sign-up hang or fail with
++ * it — the message goes out when the queued work runs, in a worker.
++ *
++ * The payload carries the name and address the account registered with instead
++ * of a user id: everything the message needs travels with it, so the worker
++ * needs no database of its own.
++ */
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailPayload> {
++  // Pinned so a bundled build (which may mangle class names) still queues and
++  // resolves the job under the name in-flight messages carry.
++  static override jobName = 'SendWelcomeEmailJob'
++  static override queue = 'default'
++  static override maxAttempts = 3
++
++  async handle(payload: SendWelcomeEmailPayload): Promise<void> {
++    const manager = getMailManager()
++    if (!manager) {
++      throw new Error('Mail manager not configured for queue jobs — app/Providers/MailProvider.ts publishes it on boot.')
++    }
++
++    await sendWelcomeMail(manager, payload)
++  }
++
++  async failed(payload: SendWelcomeEmailPayload, error: Error): Promise<void> {
++    console.error(`SendWelcomeEmailJob failed for ${payload.email}:`, error.message)
++  }
++}
+diff --git a/app/Mail/WelcomeMail.ts b/app/Mail/WelcomeMail.ts
+new file mode 100644
+index 0000000..d193818
+--- /dev/null
++++ b/app/Mail/WelcomeMail.ts
+@@ -0,0 +1,40 @@
++import { mail, type MailManager } from '@guren/core'
++import { appName } from '../../config/app.js'
++import { mailFrom } from '../../config/mail.js'
++
++export interface WelcomeMailRecipient {
++  name: string
++  email: string
++}
++
++/**
++ * The greeting every newly registered account receives. Sent from
++ * `SendWelcomeEmailJob`, never from the registration request itself.
++ *
++ * The sender is set explicitly rather than left to the manager's default, so
++ * the message carries it whichever manager ends up delivering it — the one in
++ * this process, or the one a worker booted.
++ */
++export async function sendWelcomeMail(manager: MailManager, recipient: WelcomeMailRecipient): Promise<void> {
++  const app = appName()
++
++  const result = await mail(manager)
++    .from(mailFrom())
++    .to(recipient.email)
++    .subject(`Welcome to ${app}, ${recipient.name}!`)
++    .text(
++      [
++        `Hi ${recipient.name},`,
++        '',
++        `Welcome to ${app}! Your account is ready — sign in any time to read the latest posts or write your own.`,
++        '',
++        `— The ${app} team`,
++      ].join('\n'),
++    )
++    .send()
++
++  // Thrown rather than swallowed so the queue retries the delivery.
++  if (!result.success) {
++    throw new Error(result.error ?? `Sending the welcome email to ${recipient.email} failed.`)
++  }
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..7cbae62
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,19 @@
++import { ServiceProvider, createMailManager, getMailManager, setMailManager, type MailManager } from '@guren/core'
++import { mailConfig } from '../../config/mail.js'
++
++export default class MailProvider extends ServiceProvider {
++  register(): void {
++    this.container.instance('mail', createMailManager(mailConfig()))
++  }
++
++  boot(): void {
++    // Queued mail is sent from a job, which runs without a request and — in
++    // production — in a worker process of its own, so the manager is published
++    // globally for jobs to reach. It is the same instance the container hands
++    // out. A manager installed before boot, such as a test recording what gets
++    // sent, is left alone.
++    if (!getMailManager()) {
++      setMailManager(this.container.make<MailManager>('mail'))
++    }
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..cd3c241
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,24 @@
++import { ServiceProvider, createQueueManager, getQueueDriver, registerJob, type QueueManager } from '@guren/core'
++import { queueConfig } from '../../config/queue.js'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    this.container.instance('queue', createQueueManager(queueConfig()))
++  }
++
++  boot(): void {
++    // A queued message records only the job's name, and whoever runs it —
++    // the sync driver here, or the worker `bunx guren queue:work` boots —
++    // resolves the class back from this registry. Registered before the driver
++    // is activated, so even an inline dispatch finds it.
++    registerJob(SendWelcomeEmailJob)
++
++    // Job.dispatch() pushes to the globally activated driver, and resolving
++    // the configured connection activates it. A driver installed before boot —
++    // a test pointing the app at a queue of its own — is left alone.
++    if (!getQueueDriver()) {
++      this.container.make<QueueManager>('queue').driver()
++    }
++  }
++}
+diff --git a/config/app.ts b/config/app.ts
+index ba658cc..0fd622f 100644
+--- a/config/app.ts
++++ b/config/app.ts
+@@ -26,6 +26,15 @@ function shouldSeedOnBoot(): boolean {
+   return process.env.NODE_ENV !== 'production'
+ }
+ 
++/**
++ * The name the app calls itself by, from APP_NAME. Read per call rather than
++ * captured at import time, so a process that populates process.env after this
++ * module loads (the Cloudflare worker does) still gets the configured name.
++ */
++export function appName(): string {
++  return process.env.APP_NAME ?? 'Guren'
++}
++
+ export async function bootModels(): Promise<void> {
+   if (bootstrapped) return
+ 
+diff --git a/config/mail.ts b/config/mail.ts
+new file mode 100644
+index 0000000..65c7d4c
+--- /dev/null
++++ b/config/mail.ts
+@@ -0,0 +1,29 @@
++import type { MailAddress, MailConfig } from '@guren/core'
++import { appName } from './app.js'
++
++/**
++ * MAIL_MAILER decides how a message leaves the app: `log` writes it to the
++ * server output (the development default, so nothing is actually delivered),
++ * `resend` posts it to the Resend API in production, and `memory` keeps it
++ * in-process for tests to read back. Switching provider is an .env change —
++ * no code that sends mail knows which one is active.
++ */
++export function mailConfig(): MailConfig {
++  return {
++    default: process.env.MAIL_MAILER ?? 'log',
++    from: mailFrom(),
++    transports: {
++      log: { driver: 'log' },
++      memory: { driver: 'memory' },
++      resend: { driver: 'resend', apiKey: process.env.RESEND_API_KEY ?? '' },
++    },
++  }
++}
++
++/** The sender every message goes out as — MAIL_FROM_ADDRESS / MAIL_FROM_NAME. */
++export function mailFrom(): MailAddress {
++  return {
++    email: process.env.MAIL_FROM_ADDRESS ?? 'hello@example.com',
++    name: process.env.MAIL_FROM_NAME ?? appName(),
++  }
++}
+diff --git a/config/queue.ts b/config/queue.ts
+new file mode 100644
+index 0000000..581c30c
+--- /dev/null
++++ b/config/queue.ts
+@@ -0,0 +1,26 @@
++import { MemoryDriver, RedisDriver, SyncDriver, type QueueConfig } from '@guren/core'
++import { createRedisClient } from '@guren/core/redis'
++
++/**
++ * QUEUE_CONNECTION decides where a dispatched job goes:
++ *
++ * - `sync` runs it inline in the dispatching process — the development
++ *   default, so queued work happens with no worker to start.
++ * - `memory` holds it in this process until a Worker picks it up (tests).
++ * - `redis` hands it to the separate worker process `bunx guren queue:work`
++ *   runs, which is how production drains the queue.
++ *
++ * Nothing that dispatches a job knows which one is active.
++ */
++export function queueConfig(): QueueConfig {
++  return {
++    default: process.env.QUEUE_CONNECTION ?? 'sync',
++    drivers: {
++      sync: () => new SyncDriver(),
++      memory: () => new MemoryDriver(),
++      // Factories run only for the connection actually selected, so
++      // development and tests never open a Redis connection.
++      redis: () => new RedisDriver(createRedisClient({ url: process.env.REDIS_URL })),
++    },
++  }
++}
+diff --git a/docs/adr/0002-queue-the-welcome-email.md b/docs/adr/0002-queue-the-welcome-email.md
+new file mode 100644
+index 0000000..61f1d36
+--- /dev/null
++++ b/docs/adr/0002-queue-the-welcome-email.md
+@@ -0,0 +1,61 @@
++---
++type: adr
++status: stable
++entities: [User]
++related:
++  - app/Http/Controllers/Auth/RegisterController.ts
++  - app/Jobs/SendWelcomeEmailJob.ts
++  - app/Mail/WelcomeMail.ts
++  - app/Providers/QueueProvider.ts
++  - app/Providers/MailProvider.ts
++  - config/queue.ts
++  - config/mail.ts
++---
++
++# Queue the welcome email instead of sending it during sign-up
++
++## Context
++
++Every newly registered account gets a welcome email. The mail provider is
++slow and occasionally unavailable, so sending the message inside the
++registration request would make sign-up hang whenever the provider is slow
++and fail whenever it is down — a registration that succeeded in the
++database would still be reported to the visitor as an error.
++
++Registration was the first thing in this app to need either a queue or a
++mailer, so neither was wired up.
++
++## Decision
++
++`RegisterController.store()` dispatches `SendWelcomeEmailJob` and returns
++the same redirect to `/dashboard` as before. The message is composed and
++handed to the mail transport inside the job, so nothing in the request path
++waits on the provider. A refused registration throws before the dispatch and
++so queues nothing.
++
++Both subsystems are configured from `.env`, and neither the controller nor
++the job knows which backend is active:
++
++- `QUEUE_CONNECTION` — `sync` runs the job inline in development (no worker
++  to start), `redis` hands it to the `bunx guren queue:work` worker in
++  production. `config/queue.ts` maps the name to a driver;
++  `app/Providers/QueueProvider.ts` activates it and registers the job class,
++  which is how a worker resolves a queued message back to its class.
++- `MAIL_MAILER` — `log` writes the message to the server output in
++  development, `resend` delivers it in production. `config/mail.ts` maps the
++  name to a transport and carries the `MAIL_FROM_ADDRESS` /
++  `MAIL_FROM_NAME` sender; `app/Providers/MailProvider.ts` binds the manager
++  and publishes it for jobs, which run without a request and, in production,
++  in a process of their own.
++
++The job payload carries the name and address the account registered with
++rather than a user id, so the worker needs no database access to send.
++
++## Consequences
++
++Sign-up no longer depends on the mail provider being up, at the cost of a
++worker process in production: with `QUEUE_CONNECTION=redis` the welcome
++email is only delivered while `bunx guren queue:work` is running, and a
++delivery that keeps failing lands in the failed-jobs list
++(`bunx guren queue:failed`) rather than being visible at sign-up. Later
++mail — verification, password resets, notifications — inherits this wiring.
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..1b13722 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, QueueProvider, MailProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..cd1854d
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,92 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import {
++  MemoryDriver,
++  MemoryTransport,
++  Worker,
++  getQueueDriver,
++  setQueueDriver,
++  type MailManager,
++  type QueueDriver,
++} from '@guren/core'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++
++// Registration hands the welcome email to the queue and returns; the message
++// only goes out when the queued work runs. These tests point the app's queue at
++// a driver that holds the work instead of running it (development runs `sync`,
++// which would send inline) and its mailer at a transport that records what it
++// was asked to deliver.
++describe('register.store', () => {
++  let http: TestApp
++  let mailer: MailManager
++  let defaultTransport: string
++  let previousQueueDriver: QueueDriver | null
++  let queue: MemoryDriver
++  let mailbox: MemoryTransport
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++
++    mailer = app.container.make<MailManager>('mail')
++    defaultTransport = mailer.getDefaultTransportName()
++    previousQueueDriver = getQueueDriver()
++  })
++
++  beforeEach(() => {
++    queue = new MemoryDriver()
++    setQueueDriver(queue)
++
++    mailbox = new MemoryTransport()
++    mailer.registerTransport(defaultTransport, () => mailbox)
++  })
++
++  afterAll(() => {
++    if (previousQueueDriver) {
++      setQueueDriver(previousQueueDriver)
++    }
++  })
++
++  it('queues the welcome email rather than sending it during sign-up', async () => {
++    const csrf = await http.withCsrf('/register')
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'a-good-password',
++        passwordConfirmation: 'a-good-password',
++      })
++      .assertRedirect('/dashboard')
++
++    expect(mailbox.count()).toBe(0)
++    expect(await queue.size('default')).toBe(1)
++
++    // What a worker process does with the waiting work.
++    await new Worker(queue, { queues: ['default'], stopWhenEmpty: true }).start()
++
++    expect(mailbox.count()).toBe(1)
++    const message = mailbox.getLastMessage()
++    expect(message?.to.map((address) => address.email)).toEqual(['ada@example.com'])
++    expect(message?.from?.email).toBe(process.env.MAIL_FROM_ADDRESS)
++    expect(message?.subject).toBe('Welcome to Guren, Ada Lovelace!')
++    expect(message?.text).toContain('Hi Ada Lovelace,')
++  })
++
++  it('queues nothing when the registration is refused', async () => {
++    const csrf = await http.withCsrf('/register')
++
++    await csrf
++      .post('/register', {
++        name: 'Grace Hopper',
++        email: 'grace@example.com',
++        password: 'a-good-password',
++        passwordConfirmation: 'a-different-password',
++      })
++      .assertUnprocessable()
++
++    expect(await queue.size('default')).toBe(0)
++    expect(mailbox.count()).toBe(0)
++  })
++})

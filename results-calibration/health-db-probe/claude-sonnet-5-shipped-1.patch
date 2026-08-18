@@ -1,0 +1,113 @@
+diff --git a/app/Http/HealthCheck.ts b/app/Http/HealthCheck.ts
+new file mode 100644
+index 0000000..b4a6859
+--- /dev/null
++++ b/app/Http/HealthCheck.ts
+@@ -0,0 +1,27 @@
++import { createHealthManager, DatabaseCheck, type DatabaseConnection, type Middleware } from '@guren/core'
++import { getDatabase } from '../../config/database.js'
++
++// The raw Drizzle SQLite handle (drizzle-orm/bun-sqlite) exposes `run()`,
++// not the `query()` shape DatabaseCheck expects — adapt it.
++const appDatabaseConnection: DatabaseConnection = {
++  async query(sql) {
++    const db = (await getDatabase()) as { run(query: string): unknown }
++    return db.run(sql)
++  },
++}
++
++/**
++ * Builds a `/health` route handler backed by the given database connection.
++ * Exported so tests can wire a failing connection and assert the 503 path
++ * without touching the real database.
++ */
++export function createHealthCheckHandler(connection: DatabaseConnection): Middleware {
++  const health = createHealthManager()
++  // `critical: true` — a failed database check drags the overall report to
++  // "unhealthy" (and the response to 503); otherwise it would only degrade
++  // to a still-200 "degraded" report, and a bad deploy would stay in rotation.
++  health.register(new DatabaseCheck(connection), { critical: true })
++  return health.middleware()
++}
++
++export const healthCheckHandler = createHealthCheckHandler(appDatabaseConnection)
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..ad06a7b 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -3,6 +3,7 @@ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
++import { healthCheckHandler } from '../app/Http/HealthCheck.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
+@@ -14,8 +15,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors — runs a
++  // real database round trip on every probe and answers 503 when it fails,
++  // so a deploy with an unreachable database gets drained instead of kept
++  // in rotation. See app/Http/HealthCheck.ts.
++  router.get('/health', healthCheckHandler)
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthCheck.test.ts b/tests/HealthCheck.test.ts
+new file mode 100644
+index 0000000..ad0caac
+--- /dev/null
++++ b/tests/HealthCheck.test.ts
+@@ -0,0 +1,48 @@
++import { describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import type { Router } from '@guren/core'
++import app from '../src/app.js'
++import { createHealthCheckHandler } from '../app/Http/HealthCheck.js'
++
++describe('GET /health', () => {
++  it('reports healthy with a 200 and a database check when the database is reachable', async () => {
++    const http = await TestApp.fromApp(app)
++
++    await http
++      .get('/health')
++      .assertOk()
++      .assertJsonPath('status', 'healthy')
++      .assertJsonPath('checks.0.name', 'database')
++      .assertJsonPath('checks.0.status', 'healthy')
++  })
++
++  it('queries the database on every probe, not a cached flag', async () => {
++    let calls = 0
++    const handler = createHealthCheckHandler({
++      async query() {
++        calls++
++        if (calls > 1) {
++          throw new Error('connection lost')
++        }
++      },
++    })
++    const http = await TestApp.create({
++      routes: (router: Router) => {
++        router.get('/health', handler)
++      },
++    })
++
++    // First probe: the database answers, so the endpoint is healthy.
++    await http.get('/health').assertOk().assertJsonPath('status', 'healthy')
++
++    // Second probe on the same handler instance: the database now fails —
++    // this only flips if the check re-queries every time rather than
++    // remembering the first result.
++    await http
++      .get('/health')
++      .assertStatus(503)
++      .assertJsonPath('status', 'unhealthy')
++      .assertJsonPath('checks.0.name', 'database')
++      .assertJsonPath('checks.0.status', 'unhealthy')
++  })
++})

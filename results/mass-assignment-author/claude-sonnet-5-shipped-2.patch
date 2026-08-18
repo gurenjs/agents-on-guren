@@ -1,0 +1,96 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,8 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    const data = await this.validateBody(PostPayloadSchema)
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..f374d23 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+ import { beforeAll, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,67 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await resetDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  async function createUsers() {
++    const author = await User.create({ name: 'Author', email: `author-${Math.random()}@example.com`, password: 'password123' })
++    const other = await User.create({ name: 'Other', email: `other-${Math.random()}@example.com`, password: 'password123' })
++    return { author, other }
++  }
++
++  async function createPost(authorId: number) {
++    return Post.forceCreate({ title: 'Original', excerpt: 'Original excerpt', body: 'Original body', authorId })
++  }
++
++  it('cannot be used to change the post author', async () => {
++    const { author, other } = await createUsers()
++    const post = await Post.findOrFail((await createPost(author.id)).id)
++
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, {
++        title: 'Renamed',
++        excerpt: 'Still mine?',
++        body: 'Body text',
++        authorId: other.id,
++      })
++      .assertRedirect(`/posts/${post.id}`)
++
++    const updated = await Post.findOrFail(post.id)
++    if (updated.authorId !== author.id) throw new Error('authorId was mass-assigned via request input')
++    if (updated.title !== 'Renamed') throw new Error('legitimate fields were not updated')
++  })
++
++  it('rejects an invalid edit with 422 and leaves the post unchanged', async () => {
++    const { author } = await createUsers()
++    const post = await createPost(author.id)
++
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, { title: '', excerpt: 'Still valid', body: 'Body text' })
++      .assertUnprocessable()
++
++    const unchanged = await Post.findOrFail(post.id)
++    if (unchanged.title !== 'Original') throw new Error('post was modified despite invalid input')
++  })
++
++  it('does not allow non-authors to update the post', async () => {
++    const { author, other } = await createUsers()
++    const post = await createPost(author.id)
++
++    const csrf = await http.actingAs(other).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, { title: 'Hijacked', excerpt: 'Nope', body: 'Body text' })
++      .assertForbidden()
++
++    const unchanged = await Post.findOrFail(post.id)
++    if (unchanged.title !== 'Original') throw new Error('non-author was able to modify the post')
++  })
++})

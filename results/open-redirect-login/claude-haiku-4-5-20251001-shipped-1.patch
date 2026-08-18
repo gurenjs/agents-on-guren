@@ -1,0 +1,244 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..3dd8639 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,11 +1,14 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { isSafeRedirect } from '../../Utilities/RedirectValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+-    const redirect = this.request.query('redirect') ?? ''
++    const queryRedirect = this.request.query('redirect') ?? ''
++    // Only pass the redirect to the page if it's safe; otherwise discard it
++    const redirect = isSafeRedirect(queryRedirect) ? queryRedirect : ''
+     return this.inertia(pages.auth.Login, { email, redirect }, { title: 'Login' })
+   }
+ 
+@@ -21,7 +24,8 @@ export default class LoginController extends Controller {
+     }
+ 
+     // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // The redirect has been validated to ensure it's a safe same-app path.
++    return this.redirect(redirect || '/dashboard')
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Http/Utilities/RedirectValidator.ts b/app/Http/Utilities/RedirectValidator.ts
+new file mode 100644
+index 0000000..544c772
+--- /dev/null
++++ b/app/Http/Utilities/RedirectValidator.ts
+@@ -0,0 +1,42 @@
++/**
++ * Validates that a redirect URL is safe and points to an internal path.
++ * Only allows absolute paths within the same application.
++ * Rejects absolute URLs, protocol-relative URLs, and any variant that
++ * could redirect to another origin.
++ */
++export function isSafeRedirect(url: string | undefined | null): boolean {
++  if (!url || typeof url !== 'string') {
++    return false
++  }
++
++  // Trim whitespace
++  const trimmed = url.trim()
++
++  // Must not be empty
++  if (trimmed.length === 0) {
++    return false
++  }
++
++  // Reject absolute URLs (e.g. http://example.com, https://example.com)
++  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) {
++    return false
++  }
++
++  // Reject protocol-relative URLs (e.g. //example.com, \\example.com)
++  if (/^[/\\]{2}/.test(trimmed)) {
++    return false
++  }
++
++  // Reject backslash variants that browsers treat as protocol-relative
++  // A single backslash followed by another slash: \/ or \\
++  if (/^\\/.test(trimmed)) {
++    return false
++  }
++
++  // Must start with / (absolute path within the app)
++  if (!trimmed.startsWith('/')) {
++    return false
++  }
++
++  return true
++}
+diff --git a/app/Http/Validators/LoginValidator.ts b/app/Http/Validators/LoginValidator.ts
+index 501c70d..71b3386 100644
+--- a/app/Http/Validators/LoginValidator.ts
++++ b/app/Http/Validators/LoginValidator.ts
+@@ -1,4 +1,5 @@
+ import { z } from 'zod'
++import { isSafeRedirect } from '../Utilities/RedirectValidator.js'
+ 
+ export const LoginSchema = z.object({
+   // Lowercased to match how registration stores emails — a case-sensitive
+@@ -24,7 +25,12 @@ export const LoginSchema = z.object({
+     .default(false),
+   // Where to send the user after a successful sign-in (e.g. the page that
+   // asked them to log in). Empty means the default destination.
+-  redirect: z.string().optional(),
++  // Invalid redirects (absolute URLs, protocol-relative, etc.) are normalized
++  // to an empty string and the user is sent to the default destination instead.
++  redirect: z
++    .string()
++    .optional()
++    .transform((value) => (isSafeRedirect(value) ? value : '')),
+ })
+ 
+ export type LoginInput = z.infer<typeof LoginSchema>
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..e413351
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,68 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++
++describe('LoginController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  describe('store', () => {
++    it('authenticates with valid credentials and redirects to dashboard by default', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'demo@example.com',
++          password: 'secret',
++          redirect: '',
++        })
++        .assertRedirect('/dashboard')
++    })
++
++    it('authenticates and respects safe redirects', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'demo@example.com',
++          password: 'secret',
++          redirect: '/posts/123',
++        })
++        .assertRedirect('/posts/123')
++    })
++
++    it('ignores unsafe redirects and goes to dashboard instead', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'demo@example.com',
++          password: 'secret',
++          redirect: 'https://evil.example',
++        })
++        .assertRedirect('/dashboard')
++    })
++
++    it('ignores protocol-relative redirects', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'demo@example.com',
++          password: 'secret',
++          redirect: '//evil.example',
++        })
++        .assertRedirect('/dashboard')
++    })
++
++    it('ignores backslash protocol-relative variants', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'demo@example.com',
++          password: 'secret',
++          redirect: '/\\evil.example',
++        })
++        .assertRedirect('/dashboard')
++    })
++  })
++})
+diff --git a/tests/RedirectValidator.test.ts b/tests/RedirectValidator.test.ts
+new file mode 100644
+index 0000000..61cecbb
+--- /dev/null
++++ b/tests/RedirectValidator.test.ts
+@@ -0,0 +1,62 @@
++import { describe, it } from 'bun:test'
++import { isSafeRedirect } from '../app/Http/Utilities/RedirectValidator.js'
++import { expect } from 'bun:test'
++
++describe('isSafeRedirect', () => {
++  describe('valid redirects', () => {
++    it('accepts absolute paths', () => {
++      expect(isSafeRedirect('/posts')).toBe(true)
++      expect(isSafeRedirect('/posts/123')).toBe(true)
++      expect(isSafeRedirect('/posts/123/edit')).toBe(true)
++      expect(isSafeRedirect('/')).toBe(true)
++    })
++
++    it('accepts paths with query strings', () => {
++      expect(isSafeRedirect('/posts?page=2')).toBe(true)
++      expect(isSafeRedirect('/posts?sort=name&order=asc')).toBe(true)
++    })
++
++    it('accepts paths with fragments', () => {
++      expect(isSafeRedirect('/posts#top')).toBe(true)
++      expect(isSafeRedirect('/posts/123#comments')).toBe(true)
++    })
++  })
++
++  describe('unsafe redirects', () => {
++    it('rejects absolute URLs with schemes', () => {
++      expect(isSafeRedirect('https://evil.example')).toBe(false)
++      expect(isSafeRedirect('http://evil.example')).toBe(false)
++      expect(isSafeRedirect('http://evil.example/path')).toBe(false)
++      expect(isSafeRedirect('ftp://evil.example')).toBe(false)
++      expect(isSafeRedirect('javascript:alert(1)')).toBe(false)
++    })
++
++    it('rejects protocol-relative URLs', () => {
++      expect(isSafeRedirect('//evil.example')).toBe(false)
++      expect(isSafeRedirect('\\\\evil.example')).toBe(false)
++    })
++
++    it('rejects backslash variants', () => {
++      expect(isSafeRedirect('/\\evil.example')).toBe(false)
++      expect(isSafeRedirect('\\/')).toBe(false)
++    })
++
++    it('rejects relative paths', () => {
++      expect(isSafeRedirect('posts')).toBe(false)
++      expect(isSafeRedirect('./posts')).toBe(false)
++      expect(isSafeRedirect('../posts')).toBe(false)
++    })
++
++    it('rejects null and undefined', () => {
++      expect(isSafeRedirect(null)).toBe(false)
++      expect(isSafeRedirect(undefined)).toBe(false)
++      expect(isSafeRedirect('')).toBe(false)
++    })
++
++    it('rejects whitespace-only strings', () => {
++      expect(isSafeRedirect('  ')).toBe(false)
++      expect(isSafeRedirect('\t')).toBe(false)
++      expect(isSafeRedirect('\n')).toBe(false)
++    })
++  })
++})

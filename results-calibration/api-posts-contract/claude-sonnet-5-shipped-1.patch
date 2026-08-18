@@ -1,0 +1,291 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..73ff95c 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: { id: number; title: string; excerpt: string; body: string; createdAt: string; author: { id: number; name: string } }[]; meta: { currentPage: number; lastPage: number; perPage: number; total: number } }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..16e1e34 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,7 +3,13 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import {
++  PostIdParamSchema,
++  PostPayloadSchema,
++  PostSearchSchema,
++  ListPostsQuerySchema,
++  ApiPostsIndexQuerySchema,
++} from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -50,6 +56,33 @@ export default class PostController extends Controller {
+     return this.json({ data: PostResource.collection(posts) })
+   }
+ 
++  // Serves the public, unauthenticated `api.posts.index` route. Read-only
++  // and open to external consumers, so it lives outside the 'auth' group
++  // above and never touches `this.auth`.
++  async apiIndex(): Promise<Response> {
++    const { page, author } = this.validateQuery(ApiPostsIndexQuerySchema)
++
++    // withPaginate(), not .with().paginate() — chaining .with() onto a
++    // QueryBuilder that terminates in .paginate() silently drops the eager
++    // load, so `author` would come back undefined on every row.
++    const result = await Post.withPaginate('author', {
++      page,
++      perPage: 10,
++      where: author !== undefined ? { authorId: author } : undefined,
++      orderBy: ['id', 'desc'],
++    })
++
++    return this.json({
++      data: result.data.map((post) => new PostResource(post).toJSON()),
++      meta: {
++        currentPage: result.meta.currentPage,
++        lastPage: result.meta.totalPages,
++        perPage: result.meta.perPage,
++        total: result.meta.total,
++      },
++    })
++  }
++
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..d9e77d0 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -8,6 +8,30 @@ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+ 
++export const ApiPostsIndexQuerySchema = z.object({
++  page: z.coerce.number().int().min(1).default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
++const ApiPostSchema = z.object({
++  id: z.number(),
++  title: z.string(),
++  excerpt: z.string(),
++  body: z.string(),
++  createdAt: z.string(),
++  author: z.object({ id: z.number(), name: z.string() }),
++})
++
++export const ApiPostsIndexOutputSchema = z.object({
++  data: z.array(ApiPostSchema),
++  meta: z.object({
++    currentPage: z.number(),
++    lastPage: z.number(),
++    perPage: z.number(),
++    total: z.number(),
++  }),
++})
++
+ export const PostSearchSchema = z.object({
+   keywords: z
+     .array(z.string().trim().min(1, 'Keywords must not be blank.'))
+diff --git a/check3.ts b/check3.ts
+new file mode 100644
+index 0000000..90db104
+--- /dev/null
++++ b/check3.ts
+@@ -0,0 +1,9 @@
++import { TestApp } from '@guren/testing'
++import app from './src/app.js'
++import { resetDatabase } from './config/database.js'
++import { Post } from './app/Models/Post.js'
++
++await TestApp.fromApp(app)
++await resetDatabase()
++const rows = await Post.all()
++console.log('after reset:', rows.length, rows.map((r) => r.title))
+diff --git a/check4.ts b/check4.ts
+new file mode 100644
+index 0000000..81a051a
+--- /dev/null
++++ b/check4.ts
+@@ -0,0 +1,17 @@
++import { TestApp } from '@guren/testing'
++import app from './src/app.js'
++import { resetDatabase } from './config/database.js'
++import { Post } from './app/Models/Post.js'
++import { User } from './app/Models/User.js'
++
++await resetDatabase()
++const http = await TestApp.fromApp(app)
++
++const alice = await User.create({ name: 'Alice', email: 'alice@example.com', password: 'secret123' })
++const bob = await User.create({ name: 'Bob', email: 'bob@example.com', password: 'secret123' })
++const first = await Post.forceCreate({ title: 'First', excerpt: 'e1', body: 'b1', authorId: alice.id })
++const second = await Post.forceCreate({ title: 'Second', excerpt: 'e2', body: 'b2', authorId: bob.id })
++
++const res = await http.get('/api/posts')
++console.log(res.status)
++console.log(await res.text())
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..52a9e82 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,7 +1,12 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+-import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import {
++  PostPayloadSchema,
++  PostSearchSchema,
++  ApiPostsIndexQuerySchema,
++  ApiPostsIndexOutputSchema,
++} from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+@@ -44,4 +49,13 @@ export function registerWebRoutes(baseRouter: Router): void {
+       resource: { data: [PostResource] },
+     }, [PostController, 'search'])
+   })
++
++  // Public JSON feed for partner integrations — no auth, no CSRF, plain GET.
++  router.group('/api', (api) => {
++    api.get('/posts', {
++      name: 'api.posts.index',
++      query: ApiPostsIndexQuerySchema,
++      output: ApiPostsIndexOutputSchema,
++    }, [PostController, 'apiIndex'])
++  })
+ }
+diff --git a/tests/ApiPosts.test.ts b/tests/ApiPosts.test.ts
+new file mode 100644
+index 0000000..b111ea6
+--- /dev/null
++++ b/tests/ApiPosts.test.ts
+@@ -0,0 +1,79 @@
++import { beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++describe('GET /api/posts', () => {
++  let http: TestApp
++
++  beforeEach(async () => {
++    await resetDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  it('lists posts newest first with author info, no auth required', async () => {
++    const alice = await User.create({ name: 'Alice', email: 'alice@example.com', password: 'secret123' })
++    const bob = await User.create({ name: 'Bob', email: 'bob@example.com', password: 'secret123' })
++    const first = await Post.forceCreate({ title: 'First', excerpt: 'e1', body: 'b1', authorId: alice.id })
++    const second = await Post.forceCreate({ title: 'Second', excerpt: 'e2', body: 'b2', authorId: bob.id })
++
++    const res = await http.get('/api/posts').assertOk()
++    const body = await res.json<{ data: Array<Record<string, unknown>>; meta: Record<string, number> }>()
++
++    expect(body.data.length).toBe(2)
++    expect(body.data[0]?.id).toBe(second.id)
++    expect(body.data[0]?.author).toEqual({ id: bob.id, name: 'Bob' })
++    expect(body.data[1]?.id).toBe(first.id)
++    expect(body.meta).toEqual({ currentPage: 1, lastPage: 1, perPage: 10, total: 2 })
++  })
++
++  it('paginates at 10 per page', async () => {
++    const author = await User.create({ name: 'Carol', email: 'carol@example.com', password: 'secret123' })
++    for (let i = 0; i < 12; i++) {
++      await Post.forceCreate({ title: `Post ${i}`, excerpt: 'e', body: 'b', authorId: author.id })
++    }
++
++    const page1 = await (await http.get('/api/posts').assertOk()).json<{ data: unknown[]; meta: Record<string, number> }>()
++    expect(page1.data.length).toBe(10)
++    expect(page1.meta).toEqual({ currentPage: 1, lastPage: 2, perPage: 10, total: 12 })
++
++    const page2 = await (await http.get('/api/posts?page=2').assertOk()).json<{ data: unknown[]; meta: Record<string, number> }>()
++    expect(page2.data.length).toBe(2)
++    expect(page2.meta.currentPage).toBe(2)
++  })
++
++  it('filters by author and reports the filtered total', async () => {
++    const alice = await User.create({ name: 'Alice', email: 'alice2@example.com', password: 'secret123' })
++    const bob = await User.create({ name: 'Bob', email: 'bob2@example.com', password: 'secret123' })
++    await Post.forceCreate({ title: 'Alice post', excerpt: 'e', body: 'b', authorId: alice.id })
++    await Post.forceCreate({ title: 'Bob post 1', excerpt: 'e', body: 'b', authorId: bob.id })
++    await Post.forceCreate({ title: 'Bob post 2', excerpt: 'e', body: 'b', authorId: bob.id })
++
++    const res = await (await http.get(`/api/posts?author=${bob.id}`).assertOk()).json<{
++      data: Array<Record<string, unknown>>
++      meta: Record<string, number>
++    }>()
++
++    expect(res.data.length).toBe(2)
++    expect(res.data.every((post) => (post.author as { id: number }).id === bob.id)).toBe(true)
++    expect(res.meta.total).toBe(2)
++  })
++
++  it('returns an empty page for an author with no posts', async () => {
++    const author = await User.create({ name: 'Dana', email: 'dana@example.com', password: 'secret123' })
++
++    const res = await (await http.get(`/api/posts?author=${author.id}`).assertOk()).json<{
++      data: unknown[]
++      meta: Record<string, number>
++    }>()
++
++    expect(res.data).toEqual([])
++    expect(res.meta.total).toBe(0)
++  })
++
++  it.each(['?page=0', '?page=abc', '?author=abc', '?author=0'])('rejects invalid query %s', async (qs) => {
++    await http.get(`/api/posts${qs}`).assertUnprocessable()
++  })
++})

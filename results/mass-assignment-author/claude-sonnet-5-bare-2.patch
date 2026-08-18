@@ -1,0 +1,131 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..6827e4f 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,10 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    const data = await this.validateBody(PostPayloadSchema)
++    // Post.update, not forceUpdate: only fillable fields (title, excerpt, body)
++    // are written, so request input can never touch authorId.
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..9504bbd 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,99 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  async function makeUser(email: string) {
++    return User.forceCreate({ name: email, email, passwordHash: 'not-a-real-hash' })
++  }
++
++  async function makePost(authorId: number) {
++    return Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId,
++    })
++  }
++
++  it('keeps the original author even when the request supplies a different authorId', async () => {
++    const author = await makeUser('author-a@example.com')
++    const other = await makeUser('author-b@example.com')
++    const post = await makePost(author!.id)
++
++    const asAuthor = await http.actingAs({ id: author!.id }).withCsrf()
++    await asAuthor
++      .put(`/posts/${post!.id}`, {
++        title: 'Renamed',
++        excerpt: 'Still mine?',
++        body: 'Updated body',
++        authorId: other!.id,
++      })
++      .assertRedirect(`/posts/${post!.id}`)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.authorId).toBe(author!.id)
++    expect(reloaded.title).toBe('Renamed')
++  })
++
++  it('does not write fields outside the edit form, like createdAt', async () => {
++    const author = await makeUser('author-c@example.com')
++    const post = await makePost(author!.id)
++    const originalCreatedAt = post!.createdAt
++
++    const asAuthor = await http.actingAs({ id: author!.id }).withCsrf()
++    await asAuthor
++      .put(`/posts/${post!.id}`, {
++        title: 'Renamed again',
++        excerpt: 'Still mine?',
++        body: 'Updated body',
++        createdAt: '1999-01-01T00:00:00.000Z',
++      })
++      .assertRedirect(`/posts/${post!.id}`)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.createdAt).toBe(originalCreatedAt)
++  })
++
++  it('rejects an empty title with a 422 and leaves the post unchanged', async () => {
++    const author = await makeUser('author-d@example.com')
++    const post = await makePost(author!.id)
++
++    const asAuthor = await http.actingAs({ id: author!.id }).withCsrf()
++    await asAuthor
++      .put(`/posts/${post!.id}`, {
++        title: '',
++        excerpt: 'Still mine?',
++        body: 'Updated body',
++      })
++      .assertStatus(422)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.title).toBe('Original title')
++  })
++
++  it('refuses an edit from a non-author with a 403', async () => {
++    const author = await makeUser('author-e@example.com')
++    const intruder = await makeUser('author-f@example.com')
++    const post = await makePost(author!.id)
++
++    const asIntruder = await http.actingAs({ id: intruder!.id }).withCsrf()
++    await asIntruder
++      .put(`/posts/${post!.id}`, {
++        title: 'Hijacked',
++        excerpt: 'Not mine',
++        body: 'Body',
++      })
++      .assertStatus(403)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.title).toBe('Original title')
++  })
++})

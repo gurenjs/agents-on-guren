@@ -1,0 +1,230 @@
+diff --git a/app/Health/DatabaseHealthCheck.ts b/app/Health/DatabaseHealthCheck.ts
+new file mode 100644
+index 0000000..8a0f5c8
+--- /dev/null
++++ b/app/Health/DatabaseHealthCheck.ts
+@@ -0,0 +1,37 @@
++import { HealthCheck, type CheckResult } from '@guren/core'
++import { getDatabase, type AppDatabase } from '../../config/database.js'
++
++/** Opens (or reuses) the app connection. Injectable so tests can fail it. */
++export type DatabaseConnector = () => Promise<AppDatabase>
++
++const connectToDatabase: DatabaseConnector = async () => (await getDatabase()) as AppDatabase
++
++/**
++ * Verifies the database on every probe with the cheapest round trip SQLite
++ * offers. Deliberately not memoized: a cached verdict is exactly what kept a
++ * deploy with an unreachable database in the load-balancer pool.
++ */
++export class DatabaseHealthCheck extends HealthCheck {
++  readonly name: string
++  private readonly connect: DatabaseConnector
++
++  constructor(connect: DatabaseConnector = connectToDatabase, name = 'database') {
++    super()
++    this.connect = connect
++    this.name = name
++  }
++
++  async check(): Promise<CheckResult> {
++    try {
++      const db = await this.connect()
++      await db.get('select 1')
++
++      return this.healthy('Database answered a round trip')
++    } catch (error) {
++      // One catch for both failure modes: the connection cannot be opened, or
++      // the query itself throws. A timeout is handled by the HealthManager,
++      // which races every check against its configured budget.
++      return this.handleError(error, 'Database is unreachable')
++    }
++  }
++}
+diff --git a/app/Health/index.ts b/app/Health/index.ts
+new file mode 100644
+index 0000000..9f1dabc
+--- /dev/null
++++ b/app/Health/index.ts
+@@ -0,0 +1,30 @@
++import { createHealthManager, type HealthManager, type HealthStatus } from '@guren/core'
++import { DatabaseHealthCheck } from './DatabaseHealthCheck.js'
++
++/**
++ * A probe answers a load balancer, so it must not hang on a database that
++ * accepts connections but never replies — shorter than the 5s default.
++ */
++const DATABASE_TIMEOUT_MS = 2_000
++
++/**
++ * The checks `GET /health` reports on. The database is the only dependency the
++ * app cannot serve a page without, so it is `critical`: its failure drops the
++ * whole report to `unhealthy` (a non-critical failure would only downgrade it
++ * to `degraded`, which still answers 200 and keeps traffic coming).
++ */
++export function createAppHealthManager(): HealthManager {
++  return createHealthManager().register(new DatabaseHealthCheck(), {
++    critical: true,
++    timeout: DATABASE_TIMEOUT_MS,
++  })
++}
++
++/**
++ * Maps a report to the status code the platform routes on: only `unhealthy`
++ * drains this instance from the pool. `degraded` — a future non-critical check
++ * failing — still serves traffic.
++ */
++export function healthStatusCode(status: HealthStatus): number {
++  return status === 'unhealthy' ? 503 : 200
++}
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..2fa6ab8
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,23 @@
++import { Controller } from '@guren/core'
++import { createAppHealthManager, healthStatusCode } from '../../Health/index.js'
++
++// Built once — the manager holds no per-request state, and every probe re-runs
++// each registered check against the live dependency.
++const health = createAppHealthManager()
++
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    const report = await health.check()
++
++    // 200/503 is what the platform routes on; the body is for the dashboard,
++    // which reads the per-check breakdown to name the failing dependency.
++    return this.json(
++      {
++        status: report.status,
++        timestamp: report.timestamp.toISOString(),
++        checks: report.checks,
++      },
++      { status: healthStatusCode(report.status) },
++    )
++  }
++}
+diff --git a/config/database.ts b/config/database.ts
+index 37af44e..b3eeb33 100644
+--- a/config/database.ts
++++ b/config/database.ts
+@@ -22,3 +22,11 @@ export const { getDatabase, migrateDatabase, closeDatabase, configureOrm, seedDa
+ 
+ /** Annotate seeders with this: `defineSeeder(async ({ db }: AppSeederContext) => {})`. */
+ export type AppSeederContext = SqliteSeederContext
++
++/**
++ * The Drizzle handle `getDatabase()` resolves to. The factory types it as
++ * `unknown` because the dialect is unknowable at the package boundary — it is
++ * chosen here, so this is where the concrete handle gets a name. Cast with it
++ * when raw SQL is needed: `(await getDatabase()) as AppDatabase`.
++ */
++export type AppDatabase = AppSeederContext['db']
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..a2cccca 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. Answers 503
++  // when a dependency is down, so a bad deploy is drained from the pool.
++  router.get('/health', [HealthController, 'index'])
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..dc1ae28
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,78 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { createHealthManager } from '@guren/core'
++import { TestApp } from '@guren/testing'
++import { DatabaseHealthCheck } from '../app/Health/DatabaseHealthCheck.js'
++import { healthStatusCode } from '../app/Health/index.js'
++import type { AppDatabase } from '../config/database.js'
++import app from '../src/app.js'
++
++type HealthBody = {
++  status: string
++  checks: Array<{ name: string; status: string; message?: string }>
++}
++
++/** Stands in for the Drizzle handle, failing the way an unusable database does. */
++function failingDatabase(message: string): AppDatabase {
++  return {
++    get() {
++      throw new Error(message)
++    },
++  } as unknown as AppDatabase
++}
++
++describe('GET /health', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('answers 200 with a passing database check', async () => {
++    const response = await http.get('/health').assertOk()
++    const body = await response.json<HealthBody>()
++
++    expect(body.status).toBe('healthy')
++    expect(body.checks.find((check) => check.name === 'database')?.status).toBe('healthy')
++  })
++})
++
++describe('database health check', () => {
++  it('reports healthy after a real round trip', async () => {
++    const result = await new DatabaseHealthCheck().check()
++
++    expect(result.status).toBe('healthy')
++  })
++
++  it('reports unhealthy when the connection cannot be opened', async () => {
++    const check = new DatabaseHealthCheck(() => Promise.reject(new Error('connection refused')))
++    const result = await check.check()
++
++    expect(result.status).toBe('unhealthy')
++    expect(result.message).toBe('connection refused')
++  })
++
++  it('reports unhealthy when the query throws', async () => {
++    const check = new DatabaseHealthCheck(async () => failingDatabase('no such table'))
++    const result = await check.check()
++
++    expect(result.status).toBe('unhealthy')
++    expect(result.message).toBe('no such table')
++  })
++
++  // A failing database has to reach the report as `unhealthy`, not `degraded`:
++  // only `unhealthy` drains the instance from the load-balancer pool.
++  it('drops the whole report to unhealthy, and 503, when it fails', async () => {
++    const manager = createHealthManager().register(
++      new DatabaseHealthCheck(() => Promise.reject(new Error('down'))),
++      { critical: true },
++    )
++    const report = await manager.check()
++
++    expect(report.status).toBe('unhealthy')
++    expect(healthStatusCode(report.status)).toBe(503)
++  })
++
++  it('keeps a passing report on 200', () => {
++    expect(healthStatusCode('healthy')).toBe(200)
++  })
++})

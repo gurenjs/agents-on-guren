@@ -1,0 +1,120 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..627f7c9 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,12 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    // Same schema as store(): the body is narrowed to title/excerpt/body, so
++    // anything else the client sends (authorId above all) is dropped before it
++    // reaches the model. Plain `update`, not `forceUpdate` — Post.fillable is
++    // the second gate keeping `authorId` out of an edit.
++    const data = await this.validateBody(PostPayloadSchema)
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostUpdate.test.ts b/tests/PostUpdate.test.ts
+new file mode 100644
+index 0000000..27dd97b
+--- /dev/null
++++ b/tests/PostUpdate.test.ts
+@@ -0,0 +1,96 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// posts.update takes its author from the existing record, never from the
++// request: the body is narrowed by PostPayloadSchema and written through the
++// fillable allowlist, so neither `authorId` nor any other stray column can
++// ride along on an edit.
++describe('posts.update', () => {
++  let http: TestApp
++  let alice: UserRecord
++  let bob: UserRecord
++  let postId: number
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    alice = (await User.create({ name: 'Alice', email: 'alice@example.com', password: 'secret' })) as UserRecord
++    bob = (await User.create({ name: 'Bob', email: 'bob@example.com', password: 'secret' })) as UserRecord
++    const post = await Post.forceCreate({
++      title: 'Original',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: alice.id,
++    })
++    postId = post!.id
++  })
++
++  it('updates the post for its author', async () => {
++    const csrf = await http.actingAs(alice).withCsrf()
++    await csrf
++      .put(`/posts/${postId}`, { title: 'Renamed', excerpt: 'New excerpt', body: 'New body' })
++      .assertRedirect(`/posts/${postId}`)
++
++    const post = await Post.findOrFail(postId)
++    expect(post.title).toBe('Renamed')
++    expect(post.authorId).toBe(alice.id)
++  })
++
++  it('ignores an authorId in the request body', async () => {
++    const csrf = await http.actingAs(alice).withCsrf()
++    await csrf.put(`/posts/${postId}`, {
++      title: 'Renamed',
++      excerpt: 'Still mine?',
++      body: 'New body',
++      authorId: bob.id,
++    })
++
++    const post = await Post.findOrFail(postId)
++    expect(post.authorId).toBe(alice.id)
++  })
++
++  it('ignores fields outside the edit form', async () => {
++    const csrf = await http.actingAs(alice).withCsrf()
++    const before = await Post.findOrFail(postId)
++    await csrf.put(`/posts/${postId}`, {
++      title: 'Renamed',
++      excerpt: 'New excerpt',
++      body: 'New body',
++      createdAt: '1999-01-01T00:00:00.000Z',
++    })
++
++    const post = await Post.findOrFail(postId)
++    expect(post.createdAt).toBe(before.createdAt)
++  })
++
++  it('rejects an invalid edit with 422 and leaves the post untouched', async () => {
++    const csrf = await http.actingAs(alice).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${postId}`, { title: '', excerpt: 'New excerpt', body: 'New body' })
++      .assertUnprocessable()
++      .assertJsonPath('errors.title.0', 'Title is required.')
++
++    const post = await Post.findOrFail(postId)
++    expect(post.title).toBe('Original')
++    expect(post.excerpt).toBe('Original excerpt')
++  })
++
++  it('still refuses an edit by someone other than the author', async () => {
++    const csrf = await http.actingAs(bob).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${postId}`, { title: 'Hijacked', excerpt: 'Nope', body: 'Nope' })
++      .assertForbidden()
++
++    const post = await Post.findOrFail(postId)
++    expect(post.title).toBe('Original')
++  })
++})

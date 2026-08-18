@@ -1,0 +1,100 @@
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..2bbf080 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -31,8 +31,12 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+-    // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    // Registered before '/:id', or "archive" is read as a post id. Guren's router
++    // passes the path straight through to Hono, so this needs Hono's own
++    // "match everything, including slashes" syntax — a `{.+}` regex constraint,
++    // not the `:name*` glob suffix (which Hono treats as a literal, single-segment
++    // param literally named "date*").
++    posts.get('/archive/:date{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.archive.test.ts b/tests/PostController.archive.test.ts
+new file mode 100644
+index 0000000..32162b3
+--- /dev/null
++++ b/tests/PostController.archive.test.ts
+@@ -0,0 +1,75 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
++
++// posts.archive lists posts created in a given year (`/posts/archive/2026`)
++// or a given month (`/posts/archive/2026/08`), newest first, as JSON.
++describe('posts.archive', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function seedPosts(): Promise<void> {
++    const author = await User.forceCreate({
++      name: 'Author',
++      email: 'author@example.com',
++      passwordHash: 'hashed',
++    })
++
++    for (const [title, createdAt] of [
++      ['August post (early)', '2026-08-05T12:00:00.000Z'],
++      ['August post (late)', '2026-08-20T09:00:00.000Z'],
++      ['July post', '2026-07-15T00:00:00.000Z'],
++    ] as const) {
++      await Post.forceCreate({
++        title,
++        excerpt: 'excerpt',
++        body: 'body',
++        authorId: author!.id,
++        createdAt,
++      })
++    }
++  }
++
++  it('lists posts created in a zero-padded month, newest first', async () => {
++    await seedPosts()
++
++    await http
++      .get('/posts/archive/2026/08')
++      .assertOk()
++      .assertJsonCount(2, 'data')
++      .assertJsonPath('data.0.title', 'August post (late)')
++      .assertJsonPath('data.1.title', 'August post (early)')
++  })
++
++  it('accepts a month without a leading zero', async () => {
++    await seedPosts()
++
++    await http.get('/posts/archive/2026/8').assertOk().assertJsonCount(2, 'data')
++  })
++
++  it('lists every post created in the given year', async () => {
++    await seedPosts()
++
++    await http.get('/posts/archive/2026').assertOk().assertJsonCount(3, 'data')
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await seedPosts()
++
++    await http.get('/posts/archive/2025').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/2026/13').assertStatus(422)
++  })
++})

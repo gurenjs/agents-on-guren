@@ -1,0 +1,86 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,8 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
++
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..3ca05ea 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,57 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// A post can only be deleted by its author — everyone else must be refused
++// and the post must survive. This mirrors the authorization already enforced
++// on posts.update.
++describe('posts.destroy', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function createPost(authorEmail: string) {
++    const author = await User.create({ name: 'Author', email: authorEmail, password: 'password123' })
++    const post = await Post.forceCreate({
++      title: 'Title',
++      excerpt: 'Excerpt',
++      body: 'Body',
++      authorId: author.id,
++    })
++    return { author, post }
++  }
++
++  it('lets the author delete their own post', async () => {
++    const { author, post } = await createPost('author@example.com')
++
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf.delete(`/posts/${post.id}`).assertRedirect('/posts')
++
++    expect(await Post.find(post.id)).toBeNull()
++  })
++
++  it('refuses a signed-in user who does not own the post', async () => {
++    const { post } = await createPost('author@example.com')
++    const otherUser = await User.create({ name: 'Other', email: 'other@example.com', password: 'password123' })
++
++    const csrf = await http.actingAs(otherUser).withCsrf()
++    await csrf.delete(`/posts/${post.id}`).assertForbidden()
++
++    expect(await Post.find(post.id)).not.toBeNull()
++  })
++
++  it('refuses a guest', async () => {
++    const { post } = await createPost('author@example.com')
++
++    const csrf = await http.withCsrf()
++    await csrf.delete(`/posts/${post.id}`).assertRedirect('/login')
++
++    expect(await Post.find(post.id)).not.toBeNull()
++  })
++})

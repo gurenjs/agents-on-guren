@@ -1,0 +1,230 @@
+diff --git a/app/Http/Middleware/ThrottleLogin.ts b/app/Http/Middleware/ThrottleLogin.ts
+new file mode 100644
+index 0000000..8976883
+--- /dev/null
++++ b/app/Http/Middleware/ThrottleLogin.ts
+@@ -0,0 +1,63 @@
++import { createRateLimitMiddleware, MemoryRateLimitStore, type RateLimitEntry } from '@guren/core'
++
++/** Submissions of the login form a single client may make per window. */
++export const LOGIN_MAX_ATTEMPTS = 5
++
++/** Length of the throttling window, in milliseconds. */
++export const LOGIN_THROTTLE_WINDOW_MS = 60_000
++
++/**
++ * Counters for the login throttle, kept in this process only — a single
++ * process serves the app and nothing about a one-minute window is worth
++ * surviving a restart.
++ *
++ * The base store sweeps expired entries on an interval that is not unref()ed,
++ * which would keep the process alive on its own; the `0` passed below turns
++ * that timer off and the sweep happens on the way in instead. Only login
++ * submissions get here, so the map holds one entry per client that recently
++ * tried to sign in and stays bounded to the current window.
++ */
++class LoginThrottleStore extends MemoryRateLimitStore {
++  constructor(now?: () => number) {
++    super(0, now)
++  }
++
++  override async increment(key: string, windowMs: number): Promise<RateLimitEntry> {
++    this.cleanup()
++    return super.increment(key, windowMs)
++  }
++}
++
++/**
++ * Throttles login submissions so a stolen password list cannot be walked
++ * through the form: a client gets {@link LOGIN_MAX_ATTEMPTS} submissions per
++ * {@link LOGIN_THROTTLE_WINDOW_MS}, and further submissions inside that window
++ * are refused with 429 and a `Retry-After` header saying when to come back.
++ *
++ * Every submission counts, right credentials included — a correct password is
++ * exactly what an attacker is hunting for, so letting a success clear the
++ * counter would hand back the attempts it just spent.
++ *
++ * Built per call rather than shared at module scope, so each application
++ * instance (the server, a test app) counts on a store of its own.
++ *
++ * `now` is the clock the window runs on; tests inject one to step over a
++ * window instead of sleeping through it. It drives the store as well as the
++ * `Retry-After` arithmetic, or the two would disagree.
++ */
++export function throttleLogin({ now }: { now?: () => number } = {}) {
++  return createRateLimitMiddleware({
++    limit: LOGIN_MAX_ATTEMPTS,
++    windowMs: LOGIN_THROTTLE_WINDOW_MS,
++    store: new LoginThrottleStore(now),
++    now,
++    // Identity is the connection's own peer address. `trustProxy` stays off
++    // deliberately: no proxy sits in front of this app, so forwarded-for style
++    // headers are client-controlled and a client could pick a fresh identity
++    // per request. Where the peer address cannot be resolved at all, the
++    // framework buckets those requests under one shared key — throttled
++    // together rather than waved through.
++    trustProxy: false,
++    message: 'Too many login attempts. Please try again later.',
++  })
++}
+diff --git a/docs/adr/0002-throttle-login-attempts-per-client-ip.md b/docs/adr/0002-throttle-login-attempts-per-client-ip.md
+new file mode 100644
+index 0000000..75e1335
+--- /dev/null
++++ b/docs/adr/0002-throttle-login-attempts-per-client-ip.md
+@@ -0,0 +1,56 @@
++---
++type: adr
++status: stable
++entities: [User]
++related:
++  - app/Http/Middleware/ThrottleLogin.ts
++  - routes/auth.ts
++generated: { by: "claude-code/opus-5", at: 2026-08-18T10:51:15.913Z }
++---
++
++# Throttle login attempts per client IP
++
++## Context
++
++`POST /login` answered an unlimited number of submissions. A script could
++walk a credential-stuffing list against one account at whatever rate the
++process could serve, and every guess was processed exactly like a single
++mistyped password. Nothing slowed an attacker down.
++
++## Decision
++
++`POST /login` runs behind a rate limiter (`app/Http/Middleware/ThrottleLogin.ts`,
++wired into the route in `routes/auth.ts`): 5 submissions per client per
++minute, after which further submissions in that window get 429 with a
++`Retry-After` header.
++
++- **Every submission counts**, a correct password included. A success that
++  cleared the counter would hand back the attempts it just spent — finding
++  a working password is the attacker's goal, not a reason to stop counting.
++- **"Client" is the connection's peer address.** `trustProxy` stays off: no
++  proxy fronts this app, so `X-Forwarded-For` and friends are attacker-typed
++  strings and trusting them would let one client mint an identity per request.
++  Put the app behind a proxy and this decision has to be revisited together
++  with that deployment change.
++- **Unresolvable peer address fails closed** — those requests share one
++  bucket and are throttled together rather than waved through.
++- **Counters are in memory.** One process serves the app and a one-minute
++  window is not worth persisting; a restart clearing counters costs an
++  attacker more than it costs us.
++- Only the submission is throttled. Rendering the form, registration, and
++  every other route are untouched, so a throttled client can still load
++  `/login` and read the site.
++
++## Consequences
++
++The form is no longer a free oracle: brute force drops to 5 guesses per
++minute per address, which makes an online attack impractical without
++changing anything about how a legitimate person signs in.
++
++A shared address (office NAT, a mobile carrier) shares the budget, so a
++crowd behind one IP can throttle each other. Five per minute leaves enough
++headroom that this is unlikely to be noticed in practice.
++
++Because counters are per process and in memory, this stops being a real
++limit the moment the app runs on more than one instance — a shared store
++(Redis) is the follow-up if we scale out.
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..2904923 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,12 +3,17 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { throttleLogin } from '../app/Http/Middleware/ThrottleLogin.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    // Only the submission is throttled — rendering the form stays free.
++    guest.post('/login', { name: 'login.store', middlewares: [throttleLogin()] }, [
++      LoginController,
++      'store',
++    ])
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginThrottle.test.ts b/tests/LoginThrottle.test.ts
+new file mode 100644
+index 0000000..9043393
+--- /dev/null
++++ b/tests/LoginThrottle.test.ts
+@@ -0,0 +1,70 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import {
++  LOGIN_MAX_ATTEMPTS,
++  LOGIN_THROTTLE_WINDOW_MS,
++  throttleLogin,
++} from '../app/Http/Middleware/ThrottleLogin.js'
++
++// The throttle counts submissions before the controller runs, so these cover
++// it without a login that reaches the database: a body the LoginSchema
++// rejects still spends an attempt, which is exactly the point — an attacker
++// must not be able to probe for free. The one client here is the shared
++// bucket TestApp requests fall into (no socket peer address in process).
++describe('login throttling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('refuses submissions past the limit with 429 and Retry-After', async () => {
++    const client = await http.withCsrf()
++    const submit = () => client.post('/login', { email: 'nobody@example.com', password: 'wrong' })
++
++    for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt += 1) {
++      const response = await submit()
++      expect(response.status).not.toBe(429)
++    }
++
++    const throttled = await submit()
++    throttled.assertStatus(429)
++
++    const retryAfter = throttled.headers.get('Retry-After')
++    expect(retryAfter).not.toBeNull()
++    expect(Number(retryAfter)).toBeGreaterThan(0)
++    expect(Number(retryAfter)).toBeLessThanOrEqual(60)
++  })
++
++  it('leaves the login form and other pages reachable while throttled', async () => {
++    await http.get('/login').assertOk()
++    await http.get('/health').assertOk()
++  })
++
++  // Mounted on a bare route with an injected clock, so the window can be
++  // stepped over instead of slept through.
++  it('lets the client submit again once the window has passed', async () => {
++    let clock = Date.parse('2026-08-18T09:00:00Z')
++    const isolated = await TestApp.create({
++      routes: (router) => {
++        router.post('/login', (c) => c.json({ ok: true }), throttleLogin({ now: () => clock }))
++      },
++    })
++
++    for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt += 1) {
++      await isolated.post('/login', {}).assertOk()
++    }
++    await isolated.post('/login', {}).assertStatus(429)
++
++    // Forwarded-for style headers are client-controlled, so a spoofed one must
++    // not buy a fresh bucket.
++    await isolated
++      .withHeaders({ 'X-Forwarded-For': '203.0.113.9', 'X-Real-IP': '203.0.113.9' })
++      .post('/login', {})
++      .assertStatus(429)
++
++    clock += LOGIN_THROTTLE_WINDOW_MS
++    await isolated.post('/login', {}).assertOk()
++  })
++})

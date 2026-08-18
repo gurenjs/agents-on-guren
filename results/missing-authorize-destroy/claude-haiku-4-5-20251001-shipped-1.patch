@@ -1,0 +1,109 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..28a0aed 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,7 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..54352e5 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,14 +1,10 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
+ import app from '../src/app.js'
+ 
+-// posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+-// the body with validateBody() before building any query — the schema bound
+-// to the route feeds codegen and `guren audit`, while body parsing stays in
+-// the controller so the request stream is read once — so an invalid payload
+-// gets a 422 without the database ever being touched. That keeps this starter
+-// test green without migrations or fixtures; cover the happy path with real
+-// feature tests once your test database is set up.
+ describe('posts.search', () => {
+   let http: TestApp
+ 
+@@ -20,3 +16,73 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('PostController.destroy', () => {
++  let http: TestApp
++  let authorUser: typeof User.$inferSelect
++  let otherUser: typeof User.$inferSelect
++  let authorPost: typeof Post.$inferSelect
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    // Create two users
++    authorUser = await User.create({
++      name: 'Author User',
++      email: 'author@example.com',
++      password: 'secret',
++    })
++
++    otherUser = await User.create({
++      name: 'Other User',
++      email: 'other@example.com',
++      password: 'secret',
++    })
++
++    // Create a post by the author using forceCreate (authorId is not fillable)
++    authorPost = await Post.forceCreate({
++      title: 'Test Post',
++      excerpt: 'Test excerpt',
++      body: 'Test body',
++      authorId: authorUser.id,
++    })
++  })
++
++  it('author can delete their own post', async () => {
++    const csrf = await http.actingAs(authorUser).withCsrf()
++    await csrf.delete(`/posts/${authorPost.id}`).assertRedirect('/posts')
++
++    // Verify post is deleted
++    const deleted = await Post.find(authorPost.id)
++    if (deleted !== null) {
++      throw new Error('Post should be deleted')
++    }
++  })
++
++  it('other authenticated user cannot delete the post', async () => {
++    const csrf = await http.actingAs(otherUser).withCsrf()
++    await csrf.delete(`/posts/${authorPost.id}`).assertStatus(403)
++
++    // Verify post still exists
++    const exists = await Post.find(authorPost.id)
++    if (exists === null) {
++      throw new Error('Post should still exist')
++    }
++  })
++
++  it('unauthenticated user cannot delete the post', async () => {
++    const csrf = await http.withCsrf()
++    // Guest requests should be redirected to login
++    await csrf.delete(`/posts/${authorPost.id}`).assertRedirect()
++
++    // Verify post still exists
++    const exists = await Post.find(authorPost.id)
++    if (exists === null) {
++      throw new Error('Post should still exist')
++    }
++  })
++})

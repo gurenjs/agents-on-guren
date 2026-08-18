@@ -1,0 +1,153 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..04685a0 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,7 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:date{.+}'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +312,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..95261c1 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..618f270 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -32,7 +32,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:date{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostArchive.test.ts b/tests/PostArchive.test.ts
+new file mode 100644
+index 0000000..ccfd76a
+--- /dev/null
++++ b/tests/PostArchive.test.ts
+@@ -0,0 +1,99 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// The archive route matches `:date{.+}` so a single param can span the
++// `/YYYY` and `/YYYY/MM` shapes — `createdAt` is stamped explicitly via
++// forceCreate to pin each post to a known period.
++describe('posts.archive', () => {
++  let http: TestApp
++  let augustPostId: number
++  let augustLatePostId: number
++  let januaryPostId: number
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++
++    const author = await User.forceCreate({
++      name: 'Archive Author',
++      email: 'archive-author@example.com',
++      passwordHash: 'hashed',
++    })
++
++    await Post.forceCreate({
++      title: 'July post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author.id,
++      createdAt: '2026-07-31T23:59:59.000Z',
++    })
++    const august = await Post.forceCreate({
++      title: 'August post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author.id,
++      createdAt: '2026-08-15T10:00:00.000Z',
++    })
++    const augustLate = await Post.forceCreate({
++      title: 'Late August post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author.id,
++      createdAt: '2026-08-31T23:59:59.000Z',
++    })
++    const january = await Post.forceCreate({
++      title: 'January post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author.id,
++      createdAt: '2026-01-01T00:00:00.000Z',
++    })
++    await Post.forceCreate({
++      title: 'Previous year post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author.id,
++      createdAt: '2025-08-15T00:00:00.000Z',
++    })
++
++    augustPostId = august.id
++    augustLatePostId = augustLate.id
++    januaryPostId = january.id
++  })
++
++  it('lists posts created in a given month (zero-padded), newest first', async () => {
++    const res = await http.get('/posts/archive/2026/08').assertOk()
++    const body = await res.json<{ data: { id: number }[] }>()
++    expect(body.data.map((post) => post.id)).toEqual([augustLatePostId, augustPostId])
++  })
++
++  it('lists posts created in a given month (no leading zero)', async () => {
++    const res = await http.get('/posts/archive/2026/8').assertOk()
++    const body = await res.json<{ data: { id: number }[] }>()
++    expect(body.data.map((post) => post.id)).toEqual([augustLatePostId, augustPostId])
++  })
++
++  it('lists every post created in a given year', async () => {
++    const res = await http.get('/posts/archive/2026').assertOk()
++    const body = await res.json<{ data: { id: number }[] }>()
++    const ids = body.data.map((post) => post.id)
++    expect(ids).toContain(augustPostId)
++    expect(ids).toContain(augustLatePostId)
++    expect(ids).toContain(januaryPostId)
++    expect(ids).toHaveLength(4)
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await http.get('/posts/archive/2099').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    const res = await http.get('/posts/archive/2026/13')
++    expect(res.status).toBeGreaterThanOrEqual(400)
++    expect(res.status).toBeLessThan(500)
++  })
++})

@@ -1,0 +1,155 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..2f179b5
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,112 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function actingUser() {
++    const user = await User.create({
++      name: 'Original Name',
++      email: 'original@example.com',
++      password: 'correct-horse',
++    })
++    const authed = http.actingAs(user)
++    const csrf = await authed.withCsrf()
++    return { user, csrf }
++  }
++
++  it('rejects a badly formatted email and leaves the account unchanged', async () => {
++    const { user, csrf } = await actingUser()
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'Original Name', email: 'not-an-email' })
++      .assertUnprocessable()
++
++    const stored = await User.find(user.id)
++    expect(stored?.email).toBe('original@example.com')
++  })
++
++  it('rejects an empty name and leaves the account unchanged', async () => {
++    const { user, csrf } = await actingUser()
++
++    await csrf
++      .json()
++      .put('/profile', { name: '', email: 'original@example.com' })
++      .assertUnprocessable()
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Original Name')
++  })
++
++  it('ignores fields outside the profile form, such as id and passwordHash', async () => {
++    const { user, csrf } = await actingUser()
++    const originalHash = (await User.find(user.id))?.passwordHash
++
++    await csrf
++      .json()
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'updated@example.com',
++        id: user.id + 999,
++        passwordHash: 'hacked',
++      })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.id).toBe(user.id)
++    expect(stored?.name).toBe('Updated Name')
++    expect(stored?.email).toBe('updated@example.com')
++    expect(stored?.passwordHash).toBe(originalHash)
++  })
++
++  it('accepts a valid update, lowercasing the email', async () => {
++    const { csrf, user } = await actingUser()
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'New Name', email: 'NEW@Example.com' })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('New Name')
++    expect(stored?.email).toBe('new@example.com')
++  })
++
++  it('rejects a too-short password and leaves the account unchanged', async () => {
++    const { user, csrf } = await actingUser()
++    const originalHash = (await User.find(user.id))?.passwordHash
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'Original Name', email: 'original@example.com', password: 'short' })
++      .assertUnprocessable()
++
++    const stored = await User.find(user.id)
++    expect(stored?.passwordHash).toBe(originalHash)
++  })
++
++  it('keeps the current password when the field is left blank', async () => {
++    const { user, csrf } = await actingUser()
++    const originalHash = (await User.find(user.id))?.passwordHash
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'Original Name', email: 'original@example.com', password: '' })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.passwordHash).toBe(originalHash)
++  })
++})

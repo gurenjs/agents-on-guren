@@ -1,0 +1,172 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index e6fc91a..04685a0 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -36,7 +36,7 @@ export interface ApiRoutes {
+   }
+   'posts.archive': {
+     method: 'GET'
+-    path: '/posts/archive/:date*'
++    path: '/posts/archive/:date{.+}'
+   }
+   'posts.create': {
+     method: 'GET'
+@@ -312,7 +312,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index f8b71ee..95261c1 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,7 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+-  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date{.+}' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index d15bcbb..a68a377 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -67,6 +67,9 @@ export default class PostController extends Controller {
+     const posts = await Post.newQuery()
+       .with('author')
+       .where('createdAt', 'like', `${prefix}%`)
++      // createdAt (ISO 8601 UTC) sorts lexicographically same as chronologically;
++      // id as a tiebreak for posts created in the same instant.
++      .orderBy('createdAt', 'desc')
+       .orderBy('id', 'desc')
+       .get()
+ 
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..618f270 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -32,7 +32,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:date{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..289c77e 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,8 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { afterAll, beforeAll, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +22,95 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// posts.archive is a GET route whose `date` param is captured with Hono's
++// `:date{.+}` pattern so it can span the `/YYYY/MM` segment boundary — a bare
++// `:date*` only ever binds a single path segment in Hono. These tests create
++// their own posts with fixed timestamps so they don't depend on what happens
++// to be seeded, and clean them up afterward.
++describe('posts.archive', () => {
++  let http: TestApp
++  let author: number
++  let createdAuthor = false
++  const created: number[] = []
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    // Sourced from users, not posts, so this fixture works on a freshly
++    // migrated database with no posts seeded yet.
++    const existing = await User.first()
++    if (existing) {
++      author = existing.id
++    } else {
++      const user = await User.forceCreate({
++        name: 'Archive Test Author',
++        email: 'archive-test-author@example.com',
++        passwordHash: 'not-a-real-hash',
++      })
++      author = user.id
++      createdAuthor = true
++    }
++
++    // Inserted newest-first (July before March) so a test asserting
++    // newest-first order can't pass by accident just because it matches
++    // insertion/id order.
++    const july = await Post.forceCreate({
++      title: 'July post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author,
++      createdAt: '2031-07-20T10:00:00.000Z',
++    })
++    const march = await Post.forceCreate({
++      title: 'March post',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: author,
++      createdAt: '2031-03-15T10:00:00.000Z',
++    })
++    created.push(july.id, march.id)
++  })
++
++  afterAll(async () => {
++    for (const id of created) {
++      await Post.delete({ id })
++    }
++    if (createdAuthor) {
++      await User.delete({ id: author })
++    }
++  })
++
++  it('lists posts created in a given month, zero-padded', async () => {
++    await http
++      .get('/posts/archive/2031/03')
++      .assertOk()
++      .assertJsonCount(1, 'data')
++      .assertJsonPath('data.0.title', 'March post')
++  })
++
++  it('lists posts created in a given month, without the leading zero', async () => {
++    await http
++      .get('/posts/archive/2031/3')
++      .assertOk()
++      .assertJsonCount(1, 'data')
++      .assertJsonPath('data.0.title', 'March post')
++  })
++
++  it('lists every post created in a given year, newest first', async () => {
++    await http
++      .get('/posts/archive/2031')
++      .assertOk()
++      .assertJsonCount(2, 'data')
++      .assertJsonPath('data.0.title', 'July post')
++      .assertJsonPath('data.1.title', 'March post')
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await http.get('/posts/archive/1999').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/2031/13').assertStatus(422)
++  })
++})

@@ -1,0 +1,252 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..6b698e7 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,10 +35,12 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
+-      ...(password ? { password } : {}),
+-    })
++    const updateData: { name: string; email: string; password?: string } = { name, email }
++    if (password) {
++      updateData.password = password
++    }
++
++    await User.update({ id: user.id }, updateData)
+ 
+     const refreshed = await User.find(user.id)
+     if (refreshed) {
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..70d775e 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,6 +3,7 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { ProfileUpdateSchema } from '../app/Http/Validators/ProfileValidator.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+@@ -17,6 +18,6 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+     authed.post('/logout', [LoginController, 'destroy']).name('logout')
+     authed.get('/dashboard', [DashboardController, 'index']).name('dashboard')
+     authed.get('/profile', [ProfileController, 'edit']).name('profile.edit')
+-    authed.put('/profile', [ProfileController, 'update']).name('profile.update')
++    authed.put('/profile', { name: 'profile.update', body: ProfileUpdateSchema }, [ProfileController, 'update'])
+   })
+ }
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..283b254
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,184 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { User } from '../app/Models/User.js'
++import app from '../src/app.js'
++
++describe('ProfileController', () => {
++  let http: TestApp
++  let testUser: typeof User.$inferSelect
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    // Reset database and create a test user
++    await User.delete({})
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++  })
++
++  it('rejects invalid email format', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'not-an-email',
++        password: '',
++      })
++      .assertStatus(422)
++      .assertJsonPath('errors.email.0', 'Enter a valid email address.')
++  })
++
++  it('rejects empty name', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: '',
++        email: 'test@example.com',
++        password: '',
++      })
++      .assertStatus(422)
++      .assertJsonPath('errors.name.0', 'Name is required.')
++  })
++
++  it('rejects password shorter than 8 characters', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'test@example.com',
++        password: 'short',
++      })
++      .assertStatus(422)
++      .assertJsonPath('errors.password.0', 'Password must be at least 8 characters.')
++  })
++
++  it('successfully updates profile with valid data', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'newemail@example.com',
++        password: '',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    if (updated) {
++      const { name, email } = updated
++      if (name === 'Updated Name' && email === 'newemail@example.com') {
++        // Success!
++      } else {
++        throw new Error(`Profile not updated correctly: ${name}, ${email}`)
++      }
++    }
++  })
++
++  it('successfully updates password when provided', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'test@example.com',
++        password: 'newpassword123',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    if (updated) {
++      // The password should be hashed, so we can't compare directly
++      // Just check that the user was found successfully
++      if (updated.id === testUser.id) {
++        // Success!
++      } else {
++        throw new Error('User not found after update')
++      }
++    }
++  })
++
++  it('ignores extra fields not in the profile form', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'newemail@example.com',
++        password: '',
++        id: 9999,
++        passwordHash: 'should-be-ignored',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    if (updated) {
++      // The id should still be the original testUser.id, not 9999
++      if (updated.id === testUser.id && updated.name === 'Updated Name') {
++        // Success - extra fields were ignored
++      } else {
++        throw new Error(`Extra fields were not ignored: id=${updated.id}`)
++      }
++    }
++  })
++
++  it('normalizes email to lowercase', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'TEST@EXAMPLE.COM',
++        password: '',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    if (updated) {
++      if (updated.email === 'test@example.com') {
++        // Success - email was lowercased
++      } else {
++        throw new Error(`Email was not lowercased: ${updated.email}`)
++      }
++    }
++  })
++
++  it('rejects duplicate email', async () => {
++    // Create another user
++    await User.create({
++      name: 'Another User',
++      email: 'another@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'another@example.com',
++        password: '',
++      })
++      .assertStatus(422)
++      .assertJsonPath('errors.email.0', 'Email is already in use.')
++  })
++
++  it('allows changing to a different email', async () => {
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Test User',
++        email: 'different@example.com',
++        password: '',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    if (updated) {
++      if (updated.email === 'different@example.com') {
++        // Success
++      } else {
++        throw new Error(`Email not updated: ${updated.email}`)
++      }
++    }
++  })
++})

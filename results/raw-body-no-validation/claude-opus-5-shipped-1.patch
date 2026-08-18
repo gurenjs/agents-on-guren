@@ -1,0 +1,129 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..be4eb40 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { User, type UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,9 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    // Zod strips keys the profile form does not own (id, passwordHash, …), so
++    // only name/email/password can ever reach the update below.
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +37,11 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    // An empty password means "keep the current one" — see ProfileValidator.
++    // AuthenticatableModel hashes the virtual `password` into `passwordHash`.
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..701ad40
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,82 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++  // Signed in, CSRF-primed and JSON-negotiated — PUT /profile needs all three.
++  let agent: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    user = await User.create({
++      name: 'Ada Lovelace',
++      email: 'ada@example.com',
++      password: 'correct-horse',
++    })
++    agent = (await http.actingAs(user).withCsrf()).json()
++  })
++
++  it('rejects a badly formatted email and leaves the account untouched', async () => {
++    await agent
++      .put('/profile', { name: 'Ada Lovelace', email: 'not-an-email' })
++      .assertStatus(422)
++      .assertJsonPath('errors.email.0', 'Enter a valid email address.')
++
++    const unchanged = await User.findOrFail(user.id)
++    expect(unchanged.email).toBe('ada@example.com')
++  })
++
++  it('rejects an empty name', async () => {
++    await agent
++      .put('/profile', { name: '   ', email: 'ada@example.com' })
++      .assertStatus(422)
++      .assertJsonPath('errors.name.0', 'Name is required.')
++
++    const unchanged = await User.findOrFail(user.id)
++    expect(unchanged.name).toBe('Ada Lovelace')
++  })
++
++  it('rejects a password shorter than 8 characters', async () => {
++    await agent
++      .put('/profile', { name: 'Ada', email: 'ada@example.com', password: 'short' })
++      .assertStatus(422)
++      .assertJsonPath('errors.password.0', 'Password must be at least 8 characters.')
++  })
++
++  it('ignores fields the profile form does not own', async () => {
++    await agent
++      .put('/profile', {
++        name: 'Ada L',
++        email: 'ADA@Example.com',
++        id: 9999,
++        passwordHash: 'pwned',
++      })
++      .assertOk()
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.id).toBe(user.id)
++    expect(refreshed.name).toBe('Ada L')
++    // The validator lowercases the stored address.
++    expect(refreshed.email).toBe('ada@example.com')
++    expect(refreshed.passwordHash).not.toBe('pwned')
++  })
++
++  it('saves a valid update and keeps the password when the field is empty', async () => {
++    await agent
++      .put('/profile', { name: 'Ada Byron', email: 'ada.byron@example.com', password: '' })
++      .assertOk()
++
++    const refreshed = await User.findOrFail(user.id)
++    expect(refreshed.name).toBe('Ada Byron')
++    expect(refreshed.email).toBe('ada.byron@example.com')
++    expect(refreshed.passwordHash).toBe(user.passwordHash)
++  })
++})

@@ -1,0 +1,139 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..8743384 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: Array<Data.Post> }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/app/Http/Controllers/Api/PostController.ts b/app/Http/Controllers/Api/PostController.ts
+new file mode 100644
+index 0000000..9a84ccf
+--- /dev/null
++++ b/app/Http/Controllers/Api/PostController.ts
+@@ -0,0 +1,37 @@
++import { Controller, paginate } from '@guren/core'
++import { Post } from '../../../Models/Post.js'
++import { PostResource } from '../../Resources/PostResource.js'
++import { ApiPostsQuerySchema } from '../../Validators/PostValidator.js'
++
++const PER_PAGE = 10
++
++// Public JSON listing for external consumers: `GET /api/posts?page=&author=`.
++// Serves the same PostResource shape the pages receive, paginated with the
++// standard `{ data, meta, links }` envelope.
++export default class ApiPostController extends Controller {
++  async index(): Promise<Response> {
++    const { page, author } = this.validateQuery(ApiPostsQuerySchema)
++
++    const scoped = () => {
++      let query = Post.newQuery()
++      if (author !== undefined) {
++        query = query.where('authorId', author)
++      }
++      return query
++    }
++
++    const total = await scoped().count()
++    const posts = await scoped()
++      .with('author')
++      .orderBy('id', 'desc')
++      .limit(PER_PAGE)
++      .offset((page - 1) * PER_PAGE)
++      .get()
++
++    const paginator = paginate(posts, total, PER_PAGE, page, {
++      path: this.request.path ?? '/api/posts',
++    })
++
++    return this.json(paginator.toResource(PostResource))
++  }
++}
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..82e588b 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -8,6 +8,13 @@ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+ 
++// Query contract for `GET /api/posts` — attached to the route so the typed
++// API surface (codegen, context, audit) sees the accepted parameters.
++export const ApiPostsQuerySchema = z.object({
++  page: z.coerce.number().int().min(1).default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
+ export const PostSearchSchema = z.object({
+   keywords: z
+     .array(z.string().trim().min(1, 'Keywords must not be blank.'))
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..f960e53 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,7 +1,8 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+-import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import ApiPostController from '../app/Http/Controllers/Api/PostController.js'
++import { ApiPostsQuerySchema, PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+@@ -44,4 +45,15 @@ export function registerWebRoutes(baseRouter: Router): void {
+       resource: { data: [PostResource] },
+     }, [PostController, 'search'])
+   })
++
++  // Public JSON API. The `query` schema and `resource` hint make the route's
++  // parameters and response part of the typed API surface: `guren codegen`
++  // emits `api.posts.index` into the generated client with a typed json().
++  router.group('/api', (api) => {
++    api.get('/posts', {
++      name: 'api.posts.index',
++      query: ApiPostsQuerySchema,
++      resource: { data: [PostResource] },
++    }, [ApiPostController, 'index'])
++  })
+ }

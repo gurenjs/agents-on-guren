@@ -1,0 +1,75 @@
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..dd15f1a 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -1,14 +1,20 @@
+-import type { Router } from '@guren/core'
++import { createRateLimitMiddleware, type Router } from '@guren/core'
+ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
+ 
++// 5 attempts/minute per client IP (trustProxy off — this app sits behind no
++// proxy in dev, so forwarded-for style headers must not be trusted). When the
++// IP can't be determined the middleware falls back to one shared bucket
++// rather than skipping the limit, so it fails closed instead of open.
++const loginRateLimit = createRateLimitMiddleware({ limit: 5, windowMs: 60_000, keyPrefix: 'rl:login:' })
++
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    guest.post('/login', { name: 'login.store', middlewares: [loginRateLimit] }, [LoginController, 'store'])
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..5f0de6a
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,42 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// All requests in this suite share one client identity (TestApp's in-process
++// fetch has no real socket, so the rate limiter falls back to its shared
++// bucket) and the limiter's counters are in-memory and never reset between
++// cases, so the whole scenario runs as one ordered sequence rather than
++// independent `it` blocks.
++describe('POST /login throttling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    const base = await TestApp.fromApp(app)
++    await resetDatabase()
++    await User.create({ name: 'Jane', email: 'jane@example.com', password: 'correct-password' })
++    http = await base.withCsrf()
++  })
++
++  it('processes attempts under the limit normally, then throttles the rest of the window', async () => {
++    // Attempts 1-4: wrong password, refused the normal way (not throttled).
++    for (let attempt = 0; attempt < 4; attempt++) {
++      await http.json().post('/login', { email: 'jane@example.com', password: 'wrong' }).assertUnprocessable()
++    }
++
++    // Attempt 5: correct credentials, still within the limit — login succeeds.
++    await http.json().post('/login', { email: 'jane@example.com', password: 'correct-password' }).assertRedirect('/dashboard')
++
++    // Attempt 6: over the limit within the same window — throttled even
++    // though the credentials are correct.
++    const throttled = await http.json().post('/login', { email: 'jane@example.com', password: 'correct-password' })
++    throttled.assertStatus(429)
++    expect(throttled.headers.get('Retry-After')).toBeTruthy()
++
++    // A throttled client can still load other pages — only the login
++    // submission itself is rate limited.
++    await http.get('/login').assertOk()
++    await http.get('/').assertOk()
++  })
++})

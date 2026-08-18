@@ -1,0 +1,200 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..ddfa7bb 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -35,12 +35,12 @@ export default class PostController extends Controller {
+ 
+     const posts = await Post.newQuery()
+       .with('author')
++      .where('published', true)
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
+       .orderBy('id', 'desc')
+       .limit(limit)
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..ff05963 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,22 +1,169 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, afterAll, beforeEach, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
+ 
+-// posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+-// the body with validateBody() before building any query — the schema bound
+-// to the route feeds codegen and `guren audit`, while body parsing stays in
+-// the controller so the request stream is read once — so an invalid payload
+-// gets a 422 without the database ever being touched. That keeps this starter
+-// test green without migrations or fixtures; cover the happy path with real
+-// feature tests once your test database is set up.
+ describe('posts.search', () => {
+   let http: TestApp
++  let testUser: any
+ 
+   beforeAll(async () => {
+     http = await TestApp.fromApp(app)
++
++    // Create a test user for posts
++    testUser = await User.create({
++      name: 'Test User',
++      email: `test-search-${Date.now()}@example.com`,
++      password: 'password123',
++    })
++  })
++
++  afterAll(async () => {
++    // Clean up test data
++    if (testUser) {
++      await Post.delete({ authorId: testUser.id })
++      await User.delete({ id: testUser.id })
++    }
++  })
++
++  beforeEach(async () => {
++    // Clean up posts before each test
++    if (testUser) {
++      await Post.delete({ authorId: testUser.id })
++    }
+   })
+ 
+   it('rejects a search without keywords', async () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
++
++  it('returns only published posts matching keywords', async () => {
++    // Create a published post with keyword "zephyrquill"
++    await Post.forceCreate({
++      title: 'The zephyrquill chronicles',
++      excerpt: 'A story about adventure',
++      body: 'Full body text',
++      authorId: testUser.id,
++      published: true,
++    })
++
++    // Create an unpublished post with the same keyword
++    await Post.forceCreate({
++      title: 'Unpublished zephyrquill draft',
++      excerpt: 'This should not appear',
++      body: 'Secret draft',
++      authorId: testUser.id,
++      published: false,
++    })
++
++    const response = await http.query('/posts/search', { keywords: ['zephyrquill'], limit: 10 })
++    const data = await response.json()
++
++    // Should only have 1 result (the published post)
++    if (data.data.length !== 1) {
++      throw new Error(
++        `Expected 1 published post, got ${data.data.length}. This means unpublished posts are leaking into search results.`,
++      )
++    }
++    if (!data.data[0].title.includes('zephyrquill')) {
++      throw new Error('Expected post to contain "zephyrquill"')
++    }
++    if (data.data[0].title.includes('Unpublished')) {
++      throw new Error('Unpublished post should not appear in search results')
++    }
++  })
++
++  it('returns empty results when only unpublished posts match', async () => {
++    // Create only an unpublished post
++    await Post.forceCreate({
++      title: 'Secret unpublished marmalade',
++      excerpt: 'This is a draft',
++      body: 'Not for public',
++      authorId: testUser.id,
++      published: false,
++    })
++
++    const response = await http.query('/posts/search', { keywords: ['marmalade'], limit: 10 })
++    const data = await response.json()
++
++    if (data.data.length !== 0) {
++      throw new Error(
++        `Expected 0 results when only unpublished posts match, got ${data.data.length}. Unpublished posts should never appear.`,
++      )
++    }
++  })
++
++  it('returns only posts containing keywords, not all published posts', async () => {
++    // Create a published post that matches
++    await Post.forceCreate({
++      title: 'Published zephyrquill post',
++      excerpt: 'This matches the search',
++      body: 'Full text',
++      authorId: testUser.id,
++      published: true,
++    })
++
++    // Create another published post that does NOT match
++    await Post.forceCreate({
++      title: 'Another published post',
++      excerpt: 'This does not match',
++      body: 'Different content',
++      authorId: testUser.id,
++      published: true,
++    })
++
++    const response = await http.query('/posts/search', { keywords: ['zephyrquill'], limit: 10 })
++    const data = await response.json()
++
++    if (data.data.length !== 1) {
++      throw new Error(
++        `Expected 1 result, got ${data.data.length}. Search should not return all published posts, only matching ones.`,
++      )
++    }
++  })
++
++  it('matches multiple keywords with OR logic', async () => {
++    // Create posts with different keywords
++    await Post.forceCreate({
++      title: 'Published zephyrquill post',
++      excerpt: 'About birds',
++      body: 'Full text',
++      authorId: testUser.id,
++      published: true,
++    })
++
++    await Post.forceCreate({
++      title: 'Another post',
++      excerpt: 'With marmalade flavor',
++      body: 'Full text',
++      authorId: testUser.id,
++      published: true,
++    })
++
++    // Unpublished post with one of the keywords
++    await Post.forceCreate({
++      title: 'Draft about marmalade',
++      excerpt: 'Unpublished version',
++      body: 'Secret',
++      authorId: testUser.id,
++      published: false,
++    })
++
++    const response = await http.query('/posts/search', { keywords: ['zephyrquill', 'marmalade'], limit: 10 })
++    const data = await response.json()
++
++    if (data.data.length !== 2) {
++      throw new Error(
++        `Expected 2 published posts matching either keyword, got ${data.data.length}. Unpublished posts must not appear.`,
++      )
++    }
++
++    // Verify all results are published
++    for (const post of data.data) {
++      if (post.title.includes('Draft')) {
++        throw new Error('Unpublished post appeared in search results')
++      }
++    }
++  })
+ })

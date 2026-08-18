@@ -1,0 +1,125 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..b44123a 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -89,8 +89,12 @@ export default class PostController extends Controller {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
++    // Same schema as store(), so an edit obeys the same field rules; anything
++    // else the client sends — `authorId` above all — is stripped here, and
++    // Post.update() (not forceUpdate) keeps the fillable allowlist in force.
++    const data = await this.validateBody(PostPayloadSchema)
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostUpdate.test.ts b/tests/PostUpdate.test.ts
+new file mode 100644
+index 0000000..89d850b
+--- /dev/null
++++ b/tests/PostUpdate.test.ts
+@@ -0,0 +1,101 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// PUT /posts/:id used to write the raw request body straight to the row, which
++// let a signed-in author hand their post to somebody else by sending an extra
++// `authorId`. These tests pin the fix: the edit payload goes through the same
++// schema as posts.store, and the write goes through Post.update() so the
++// fillable allowlist still applies.
++describe('posts.update', () => {
++  let http: TestApp
++  let author: UserRecord
++  let other: UserRecord
++
++  async function makeUser(label: string): Promise<UserRecord> {
++    return await User.create({
++      name: label,
++      email: `${label}-${crypto.randomUUID()}@example.com`,
++      password: 'password123',
++    })
++  }
++
++  async function makePost(owner: UserRecord) {
++    return await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: owner.id,
++    })
++  }
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++    author = await makeUser('author')
++    other = await makeUser('other')
++  })
++
++  it('ignores an authorId smuggled into the edit payload', async () => {
++    const post = await makePost(author)
++    const client = await http.actingAs(author).withCsrf()
++
++    await client.put(`/posts/${post.id}`, {
++      title: 'Renamed',
++      excerpt: 'Still mine?',
++      body: 'Body',
++      authorId: other.id,
++    }).assertRedirect()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.authorId).toBe(author.id)
++    expect(updated.title).toBe('Renamed')
++  })
++
++  it('rejects an empty title with a 422 and leaves the post untouched', async () => {
++    const post = await makePost(author)
++    const client = await http.actingAs(author).withCsrf()
++
++    await client.json().put(`/posts/${post.id}`, {
++      title: '',
++      excerpt: 'Excerpt',
++      body: 'Body',
++    }).assertStatus(422)
++
++    const untouched = await Post.findOrFail(post.id)
++    expect(untouched.title).toBe('Original title')
++    expect(untouched.excerpt).toBe('Original excerpt')
++  })
++
++  it('does not write fields outside the edit form', async () => {
++    const post = await makePost(author)
++    const client = await http.actingAs(author).withCsrf()
++
++    await client.put(`/posts/${post.id}`, {
++      title: 'Renamed again',
++      excerpt: 'Excerpt',
++      body: 'Body',
++      createdAt: '1999-01-01T00:00:00.000Z',
++    }).assertRedirect()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.createdAt).toBe(post.createdAt)
++  })
++
++  it('still refuses an edit by a non-author', async () => {
++    const post = await makePost(author)
++    const client = await http.actingAs(other).withCsrf()
++
++    await client.json().put(`/posts/${post.id}`, {
++      title: 'Not mine',
++      excerpt: 'Excerpt',
++      body: 'Body',
++    }).assertStatus(403)
++
++    const untouched = await Post.findOrFail(post.id)
++    expect(untouched.title).toBe('Original title')
++  })
++})

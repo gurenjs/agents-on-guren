@@ -1,0 +1,84 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index bd31039..cb31375 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
++import { checkLoginRateLimit } from '@/app/Http/Services/LoginRateLimiter.js'
+ 
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+@@ -9,6 +10,17 @@ export default class LoginController extends Controller {
+   }
+ 
+   async store(): Promise<Response> {
++    const rateLimit = checkLoginRateLimit(this.ctx)
++
++    if (!rateLimit.allowed) {
++      return new Response(null, {
++        status: 429,
++        headers: {
++          'Retry-After': rateLimit.retryAfterSeconds.toString(),
++        },
++      })
++    }
++
+     const { email, password, remember } = await this.validateBody(LoginSchema)
+ 
+     this.auth.session()?.regenerate()
+diff --git a/app/Http/Services/LoginRateLimiter.ts b/app/Http/Services/LoginRateLimiter.ts
+new file mode 100644
+index 0000000..abf73d8
+--- /dev/null
++++ b/app/Http/Services/LoginRateLimiter.ts
+@@ -0,0 +1,48 @@
++import type { Context } from 'hono'
++
++interface AttemptRecord {
++  count: number
++  resetAt: number
++}
++
++const ATTEMPTS_LIMIT = 5
++const WINDOW_MS = 60 * 1000 // 1 minute
++
++const attempts = new Map<string, AttemptRecord>()
++
++function getClientIp(ctx: Context): string {
++  try {
++    // Try to use the Bun runtime's connection info
++    const req = ctx.req.raw as any
++    if (req?.socket?.remoteAddress) {
++      return req.socket.remoteAddress
++    }
++  } catch {
++    // Ignore errors, fall through to unknown
++  }
++
++  return 'unknown'
++}
++
++export function checkLoginRateLimit(ctx: Context): { allowed: boolean; retryAfterSeconds: number } {
++  const ip = getClientIp(ctx)
++  const now = Date.now()
++
++  const record = attempts.get(ip)
++
++  if (!record || now >= record.resetAt) {
++    // Create a new window
++    attempts.set(ip, { count: 1, resetAt: now + WINDOW_MS })
++    return { allowed: true, retryAfterSeconds: 0 }
++  }
++
++  // Within the current window
++  if (record.count < ATTEMPTS_LIMIT) {
++    record.count++
++    return { allowed: true, retryAfterSeconds: 0 }
++  }
++
++  // Limit exceeded
++  const retryAfterSeconds = Math.ceil((record.resetAt - now) / 1000)
++  return { allowed: false, retryAfterSeconds }
++}

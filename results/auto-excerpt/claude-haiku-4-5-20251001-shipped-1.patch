@@ -1,0 +1,197 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..5b67e4f 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,6 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { deriveExcerpt } from '../../Utils/ExcerptDeriver.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -68,9 +69,10 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const data = await this.validateBody(PostPayloadSchema)
++    const excerpt = data.excerpt || deriveExcerpt(data.body)
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({ ...data, excerpt, authorId: author.id })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +93,8 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const data = await this.validateBody(PostPayloadSchema)
+-    await Post.update({ id: post.id }, data)
++    const excerpt = data.excerpt || deriveExcerpt(data.body)
++    await Post.update({ id: post.id }, { ...data, excerpt })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..39d7e80 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -18,7 +18,7 @@ export const PostSearchSchema = z.object({
+ 
+ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++  excerpt: z.string().trim().max(500, 'Excerpt must be 500 characters or fewer.').optional().default(''),
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
+diff --git a/app/Utils/ExcerptDeriver.ts b/app/Utils/ExcerptDeriver.ts
+new file mode 100644
+index 0000000..2ca1cf1
+--- /dev/null
++++ b/app/Utils/ExcerptDeriver.ts
+@@ -0,0 +1,31 @@
++export function deriveExcerpt(body: string): string {
++  const trimmed = body.trim()
++
++  if (trimmed.length <= 140) {
++    return trimmed
++  }
++
++  // Body is longer than 140 characters
++  const first140 = trimmed.substring(0, 140)
++  const char141 = trimmed[140]
++
++  // Check if character 141 exists and if char 140 and 141 are both non-whitespace
++  if (char141 && /\S/.test(trimmed[139]) && /\S/.test(char141)) {
++    // We're cutting inside a word. Find the last whitespace before position 140
++    let cutPoint = 139
++    while (cutPoint >= 0 && /\S/.test(trimmed[cutPoint])) {
++      cutPoint--
++    }
++
++    if (cutPoint >= 0) {
++      // Found whitespace, trim trailing whitespace and add ellipsis
++      return trimmed.substring(0, cutPoint + 1).trimEnd() + '…'
++    }
++
++    // No whitespace found in first 140 chars, cut at 140
++    return first140 + '…'
++  }
++
++  // Character 141 is whitespace or doesn't exist, keep all 140 chars
++  return first140.trimEnd() + '…'
++}
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..b4811de 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -44,9 +44,13 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt
++              <span className="ml-1 text-xs font-normal text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
++              placeholder="Leave blank to auto-generate from body"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
+               className={fieldClass}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..952a428 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -36,9 +36,13 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt
++              <span className="ml-1 text-xs font-normal text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
++              placeholder="Leave blank to auto-generate from body"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
+               className={fieldClass}
+diff --git a/tests/ExcerptDeriver.test.ts b/tests/ExcerptDeriver.test.ts
+new file mode 100644
+index 0000000..117e42c
+--- /dev/null
++++ b/tests/ExcerptDeriver.test.ts
+@@ -0,0 +1,69 @@
++import { describe, it, expect } from 'bun:test'
++import { deriveExcerpt } from '../app/Utils/ExcerptDeriver.js'
++
++describe('deriveExcerpt', () => {
++  it('returns whole body if 140 characters or fewer', () => {
++    const body = 'The quick brown fox'
++    expect(deriveExcerpt(body)).toBe('The quick brown fox')
++  })
++
++  it('trims whitespace from body before checking length', () => {
++    const body = '  The quick brown fox  '
++    expect(deriveExcerpt(body)).toBe('The quick brown fox')
++  })
++
++  it('cuts at 140 chars and adds ellipsis when body is longer', () => {
++    const body = 'a'.repeat(141)
++    const result = deriveExcerpt(body)
++    expect(result).toBe('a'.repeat(140) + '…')
++  })
++
++  it('cuts before word boundary when char 141 is inside a word', () => {
++    // Construct body where first 140 chars end mid-word
++    // First 140: "The quick brown fox ... The q"
++    // Char 141: "u" (inside "quick")
++    const body = 'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown'
++    expect(body.length).toBe(150)
++
++    const result = deriveExcerpt(body)
++    // Should cut at space before "The quick", giving us 138 chars + ellipsis
++    const expected = 'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…'
++    expect(result).toBe(expected)
++    expect(result.length).toBe(139)
++  })
++
++  it('keeps all 140 chars when char 141 is whitespace', () => {
++    const body = 'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right at a space, then adds a mark.'
++    expect(body.length).toBe(170)
++
++    const result = deriveExcerpt(body)
++    const expected = 'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right…'
++    expect(result).toBe(expected)
++    expect(result.length).toBe(141)
++  })
++
++  it('handles body with no whitespace in first 140 chars', () => {
++    const body = 'a'.repeat(150)
++    const result = deriveExcerpt(body)
++    expect(result).toBe('a'.repeat(140) + '…')
++  })
++
++  it('trims trailing whitespace before adding ellipsis', () => {
++    // Create a body that, after first 140 chars, has trailing spaces in the cut section
++    // but still longer than 140 chars overall
++    const body = 'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The q     uality matters'
++    expect(body.length).toBeGreaterThan(140)
++    const result = deriveExcerpt(body)
++    // Should trim trailing spaces and add ellipsis
++    expect(result.endsWith('…')).toBe(true)
++  })
++
++  it('handles body with 140+ chars and no ellipsis needed', () => {
++    // Body that's exactly 140 characters should be returned as-is with ellipsis only if > 140
++    const body = 'a'.repeat(140) + ' more text here'
++    expect(body.length).toBeGreaterThan(140)
++    const result = deriveExcerpt(body)
++    // Should end with ellipsis since it's longer than 140
++    expect(result.endsWith('…')).toBe(true)
++  })
++})

@@ -1,0 +1,218 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..5bd3666 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -18,6 +18,10 @@ export interface ApiRoutes {
+     method: 'GET'
+     path: '/dashboard'
+   }
++  'health': {
++    method: 'GET'
++    path: '/health'
++  }
+   'home': {
+     method: 'GET'
+     path: '/'
+@@ -304,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ 
+ const routes: Record<string, { method: string; path: string }> = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..1105f0a 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -3,6 +3,7 @@
+ 
+ export const routeManifest = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
++  'health': { method: 'GET', path: '/health' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+@@ -68,6 +69,7 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ 
+ export const routes = {
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
++  health: (query?: RouteQuery) => route('health', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+     (query?: RouteQuery) => route('login', query),
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..20a3a00
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,40 @@
++import { Controller, type CheckResult } from '@guren/core'
++import { health } from '../../../config/health.js'
++
++interface CheckPayload {
++  status: CheckResult['status']
++  message?: string
++  durationMs: number
++}
++
++/**
++ * Liveness/readiness probe for load balancers and uptime monitors.
++ *
++ * The HTTP status is what drains traffic — 200 while every check passes, 503
++ * as soon as one fails — so a failing dependency must never reach the global
++ * exception handler as a 500. The JSON body carries the per-check breakdown
++ * the ops dashboard renders.
++ */
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    const report = await health.check()
++    const checks: Record<string, CheckPayload> = {}
++
++    for (const check of report.checks) {
++      checks[check.name] = {
++        status: check.status,
++        ...(check.message === undefined ? {} : { message: check.message }),
++        durationMs: check.duration,
++      }
++    }
++
++    return this.json(
++      {
++        status: report.status,
++        timestamp: report.timestamp.toISOString(),
++        checks,
++      },
++      { status: report.status === 'healthy' ? 200 : 503 },
++    )
++  }
++}
+diff --git a/config/health.ts b/config/health.ts
+new file mode 100644
+index 0000000..2a9c281
+--- /dev/null
++++ b/config/health.ts
+@@ -0,0 +1,29 @@
++import { createHealthManager, DatabaseCheck, type DatabaseConnection } from '@guren/core'
++import { sql } from 'drizzle-orm'
++import { getDatabase } from './database.js'
++
++/**
++ * The deployment platform keeps a deploy in the load-balancer pool for as long
++ * as GET /health answers 2xx, so every probe has to reach the database for
++ * real — a cached flag would have kept a deploy with an unreachable database
++ * in rotation. Opening the connection is part of the probe: `getDatabase()`
++ * throws when the file (or server) cannot be opened, and `DatabaseCheck`
++ * reports that as `unhealthy` just like a failing query.
++ */
++const connection: DatabaseConnection = {
++  async query(statement: string): Promise<unknown> {
++    const db = (await getDatabase()) as { all(query: unknown): unknown }
++    return db.all(sql.raw(statement))
++  },
++}
++
++/**
++ * The app's dependency probes. The database is the only one so far; register
++ * further checks here as the app grows dependencies worth draining traffic for.
++ */
++export const health = createHealthManager().register(new DatabaseCheck(connection), {
++  // The database is the whole point of the probe: a failure has to drive the
++  // report to `unhealthy` (503), not merely to `degraded` (still 200).
++  critical: true,
++  timeout: 2_000,
++})
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..bdead9e 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. Answers 503
++  // when a dependency check fails, so a bad deploy is drained from the pool.
++  router.get('/health', [HealthController, 'index']).name('health')
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..9cc8523
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,66 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { closeDatabase } from '../config/database.js'
++
++// The probe has to fail when the database is unreachable, so the failure case
++// is exercised for real: close the connection, point the filename resolver at
++// a path SQLite cannot open, and let the next probe try to open it. The
++// filename is resolved per connection and a failed open is never cached, so
++// restoring the variable and closing again puts the suite back on the test DB.
++const UNOPENABLE_DATABASE = '/dev/null/unreachable.db'
++
++// Assigning `undefined` would leave the literal string "undefined" behind.
++function setTestDatabaseUrl(value: string | undefined): void {
++  if (value === undefined) {
++    delete process.env.TEST_DATABASE_URL
++  } else {
++    process.env.TEST_DATABASE_URL = value
++  }
++}
++
++describe('GET /health', () => {
++  let http: TestApp
++  const originalTestDatabaseUrl = process.env.TEST_DATABASE_URL
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  afterAll(async () => {
++    setTestDatabaseUrl(originalTestDatabaseUrl)
++    await closeDatabase()
++  })
++
++  it('reports the database as healthy while it answers', async () => {
++    const response = await http.get('/health').assertOk()
++    const body = await response.json<{
++      status: string
++      checks: Record<string, { status: string }>
++    }>()
++
++    expect(body.status).toBe('healthy')
++    expect(body.checks.database?.status).toBe('healthy')
++  })
++
++  it('answers 503 when the database cannot be reached', async () => {
++    await closeDatabase()
++    setTestDatabaseUrl(UNOPENABLE_DATABASE)
++
++    const response = await http.get('/health').assertStatus(503)
++    const body = await response.json<{
++      status: string
++      checks: Record<string, { status: string }>
++    }>()
++
++    expect(body.status).toBe('unhealthy')
++    expect(body.checks.database?.status).toBe('unhealthy')
++  })
++
++  it('recovers once the database is reachable again', async () => {
++    setTestDatabaseUrl(originalTestDatabaseUrl)
++    await closeDatabase()
++
++    await http.get('/health').assertOk()
++  })
++})

@@ -1,0 +1,240 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..5320b0c 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,11 +1,16 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { sanitizeRedirectTarget } from '../../../Support/SafeRedirect.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++/** Where a sign-in goes when no usable redirect target came with the request. */
++const DEFAULT_LOGIN_REDIRECT = '/dashboard'
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+-    const redirect = this.request.query('redirect') ?? ''
++    // Sanitized here too, so the form never carries an off-site target forward.
++    const redirect = sanitizeRedirectTarget(this.request.query('redirect'), '')
+     return this.inertia(pages.auth.Login, { email, redirect }, { title: 'Login' })
+   }
+ 
+@@ -20,8 +25,12 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in — but only
++    // if that page is inside this app. A target pointing at another origin is
++    // an attacker handing a freshly signed-in user to a look-alike site, so it
++    // is dropped in favour of the default destination.
++    const requested = redirect || this.request.query('redirect')
++    return this.redirect(sanitizeRedirectTarget(requested, DEFAULT_LOGIN_REDIRECT))
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Support/SafeRedirect.ts b/app/Support/SafeRedirect.ts
+new file mode 100644
+index 0000000..6eec58b
+--- /dev/null
++++ b/app/Support/SafeRedirect.ts
+@@ -0,0 +1,60 @@
++/**
++ * Guards "send me back where I came from" parameters against open redirects.
++ *
++ * A redirect target that arrives with the request is attacker-controlled: a
++ * link to our own /login carrying `?redirect=https://evil.example` looks
++ * trustworthy right up until the browser lands on someone else's site. Only a
++ * path inside this app is ever honoured; anything else falls back to the
++ * default destination, exactly as if no redirect had been supplied.
++ */
++
++/** Any origin works — it only exists so a relative path can be resolved. */
++const PROBE_ORIGIN = 'http://redirect.invalid'
++
++/**
++ * Drop tabs, newlines and the rest of the control characters. Browsers remove
++ * them from a URL before resolving it, so a value like "/<tab>/evil.example"
++ * would otherwise slip past the checks below and hit the network as
++ * "//evil.example".
++ */
++function stripControlCharacters(value: string): string {
++  let stripped = ''
++  for (const character of value) {
++    const code = character.codePointAt(0) ?? 0
++    if (code > 0x1f && code !== 0x7f) stripped += character
++  }
++  return stripped
++}
++
++/**
++ * Normalize a requested redirect target to a same-app path.
++ *
++ * Returns `fallback` for absolute URLs, protocol-relative values (`//host`),
++ * backslash variants browsers rewrite into those (`/\host`), and anything that
++ * does not parse as a plain in-app path.
++ */
++export function sanitizeRedirectTarget(value: unknown, fallback: string): string {
++  if (typeof value !== 'string') return fallback
++
++  const candidate = stripControlCharacters(value).trim()
++  if (candidate === '') return fallback
++
++  // Browsers treat a backslash as a forward slash in URLs, which turns
++  // "/\evil.example" into "//evil.example" — another origin.
++  const normalized = candidate.replace(/\\/g, '/')
++
++  // A same-app path starts with exactly one slash: no scheme ("https://…"),
++  // no protocol-relative prefix ("//host"), no bare relative value.
++  if (!normalized.startsWith('/') || normalized.startsWith('//')) return fallback
++
++  // Belt and braces: resolve it and confirm it never left the probe origin.
++  let resolved: URL
++  try {
++    resolved = new URL(normalized, PROBE_ORIGIN)
++  } catch {
++    return fallback
++  }
++  if (resolved.origin !== PROBE_ORIGIN) return fallback
++
++  return `${resolved.pathname}${resolved.search}${resolved.hash}`
++}
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..758945b
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,89 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp, type TestResponse } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++const CREDENTIALS = { email: 'ada@example.com', password: 'correct-horse' }
++
++/** Replays the cookies a response set, so a later request keeps the session. */
++function cookieHeader(response: TestResponse): string {
++  return response.headers
++    .getSetCookie()
++    .map((cookie) => cookie.split(';')[0])
++    .join('; ')
++}
++
++describe('LoginController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    await User.create({ name: 'Ada', ...CREDENTIALS })
++  })
++
++  async function signIn(body: Record<string, unknown> = {}): Promise<TestResponse> {
++    const csrf = await http.withCsrf()
++    return csrf.post('/login', { ...CREDENTIALS, ...body })
++  }
++
++  describe('post-login destination', () => {
++    it('uses the default destination when no redirect is given', async () => {
++      const response = await signIn()
++      response.assertRedirect('/dashboard')
++    })
++
++    it('returns the user to the in-app page they came from', async () => {
++      const response = await signIn({ redirect: '/posts/3/edit' })
++      response.assertRedirect('/posts/3/edit')
++    })
++
++    it('ignores a redirect pointing at another site', async () => {
++      for (const redirect of [
++        'https://evil.example',
++        '//evil.example',
++        '/\\evil.example',
++        '\\\\evil.example',
++        'http://evil.example/login',
++      ]) {
++        const response = await signIn({ redirect })
++        response.assertRedirect('/dashboard')
++      }
++    })
++
++    it('ignores an off-site redirect passed in the query string', async () => {
++      const csrf = await http.withCsrf()
++      const response = await csrf.post('/login?redirect=https://evil.example', CREDENTIALS)
++      response.assertRedirect('/dashboard')
++    })
++
++    it('drops an off-site redirect from the login page props', async () => {
++      await http
++        .withHeaders({ 'X-Inertia': 'true', 'X-Requested-With': 'XMLHttpRequest' })
++        .get('/login?redirect=https://evil.example')
++        .assertInertia('auth/Login', { redirect: '' })
++    })
++  })
++
++  describe('authentication itself', () => {
++    it('signs the user in even when the redirect was rejected', async () => {
++      const response = await signIn({ redirect: 'https://evil.example' })
++      response.assertRedirect('/dashboard')
++      // Authenticated for real: /dashboard sits behind the auth middleware.
++      await http.withHeader('Cookie', cookieHeader(response)).get('/dashboard').assertOk()
++    })
++
++    it('rejects a wrong password without creating a session', async () => {
++      const response = await signIn({ password: 'nope' })
++      response.assertStatus(422)
++      await http
++        .withHeader('Cookie', cookieHeader(response))
++        .get('/dashboard')
++        .assertRedirect('/login')
++    })
++  })
++})
+diff --git a/tests/SafeRedirect.test.ts b/tests/SafeRedirect.test.ts
+new file mode 100644
+index 0000000..0166396
+--- /dev/null
++++ b/tests/SafeRedirect.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, it } from 'bun:test'
++import { sanitizeRedirectTarget } from '../app/Support/SafeRedirect.js'
++
++describe('sanitizeRedirectTarget', () => {
++  it('keeps a same-app path', () => {
++    expect(sanitizeRedirectTarget('/posts/3/edit', '/dashboard')).toBe('/posts/3/edit')
++    expect(sanitizeRedirectTarget('/posts?page=2#top', '/dashboard')).toBe('/posts?page=2#top')
++  })
++
++  it('rejects targets pointing at another origin', () => {
++    for (const target of [
++      'https://evil.example',
++      'http://evil.example/path',
++      '//evil.example',
++      '/\\evil.example',
++      '\\\\evil.example',
++      '/\\/evil.example',
++      'javascript:alert(1)',
++      '/\t/evil.example',
++      '/\n/evil.example',
++    ]) {
++      expect(sanitizeRedirectTarget(target, '/dashboard')).toBe('/dashboard')
++    }
++  })
++
++  it('falls back for empty and non-string values', () => {
++    expect(sanitizeRedirectTarget('', '/dashboard')).toBe('/dashboard')
++    expect(sanitizeRedirectTarget('   ', '/dashboard')).toBe('/dashboard')
++    expect(sanitizeRedirectTarget(undefined, '/dashboard')).toBe('/dashboard')
++    expect(sanitizeRedirectTarget(42, '/dashboard')).toBe('/dashboard')
++  })
++
++  it('rejects a value that is not an absolute in-app path', () => {
++    expect(sanitizeRedirectTarget('posts/3', '/dashboard')).toBe('/dashboard')
++  })
++})

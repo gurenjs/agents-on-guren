@@ -1,0 +1,174 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..a7a8959 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,11 +1,17 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { sanitizeRedirectPath } from '../../../Support/Redirects.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++// Where a sign-in with no usable `redirect` value lands.
++const DEFAULT_REDIRECT = '/dashboard'
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+-    const redirect = this.request.query('redirect') ?? ''
++    // Only a same-app path is carried into the form; anything pointing at
++    // another origin is dropped here so it can never be posted back.
++    const redirect = sanitizeRedirectPath(this.request.query('redirect')) ?? ''
+     return this.inertia(pages.auth.Login, { email, redirect }, { title: 'Login' })
+   }
+ 
+@@ -20,8 +26,15 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in — but
++    // only when that is a path inside this app. A value aimed at another
++    // origin is ignored rather than turning our login into a phishing hop.
++    const target =
++      sanitizeRedirectPath(redirect) ??
++      sanitizeRedirectPath(this.request.query('redirect')) ??
++      DEFAULT_REDIRECT
++
++    return this.redirect(target)
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Support/Redirects.ts b/app/Support/Redirects.ts
+new file mode 100644
+index 0000000..95de9b0
+--- /dev/null
++++ b/app/Support/Redirects.ts
+@@ -0,0 +1,46 @@
++/**
++ * Guards against open redirects.
++ *
++ * User-supplied "send me back here" values (the `redirect` field on the login
++ * form, the matching query parameter) may only ever point at a path inside
++ * this app. Anything that could take the browser to another origin — an
++ * absolute URL with a scheme, a protocol-relative `//host`, a backslash
++ * variant browsers normalise to `//host`, or a value carrying control
++ * characters they strip before parsing — is rejected so the caller can fall
++ * back to its default destination.
++ */
++
++// Any base works: the check is only that a relative path stays on it.
++const RESOLUTION_BASE = 'http://redirect-guard.invalid'
++
++/**
++ * Returns the value when it is a plain same-app path, otherwise `null`.
++ */
++export function sanitizeRedirectPath(value: unknown): string | null {
++  if (typeof value !== 'string' || value === '') return null
++
++  if (hasUnsafeCharacters(value)) return null
++
++  // Must be app-absolute: rules out "https://evil.example", "javascript:…"
++  // and bare hosts. A second slash makes it protocol-relative.
++  if (!value.startsWith('/') || value.startsWith('//')) return null
++
++  try {
++    if (new URL(value, RESOLUTION_BASE).origin !== RESOLUTION_BASE) return null
++  } catch {
++    return null
++  }
++
++  return value
++}
++
++// Backslashes are read as forward slashes by browsers ("/\evil.example" turns
++// into "//evil.example"), and whitespace or control characters are stripped
++// before the URL is parsed — neither belongs in a path we hand back untouched.
++function hasUnsafeCharacters(value: string): boolean {
++  for (const character of value) {
++    const code = character.codePointAt(0) ?? 0
++    if (code <= 0x20 || code === 0x7f || character === '\\') return true
++  }
++  return false
++}
+diff --git a/tests/Redirects.test.ts b/tests/Redirects.test.ts
+new file mode 100644
+index 0000000..72aaaf3
+--- /dev/null
++++ b/tests/Redirects.test.ts
+@@ -0,0 +1,34 @@
++import { describe, expect, it } from 'bun:test'
++import { sanitizeRedirectPath } from '../app/Support/Redirects.js'
++
++// The login flow feeds every user-supplied "come back here" value through
++// this guard, so the open-redirect vectors are pinned down here rather than
++// behind an HTTP round trip that also needs a database.
++describe('sanitizeRedirectPath', () => {
++  it('keeps same-app paths', () => {
++    expect(sanitizeRedirectPath('/posts/3/edit')).toBe('/posts/3/edit')
++    expect(sanitizeRedirectPath('/posts?page=2#top')).toBe('/posts?page=2#top')
++    expect(sanitizeRedirectPath('/')).toBe('/')
++  })
++
++  it('rejects anything that could leave this origin', () => {
++    const hostile = [
++      'https://evil.example',
++      'http://evil.example/login',
++      '//evil.example',
++      '/\\evil.example',
++      '\\\\evil.example',
++      '/\t/evil.example',
++      ' //evil.example',
++      'javascript:alert(1)',
++      'evil.example',
++      '',
++      undefined,
++      null,
++    ]
++
++    for (const value of hostile) {
++      expect(sanitizeRedirectPath(value)).toBeNull()
++    }
++  })
++})
+diff --git a/tests/controllers/LoginController.test.ts b/tests/controllers/LoginController.test.ts
+new file mode 100644
+index 0000000..47fa2e3
+--- /dev/null
++++ b/tests/controllers/LoginController.test.ts
+@@ -0,0 +1,35 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../../src/app.js'
++
++// The sign-in page carries a `redirect` value into its form so the user lands
++// back where they came from. Only same-app paths survive that trip — a value
++// aimed at another origin is dropped before it ever reaches the browser, so
++// /login?redirect=https://evil.example cannot be used as a phishing hop.
++// Signing in itself needs migrations and fixtures; the guard behind the
++// post-login redirect is covered directly in tests/Redirects.test.ts.
++describe('LoginController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    // X-Inertia asks for the JSON page payload instead of the HTML shell,
++    // which is what assertInertia() reads.
++    http = (await TestApp.fromApp(app)).withHeader('X-Inertia', 'true')
++  })
++
++  it('passes a same-app redirect to the form', async () => {
++    await http
++      .get('/login?redirect=/posts/3/edit')
++      .assertOk()
++      .assertInertia('auth/Login', { redirect: '/posts/3/edit' })
++  })
++
++  it('drops a cross-origin redirect', async () => {
++    for (const value of ['https://evil.example', '//evil.example', '/\\evil.example']) {
++      await http
++        .get(`/login?redirect=${encodeURIComponent(value)}`)
++        .assertOk()
++        .assertInertia('auth/Login', { redirect: '' })
++    }
++  })
++})

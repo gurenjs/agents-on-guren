@@ -1,0 +1,118 @@
+diff --git a/app/Http/HealthCheck.ts b/app/Http/HealthCheck.ts
+new file mode 100644
+index 0000000..fdb2f4d
+--- /dev/null
++++ b/app/Http/HealthCheck.ts
+@@ -0,0 +1,42 @@
++import { sql } from 'drizzle-orm'
++import { getDatabase } from '../../config/database.js'
++
++export type CheckStatus = 'ok' | 'error'
++
++export interface HealthCheckResult {
++  httpStatus: 200 | 503
++  body: {
++    status: 'ok' | 'error'
++    checks: {
++      db: { status: CheckStatus; message?: string }
++    }
++  }
++}
++
++/** A cheap round trip that only succeeds if the database is actually reachable. */
++export async function checkDatabaseConnection(): Promise<void> {
++  const db = (await getDatabase()) as { run(query: unknown): Promise<unknown> }
++  await db.run(sql`select 1`)
++}
++
++/**
++ * Runs the dependency checks backing `GET /health`. Takes the database probe
++ * as a parameter so it can be swapped out in tests without touching the real
++ * connection; production code always calls it with the default.
++ */
++export async function getHealth(checkDatabase: () => Promise<void> = checkDatabaseConnection): Promise<HealthCheckResult> {
++  try {
++    await checkDatabase()
++    return { httpStatus: 200, body: { status: 'ok', checks: { db: { status: 'ok' } } } }
++  } catch (error) {
++    return {
++      httpStatus: 503,
++      body: {
++        status: 'error',
++        checks: {
++          db: { status: 'error', message: error instanceof Error ? error.message : String(error) },
++        },
++      },
++    }
++  }
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..42063af 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -3,6 +3,7 @@ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
++import { getHealth } from '../app/Http/HealthCheck.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
+@@ -14,8 +15,14 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. Actually
++  // probes the database on every request (see HealthCheck.ts) and answers
++  // 503 when it's unreachable, so a broken deploy gets drained from the
++  // load-balancer pool instead of staying "ok" while every page 500s.
++  router.get('/health', async (c) => {
++    const { httpStatus, body } = await getHealth()
++    return c.json(body, httpStatus)
++  })
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthCheck.test.ts b/tests/HealthCheck.test.ts
+new file mode 100644
+index 0000000..77a411b
+--- /dev/null
++++ b/tests/HealthCheck.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from 'bun:test'
++import { getHealth } from '../app/Http/HealthCheck.js'
++
++describe('getHealth', () => {
++  it('reports ok with a 200 when the database check succeeds', async () => {
++    const result = await getHealth(async () => {})
++
++    expect(result.httpStatus).toBe(200)
++    expect(result.body.status).toBe('ok')
++    expect(result.body.checks.db.status).toBe('ok')
++  })
++
++  it('reports error with a 503 when the database check throws', async () => {
++    const result = await getHealth(async () => {
++      throw new Error('connection refused')
++    })
++
++    expect(result.httpStatus).toBe(503)
++    expect(result.body.status).toBe('error')
++    expect(result.body.checks.db.status).toBe('error')
++    expect(result.body.checks.db.message).toBe('connection refused')
++  })
++})
+diff --git a/tests/HomeController.test.ts b/tests/HomeController.test.ts
+index a051255..97d09a4 100644
+--- a/tests/HomeController.test.ts
++++ b/tests/HomeController.test.ts
+@@ -15,6 +15,6 @@ describe('app', () => {
+   })
+ 
+   it('answers the health check', async () => {
+-    await http.get('/health').assertOk()
++    await http.get('/health').assertOk().assertJsonPath('status', 'ok').assertJsonPath('checks.db.status', 'ok')
+   })
+ })

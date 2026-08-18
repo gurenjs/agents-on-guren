@@ -1,0 +1,90 @@
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..bf9ed0c 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -1,14 +1,30 @@
+ import type { Router } from '@guren/core'
++import { createRateLimitMiddleware, MemoryRateLimitStore } from '@guren/core'
+ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
+ 
++// Owned store (rather than the middleware's shared default) so tests can
++// reset it directly instead of waiting out the window.
++export const loginRateLimitStore = new MemoryRateLimitStore()
++
++// 5 attempts per minute per client IP, counted whether or not the
++// credentials were valid. No trustProxy: this app isn't behind a reverse
++// proxy in development, and trusting forwarded-for headers would let an
++// attacker spoof a fresh IP on every request to bypass the limit.
++const loginRateLimit = createRateLimitMiddleware({
++  limit: 5,
++  windowMs: 60_000,
++  keyPrefix: 'rl:login:',
++  store: loginRateLimitStore,
++})
++
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    guest.post('/login', [LoginController, 'store'], loginRateLimit).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..e12ba15
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,48 @@
++import { beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { loginRateLimitStore } from '../routes/auth.js'
++
++// Login submissions are throttled to 5 per minute per client (see
++// routes/auth.ts). The store is cleared before each test so ordering
++// against other tests in this file doesn't matter.
++describe('POST /login throttling', () => {
++  let http: TestApp
++
++  beforeEach(async () => {
++    loginRateLimitStore.clear()
++    http = (await TestApp.fromApp(app)).json()
++  })
++
++  it('allows 5 attempts per minute and rejects the 6th with 429 + Retry-After', async () => {
++    const csrf = await http.withCsrf('/login')
++    const credentials = { email: 'nobody@example.com', password: 'wrong-password' }
++
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      const response = await csrf.post('/login', credentials)
++      response.assertHeader('X-RateLimit-Remaining', String(5 - attempt))
++    }
++
++    await csrf
++      .post('/login', credentials)
++      .assertStatus(429)
++      .assertHeader('Retry-After')
++  })
++
++  it('still throttles a submission with the correct password', async () => {
++    const csrf = await http.withCsrf('/login')
++
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      await csrf.post('/login', { email: 'nobody@example.com', password: 'wrong-password' })
++    }
++
++    // A correct login attempt made while throttled is refused just like any other.
++    await csrf.post('/login', { email: 'nobody@example.com', password: 'correct-password' }).assertStatus(429)
++  })
++
++  it('does not throttle GET /login', async () => {
++    for (let i = 0; i < 10; i++) {
++      await http.get('/login').assertOk()
++    }
++  })
++})

@@ -1,0 +1,187 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..4e53158 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -85,6 +85,7 @@ export interface ApiRoutes {
+   'register.store': {
+     method: 'POST'
+     path: '/register'
++    body: { name: string; email: string; password: string; passwordConfirmation: string }
+   }
+ }
+ 
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..12e2639 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -30,6 +30,10 @@ export function isPageId(value: string): value is PageId {
+ }
+ 
+ type PostFormData = ApiRoutes['posts.store']['body']
++
++type RegisterFormData = ApiRoutes['register.store']['body']
++
++type RegisterField = keyof RegisterFormData
+ /**
+  * Auto-extracted Props types from page components.
+  */
+@@ -39,7 +43,7 @@ export interface PagePropsMap {
+   errors?: ValidationErrors<'email' | 'password'>
+ }
+   'auth/Register': {
+-  errors?: ValidationErrors<'name' | 'email' | 'password' | 'passwordConfirmation'>
++  errors?: ValidationErrors<RegisterField>
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
+diff --git a/resources/js/pages/auth/Register.tsx b/resources/js/pages/auth/Register.tsx
+index eda6b24..2a614e0 100644
+--- a/resources/js/pages/auth/Register.tsx
++++ b/resources/js/pages/auth/Register.tsx
+@@ -1,17 +1,18 @@
+ import { Head, Link, useForm } from '@inertiajs/react'
+ import { useId } from 'react'
++import type { ApiRoutes } from '@/.guren/api-client.gen'
++import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ import type { ValidationErrors } from '@guren/core'
+ 
+-interface Props {
+-  errors?: ValidationErrors<'name' | 'email' | 'password' | 'passwordConfirmation'>
+-}
++// The sign-up payload as the server defines it: the schema bound to
++// `register.store` in routes/auth.ts, extracted by `guren codegen`. Field
++// names live on the server side only — misspell one here and typecheck fails.
++type RegisterFormData = ApiRoutes['register.store']['body']
++type RegisterField = keyof RegisterFormData
+ 
+-type RegisterFormData = {
+-  name: string
+-  email: string
+-  password: string
+-  passwordConfirmation: string
++interface Props {
++  errors?: ValidationErrors<RegisterField>
+ }
+ 
+ export default function Register({ errors = {} }: Props) {
+@@ -46,7 +47,7 @@ export default function Register({ errors = {} }: Props) {
+           className="mt-6 space-y-4"
+           onSubmit={(event) => {
+             event.preventDefault()
+-            form.post('/register')
++            form.post(route('register.store'))
+           }}
+         >
+           <div>
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..6b58982 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,6 +3,7 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { RegisterSchema } from '../app/Http/Validators/RegisterValidator.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+@@ -10,7 +11,16 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+     guest.get('/login', [LoginController, 'show']).name('login')
+     guest.post('/login', [LoginController, 'store']).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+-    guest.post('/register', [RegisterController, 'store']).name('register.store')
++    // The sign-up schema is bound to the route so codegen can extract the
++    // field names into `ApiRoutes['register.store']['body']` — the sign-up
++    // page builds its form off that type, so a renamed or misspelled field
++    // fails typecheck instead of surfacing as a runtime validation error.
++    // Body parsing itself stays in the controller (the request stream is read
++    // once), same as posts.store.
++    guest.post('/register', { name: 'register.store', body: RegisterSchema }, [
++      RegisterController,
++      'store',
++    ])
+   })
+ 
+   router.middleware('auth').group((authed) => {
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..9ca33fc
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,75 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// The sign-up payload schema is bound to the `register.store` route so the
++// page can derive its field names from the server (see routes/auth.ts). These
++// tests pin the behaviour that binding must not change.
++describe('register.store', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  it('renders the sign-up page', async () => {
++    await http
++      .withHeaders({ 'X-Inertia': 'true', 'X-Inertia-Version': '1' })
++      .get('/register')
++      .assertOk()
++      .assertInertia('auth/Register')
++  })
++
++  it('creates the account and redirects to the dashboard', async () => {
++    const csrf = await http.json().withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'analytical-engine',
++        passwordConfirmation: 'analytical-engine',
++      })
++      .assertRedirect('/dashboard')
++
++    const created = await User.first({ email: 'ada@example.com' })
++    expect(created?.name).toBe('Ada Lovelace')
++  })
++
++  it('rejects a mismatched confirmation with errors keyed by field', async () => {
++    const csrf = await http.json().withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: 'Ada Lovelace',
++        email: 'ada@example.com',
++        password: 'analytical-engine',
++        passwordConfirmation: 'difference-engine',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.passwordConfirmation.0', 'Passwords do not match.')
++
++    expect(await User.first({ email: 'ada@example.com' })).toBeNull()
++  })
++
++  it('rejects a blank name and a badly formatted email', async () => {
++    const csrf = await http.json().withCsrf()
++
++    await csrf
++      .post('/register', {
++        name: '',
++        email: 'not-an-email',
++        password: 'analytical-engine',
++        passwordConfirmation: 'analytical-engine',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.name.0', 'Name is required.')
++      .assertJsonPath('errors.email.0', 'The email address is badly formatted.')
++  })
++})

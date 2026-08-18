@@ -1,0 +1,151 @@
+diff --git a/app/Http/Middleware/ThrottleLoginMiddleware.ts b/app/Http/Middleware/ThrottleLoginMiddleware.ts
+new file mode 100644
+index 0000000..c79c7b8
+--- /dev/null
++++ b/app/Http/Middleware/ThrottleLoginMiddleware.ts
+@@ -0,0 +1,33 @@
++import { createRateLimitMiddleware, MemoryRateLimitStore } from '@guren/core'
++
++/**
++ * Counters live in this process only — a single-process app has nothing to
++ * share them with, and a restart dropping them is acceptable for a limiter
++ * this short-lived. Swap in RedisRateLimitStore once the app runs on more
++ * than one instance.
++ *
++ * Exported so tests can `clear()` the counters between cases; nothing in the
++ * request path should touch it.
++ */
++export const loginRateLimitStore = new MemoryRateLimitStore()
++
++/**
++ * Throttles login submissions to 5 per minute per client IP.
++ *
++ * Every submission counts, successful ones included: an attacker who guesses
++ * right on the third try must not get a fresh budget for the next account.
++ *
++ * `trustProxy` stays off (the default), so the identity is the address the
++ * connection actually came from — `X-Forwarded-For` and friends are
++ * client-controlled and this app is not behind a proxy. When the address
++ * cannot be resolved at all the framework falls back to one shared bucket
++ * for the route, which fails closed: unidentified clients are throttled
++ * together rather than waved through.
++ */
++export const ThrottleLoginMiddleware = createRateLimitMiddleware({
++  limit: 5,
++  windowMs: 60_000,
++  store: loginRateLimitStore,
++  keyPrefix: 'login:',
++  message: 'Too many login attempts. Please try again later.',
++})
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..b34285f 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,12 +3,14 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { ThrottleLoginMiddleware } from '../app/Http/Middleware/ThrottleLoginMiddleware.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    // Only the submission is throttled — rendering the form stays free.
++    guest.post('/login', [LoginController, 'store'], ThrottleLoginMiddleware).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginThrottle.test.ts b/tests/LoginThrottle.test.ts
+new file mode 100644
+index 0000000..603e5bc
+--- /dev/null
++++ b/tests/LoginThrottle.test.ts
+@@ -0,0 +1,86 @@
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { loginRateLimitStore } from '../app/Http/Middleware/ThrottleLoginMiddleware.js'
++
++const CREDENTIALS = { email: 'nobody@example.com', password: 'wrong-password' }
++const GOOD = { email: 'throttle-fixture@example.com', password: 'correct-horse-battery' }
++
++// The limiter counts submissions, not failures, so these cases never need a
++// user row: a wrong-credentials POST is a submission like any other. Counters
++// live in one process-wide store, so each case starts by clearing it.
++describe('login throttling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await User.delete({ email: GOOD.email })
++    await User.create({ name: 'Throttle Fixture', email: GOOD.email, password: GOOD.password })
++  })
++
++  afterAll(async () => {
++    await User.delete({ email: GOOD.email })
++  })
++
++  beforeEach(() => {
++    loginRateLimitStore.clear()
++  })
++
++  it('refuses the sixth submission in a minute with 429 and a Retry-After', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let attempt = 1; attempt <= 5; attempt += 1) {
++      const allowed = await csrf.post('/login', CREDENTIALS)
++      expect(allowed.status).not.toBe(429)
++    }
++
++    const throttled = await csrf.post('/login', CREDENTIALS)
++    throttled.assertStatus(429)
++    expect(throttled.headers.get('Retry-After')).toBeTruthy()
++  })
++
++  it('still signs a client in on a correct submission within the limit', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let attempt = 1; attempt <= 4; attempt += 1) {
++      await csrf.post('/login', CREDENTIALS)
++    }
++
++    await csrf.post('/login', GOOD).assertRedirect('/dashboard')
++  })
++
++  it('refuses a correct submission once the client is throttled', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let attempt = 1; attempt <= 5; attempt += 1) {
++      await csrf.post('/login', CREDENTIALS)
++    }
++
++    await csrf.post('/login', GOOD).assertStatus(429)
++  })
++
++  it('ignores forwarded-for headers when identifying the client', async () => {
++    const csrf = await http.withCsrf()
++
++    // A spoofed address per request must not buy a fresh budget — the app is
++    // not behind a proxy, so only the connection's own address counts.
++    for (let attempt = 1; attempt <= 5; attempt += 1) {
++      const allowed = await csrf.withHeader('X-Forwarded-For', `203.0.113.${attempt}`).post('/login', CREDENTIALS)
++      expect(allowed.status).not.toBe(429)
++    }
++
++    await csrf.withHeader('X-Forwarded-For', '203.0.113.99').post('/login', CREDENTIALS).assertStatus(429)
++  })
++
++  it('leaves the login form and other pages reachable while throttled', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let attempt = 1; attempt <= 6; attempt += 1) {
++      await csrf.post('/login', CREDENTIALS)
++    }
++
++    await csrf.get('/login').assertOk()
++    await csrf.get('/').assertOk()
++  })
++})

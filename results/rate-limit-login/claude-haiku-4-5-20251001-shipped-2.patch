@@ -1,0 +1,231 @@
+diff --git a/app/Http/Middleware/LoginRateLimiter.ts b/app/Http/Middleware/LoginRateLimiter.ts
+new file mode 100644
+index 0000000..f4b48f2
+--- /dev/null
++++ b/app/Http/Middleware/LoginRateLimiter.ts
+@@ -0,0 +1,70 @@
++const WINDOW_SIZE_MS = 60 * 1000 // 60 seconds
++const MAX_ATTEMPTS = 5
++
++interface AttemptRecord {
++  attempts: number
++  windowStart: number
++}
++
++const attempts = new Map<string, AttemptRecord>()
++
++export function getClientIP(request: Request): string {
++  const rawRequest = request as any
++
++  // Try to get from common socket/connection properties
++  if (rawRequest.socket?.remoteAddress) {
++    return rawRequest.socket.remoteAddress
++  }
++
++  if (rawRequest.connection?.remoteAddress) {
++    return rawRequest.connection.remoteAddress
++  }
++
++  // Try Bun's native request properties
++  if (rawRequest.ip) {
++    return rawRequest.ip
++  }
++
++  // Try Hono's env if available
++  if (rawRequest.env?.incoming?.socket?.remoteAddress) {
++    return rawRequest.env.incoming.socket.remoteAddress
++  }
++
++  // Fallback: treat as unknown shared client
++  // This ensures we still rate limit even if we can't determine the IP
++  return 'unknown'
++}
++
++export function resetLoginRateLimiter(): void {
++  attempts.clear()
++}
++
++export function checkLoginRateLimit(clientIP: string): { allowed: boolean; retryAfterSeconds?: number } {
++  const now = Date.now()
++  const record = attempts.get(clientIP)
++
++  if (!record) {
++    // No previous attempts, start new window
++    attempts.set(clientIP, { attempts: 1, windowStart: now })
++    return { allowed: true }
++  }
++
++  const windowElapsed = now - record.windowStart
++
++  if (windowElapsed >= WINDOW_SIZE_MS) {
++    // Window expired, start a new one
++    attempts.set(clientIP, { attempts: 1, windowStart: now })
++    return { allowed: true }
++  }
++
++  // Still in the same window
++  if (record.attempts >= MAX_ATTEMPTS) {
++    // Already at or over the limit
++    const retryAfterSeconds = Math.ceil((WINDOW_SIZE_MS - windowElapsed) / 1000)
++    return { allowed: false, retryAfterSeconds }
++  }
++
++  // Increment and allow
++  record.attempts++
++  return { allowed: true }
++}
+diff --git a/app/Http/Middleware/throttleLogin.ts b/app/Http/Middleware/throttleLogin.ts
+new file mode 100644
+index 0000000..db67bda
+--- /dev/null
++++ b/app/Http/Middleware/throttleLogin.ts
+@@ -0,0 +1,21 @@
++import { defineMiddleware, HttpException } from '@guren/core'
++import { checkLoginRateLimit, getClientIP } from './LoginRateLimiter.js'
++
++export const throttleLogin = defineMiddleware(async (c, next) => {
++  const clientIP = getClientIP(c.req.raw)
++  const { allowed, retryAfterSeconds } = checkLoginRateLimit(clientIP)
++
++  if (!allowed) {
++    return c.json(
++      { message: 'Too many login attempts. Please try again later.' },
++      {
++        status: 429,
++        headers: {
++          'Retry-After': retryAfterSeconds!.toString(),
++        },
++      }
++    )
++  }
++
++  return next()
++})
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..469b6d8 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,12 +3,13 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { throttleLogin } from '../app/Http/Middleware/throttleLogin.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    guest.post('/login', { middlewares: [throttleLogin] }, [LoginController, 'store']).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/LoginRateLimit.test.ts b/tests/LoginRateLimit.test.ts
+new file mode 100644
+index 0000000..d39f3b9
+--- /dev/null
++++ b/tests/LoginRateLimit.test.ts
+@@ -0,0 +1,103 @@
++import { beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { resetLoginRateLimiter } from '../app/Http/Middleware/LoginRateLimiter.js'
++import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
++import { registerWebRoutes } from '../routes/web.js'
++
++const testEmail = 'test@example.com'
++const testPassword = 'wrongpassword123'
++
++describe('LoginController rate limiting', () => {
++  beforeEach(() => {
++    // Reset rate limiter before each test so they don't interfere
++    resetLoginRateLimiter()
++  })
++
++  it('allows up to 5 login attempts per minute', async () => {
++    const http = await TestApp.create({
++      auth: {},
++      providers: [DatabaseProvider],
++      routes: registerWebRoutes,
++    })
++    const csrf = await http.withCsrf()
++
++    for (let i = 1; i <= 5; i++) {
++      await csrf
++        .post('/login', { email: testEmail, password: testPassword })
++        .assertStatus(422) // Invalid credentials, but allowed
++    }
++  })
++
++  it('returns 429 on the 6th attempt within the same minute', async () => {
++    const http = await TestApp.create({
++      auth: {},
++      providers: [DatabaseProvider],
++      routes: registerWebRoutes,
++    })
++    const csrf = await http.withCsrf()
++
++    // Make 5 attempts
++    for (let i = 1; i <= 5; i++) {
++      await csrf
++        .post('/login', { email: testEmail, password: testPassword })
++        .assertStatus(422)
++    }
++
++    // 6th attempt should be throttled
++    await csrf
++      .post('/login', { email: testEmail, password: testPassword })
++      .assertStatus(429)
++  })
++
++  it('includes Retry-After header on 429 response', async () => {
++    const http = await TestApp.create({
++      auth: {},
++      providers: [DatabaseProvider],
++      routes: registerWebRoutes,
++    })
++    const csrf = await http.withCsrf()
++
++    // Make 5 attempts to hit the limit
++    for (let i = 1; i <= 5; i++) {
++      await csrf
++        .post('/login', { email: testEmail, password: testPassword })
++        .assertStatus(422)
++    }
++
++    // Check the 6th attempt includes Retry-After
++    const response = await csrf
++      .post('/login', { email: testEmail, password: testPassword })
++
++    response.assertStatus(429).assertHeader('Retry-After')
++  })
++
++  it('allows login attempts after rate limit window expires', async () => {
++    const http = await TestApp.create({
++      auth: {},
++      providers: [DatabaseProvider],
++      routes: registerWebRoutes,
++    })
++    const csrf = await http.withCsrf()
++
++    // Fill up the 5 allowed attempts
++    for (let i = 1; i <= 5; i++) {
++      await csrf
++        .post('/login', { email: testEmail, password: testPassword })
++        .assertStatus(422)
++    }
++
++    // 6th should fail
++    await csrf
++      .post('/login', { email: testEmail, password: testPassword })
++      .assertStatus(429)
++
++    // Simulate window expiration by resetting
++    resetLoginRateLimiter()
++
++    // Now we should be able to make attempts again
++    const csrf2 = await http.withCsrf()
++    await csrf2
++      .post('/login', { email: testEmail, password: testPassword })
++      .assertStatus(422) // Back to normal validation error, not rate limit
++  })
++})

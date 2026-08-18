@@ -1,0 +1,293 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..7d51104 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: Array<Data.Post>; meta: Data.PostListMeta }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..69ab846 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -1,6 +1,7 @@
+ // Generated from app/Http/Resources (and modules/*/app/Http/Resources) — DO NOT EDIT
+ // Run `guren codegen` to regenerate.
+ 
++import type { PaginationMeta } from '@guren/core'
+ import type { PostRecord, PostAuthorSummary } from '../app/Models/Post.js'
+ import type { WithRelations } from '@guren/core'
+ 
+@@ -20,4 +21,11 @@ export namespace Data {
+   createdAt: string
+   author?: PostAuthorSummary
+ }
++
++  export type PostListMeta = {
++  currentPage: number
++  lastPage: number
++  perPage: number
++  total: number
++}
+ }
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..3feeca9 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,7 +3,14 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostListMetaResource } from '../Resources/PostListMetaResource.js'
++import {
++  PostIdParamSchema,
++  PostPayloadSchema,
++  PostSearchSchema,
++  ListPostsQuerySchema,
++  PostApiIndexQuerySchema,
++} from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -50,6 +57,33 @@ export default class PostController extends Controller {
+     return this.json({ data: PostResource.collection(posts) })
+   }
+ 
++  // Serves the public `api.posts.index` route: an unauthenticated JSON feed
++  // for partner integrations and the front-end's API client. `page` and
++  // `author` are validated both on the route contract (for codegen/audit)
++  // and here (to get typed, parsed values) — the same double-validation
++  // pattern `search` uses for its body.
++  //
++  // Uses `Model.withPaginate` rather than `QueryBuilder#paginate` (as
++  // `index()` above does): the query-builder's `paginate()` skips eager
++  // loading, so `.with('author')` there silently comes back without the
++  // relation. `withPaginate` loads it after slicing the page.
++  async apiIndex(): Promise<Response> {
++    const { page, author } = this.validateQuery(PostApiIndexQuerySchema)
++
++    const result = await Post.withPaginate('author', {
++      page,
++      perPage: 10,
++      where: author !== undefined ? { authorId: author } : undefined,
++      orderBy: ['id', 'desc'],
++    })
++    const meta = paginate(result).meta()
++
++    return this.json({
++      data: result.data.map((post) => new PostResource(post).toJSON()),
++      meta: new PostListMetaResource(meta).toJSON(),
++    })
++  }
++
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
+diff --git a/app/Http/Resources/PostListMetaResource.ts b/app/Http/Resources/PostListMetaResource.ts
+new file mode 100644
+index 0000000..29dc514
+--- /dev/null
++++ b/app/Http/Resources/PostListMetaResource.ts
+@@ -0,0 +1,20 @@
++import { Resource, type PaginationMeta } from '@guren/core'
++
++export interface PostListMetaResourceData extends Record<string, unknown> {
++  currentPage: number
++  lastPage: number
++  perPage: number
++  total: number
++}
++
++export class PostListMetaResource extends Resource<PaginationMeta> {
++  toArray(): PostListMetaResourceData {
++    const { currentPage, lastPage, perPage, total } = this.resource
++
++    return { currentPage, lastPage, perPage, total }
++  }
++
++  override toJSON(): PostListMetaResourceData {
++    return super.toJSON() as PostListMetaResourceData
++  }
++}
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..73c6141 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -8,6 +8,14 @@ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+ 
++// Contract for `api.posts.index` — declared on the route (not only checked in
++// the controller) so `guren audit`/codegen can see what the endpoint accepts.
++// Query values arrive as strings, hence z.coerce for both fields.
++export const PostApiIndexQuerySchema = z.object({
++  page: z.coerce.number().int().min(1).default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
+ export const PostSearchSchema = z.object({
+   keywords: z
+     .array(z.string().trim().min(1, 'Keywords must not be blank.'))
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..d318c95 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,8 +1,9 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+-import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import { PostPayloadSchema, PostSearchSchema, PostApiIndexQuerySchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
++import { PostListMetaResource } from '../app/Http/Resources/PostListMetaResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
+@@ -19,6 +20,16 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   registerAuthRoutes(router)
+ 
++  // Public JSON feed for partner integrations — no auth, no CSRF. `query`
++  // is declared on the contract (not only checked in the controller) so
++  // `guren audit`/codegen see what the endpoint accepts, and `resource`
++  // types the API client's json() the same way `posts.search` does.
++  router.get('/api/posts', {
++    name: 'api.posts.index',
++    query: PostApiIndexQuerySchema,
++    resource: { data: [PostResource], meta: PostListMetaResource },
++  }, [PostController, 'apiIndex'])
++
+   router.group('/posts', (posts) => {
+     // Registered before '/:id', or "create" is read as a post id.
+     posts.middleware('auth').group((authed) => {
+diff --git a/smoke.ts b/smoke.ts
+new file mode 100644
+index 0000000..de34cb9
+--- /dev/null
++++ b/smoke.ts
+@@ -0,0 +1,15 @@
++import { TestApp } from '@guren/testing'
++import app from './src/app.js'
++
++const http = await TestApp.fromApp(app)
++const res = await http.get('/api/posts')
++console.log(res.status)
++console.log(await res.text())
++
++const res2 = await http.get('/api/posts?author=999999')
++console.log(res2.status)
++console.log(await res2.text())
++
++const res3 = await http.get('/api/posts?page=1&author=abc')
++console.log(res3.status)
++console.log(await res3.text())
+diff --git a/smoke2.ts b/smoke2.ts
+new file mode 100644
+index 0000000..c90de56
+--- /dev/null
++++ b/smoke2.ts
+@@ -0,0 +1,11 @@
++import app from './src/app.js'
++import { Post } from './app/Models/Post.js'
++
++// boot providers by hitting a route first
++import { TestApp } from '@guren/testing'
++await TestApp.fromApp(app)
++
++const result = await Post.newQuery().with('author').orderBy('id', 'desc').paginate({ page: 1, perPage: 10 })
++console.log('keys', Object.keys(result.data[0]))
++console.log('author' in result.data[0], result.data[0].author)
++console.log(JSON.stringify(result.data[0]))
+diff --git a/smoke3.ts b/smoke3.ts
+new file mode 100644
+index 0000000..952c4f7
+--- /dev/null
++++ b/smoke3.ts
+@@ -0,0 +1,8 @@
++import app from './src/app.js'
++import { Post } from './app/Models/Post.js'
++import { TestApp } from '@guren/testing'
++await TestApp.fromApp(app)
++
++const list = await Post.newQuery().with('author').orderBy('id', 'desc').get()
++console.log('get() keys', Object.keys(list[0]))
++console.log(list[0].author)
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..029b77d 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -20,3 +20,33 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// api.posts.index is the public JSON feed for partner integrations. Its
++// `page`/`author` query params are validated by the route contract itself
++// (see PostApiIndexQuerySchema on the route) before the controller — and
++// thus the database — is ever touched, so these 422 cases stay fixture-free
++// like the search tests above. Cover the happy path with real feature tests
++// once your test database is set up.
++describe('api.posts.index', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('rejects a non-positive page', async () => {
++    await http.get('/api/posts?page=0').assertStatus(422)
++  })
++
++  it('rejects a non-numeric page', async () => {
++    await http.get('/api/posts?page=abc').assertStatus(422)
++  })
++
++  it('rejects a non-numeric author', async () => {
++    await http.get('/api/posts?author=abc').assertStatus(422)
++  })
++
++  it('rejects a non-positive author', async () => {
++    await http.get('/api/posts?author=0').assertStatus(422)
++  })
++})

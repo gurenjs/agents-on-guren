@@ -1,0 +1,113 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..28a0aed 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,7 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..91ad003 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,8 @@
+ import { beforeAll, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +22,87 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.destroy', () => {
++  let http: TestApp
++  let author: typeof User.$inferSelect
++  let otherUser: typeof User.$inferSelect
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    const timestamp = Date.now()
++    author = await User.create({
++      name: 'Post Author',
++      email: `author-${timestamp}@test.example.com`,
++      password: 'secret',
++    })
++
++    otherUser = await User.create({
++      name: 'Other User',
++      email: `other-${timestamp}@test.example.com`,
++      password: 'secret',
++    })
++  })
++
++  it('allows the author to delete their own post', async () => {
++    const post = await Post.forceCreate({
++      title: 'Post to Delete',
++      excerpt: 'Test excerpt',
++      body: 'Test body',
++      authorId: author.id,
++    })
++
++    const withCsrf = await http.actingAs(author).withCsrf('/posts')
++    await withCsrf.delete(`/posts/${post.id}`).assertRedirect('/posts')
++
++    // Verify the post was deleted
++    try {
++      await Post.findOrFail(post.id)
++      throw new Error('Post should have been deleted')
++    } catch (err: unknown) {
++      // Expected — post should not exist
++      if (err instanceof Error && !err.message.includes('should have been deleted')) {
++        // This is the expected "not found" error
++      } else {
++        throw err
++      }
++    }
++  })
++
++  it('forbids a different user from deleting a post', async () => {
++    const post = await Post.forceCreate({
++      title: 'Protected Post',
++      excerpt: 'Test excerpt',
++      body: 'Test body',
++      authorId: author.id,
++    })
++
++    const withCsrf = await http.actingAs(otherUser).withCsrf('/posts')
++    await withCsrf.delete(`/posts/${post.id}`).assertForbidden()
++
++    // Verify the post still exists
++    const stillExists = await Post.findOrFail(post.id)
++    if (!stillExists) {
++      throw new Error('Post should still exist after unauthorized delete attempt')
++    }
++  })
++
++  it('forbids unauthenticated users from deleting a post', async () => {
++    const post = await Post.forceCreate({
++      title: 'Unauth Delete Test',
++      excerpt: 'Test excerpt',
++      body: 'Test body',
++      authorId: author.id,
++    })
++
++    const withCsrf = await http.withCsrf('/posts')
++    await withCsrf.delete(`/posts/${post.id}`).assertRedirect('/login')
++
++    // Verify the post still exists
++    const stillExists = await Post.findOrFail(post.id)
++    if (!stillExists) {
++      throw new Error('Post should still exist after unauthenticated delete attempt')
++    }
++  })
++})

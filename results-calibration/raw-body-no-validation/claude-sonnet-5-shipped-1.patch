@@ -1,0 +1,145 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..c8daf72
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,102 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase, resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function actingUser() {
++    const user = await User.create({
++      name: 'Original Name',
++      email: 'original@example.com',
++      password: 'correct-horse',
++    })
++    const csrf = await http.actingAs(user).withCsrf()
++    return { user, csrf }
++  }
++
++  it('rejects a badly formatted email and leaves the account unchanged', async () => {
++    const { user, csrf } = await actingUser()
++
++    await csrf
++      .put('/profile', { name: 'Still Me', email: 'not-an-email' })
++      .assertUnprocessable()
++
++    const stored = await User.findOrFail(user.id)
++    if (stored.email !== 'original@example.com') throw new Error('email should not have changed')
++  })
++
++  it('rejects an empty name and leaves the account unchanged', async () => {
++    const { user, csrf } = await actingUser()
++
++    await csrf
++      .put('/profile', { name: '', email: 'original@example.com' })
++      .assertUnprocessable()
++
++    const stored = await User.findOrFail(user.id)
++    if (stored.name !== 'Original Name') throw new Error('name should not have changed')
++  })
++
++  it('ignores unknown fields like id and passwordHash', async () => {
++    const { user, csrf } = await actingUser()
++    const originalHash = (await User.findOrFail(user.id)).passwordHash
++
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'updated@example.com',
++        id: user.id + 999,
++        passwordHash: 'attacker-controlled',
++      })
++      .assertOk()
++
++    const stored = await User.findOrFail(user.id)
++    if (stored.id !== user.id) throw new Error('id should not have changed')
++    if (stored.passwordHash !== originalHash) throw new Error('passwordHash should not have changed')
++    if (stored.name !== 'Updated Name') throw new Error('name should have been updated')
++    if (stored.email !== 'updated@example.com') throw new Error('email should have been updated')
++  })
++
++  it('applies a valid update, lowercasing the email', async () => {
++    const { user, csrf } = await actingUser()
++
++    await csrf
++      .put('/profile', { name: '  Jane Doe  ', email: 'Jane@Example.com' })
++      .assertOk()
++
++    const stored = await User.findOrFail(user.id)
++    if (stored.name !== 'Jane Doe') throw new Error(`unexpected name: ${stored.name}`)
++    if (stored.email !== 'jane@example.com') throw new Error(`unexpected email: ${stored.email}`)
++  })
++
++  it('keeps the current password when the password field is left blank', async () => {
++    const { user, csrf } = await actingUser()
++    const originalHash = (await User.findOrFail(user.id)).passwordHash
++
++    await csrf
++      .put('/profile', { name: 'Original Name', email: 'original@example.com', password: '' })
++      .assertOk()
++
++    const stored = await User.findOrFail(user.id)
++    if (stored.passwordHash !== originalHash) throw new Error('passwordHash should not have changed')
++  })
++
++  it('rejects a too-short password', async () => {
++    const { csrf } = await actingUser()
++
++    await csrf
++      .put('/profile', { name: 'Original Name', email: 'original@example.com', password: 'short' })
++      .assertUnprocessable()
++  })
++})

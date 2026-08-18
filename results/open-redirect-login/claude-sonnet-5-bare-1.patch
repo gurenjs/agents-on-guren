@@ -1,0 +1,115 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..d118665 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,7 +1,10 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { safeRedirectPath } from '../../Support/safeRedirectPath.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const DEFAULT_REDIRECT = '/dashboard'
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+@@ -20,8 +23,11 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in. Only a
++    // same-app path is trusted here - anything else (an absolute URL,
++    // protocol-relative, backslash tricks) falls back to the default so the
++    // redirect value can't be used to bounce users off to another site.
++    return this.redirect(safeRedirectPath(redirect, DEFAULT_REDIRECT))
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Http/Support/safeRedirectPath.ts b/app/Http/Support/safeRedirectPath.ts
+new file mode 100644
+index 0000000..6cc5fc1
+--- /dev/null
++++ b/app/Http/Support/safeRedirectPath.ts
+@@ -0,0 +1,33 @@
++const TAB_OR_NEWLINE = /[\t\n\r]/g
++
++/**
++ * Resolve a user-supplied redirect value into a same-app path, or fall back
++ * to `fallback` for anything that could send the browser to another origin.
++ *
++ * Browsers strip tabs/newlines and treat backslashes like forward slashes
++ * when parsing a URL, so `/\evil.example` and `/\n/evil.example` behave the
++ * same as `//evil.example`. Normalizing before the same-origin check closes
++ * those bypasses; without it a value that "looks" like a path can still
++ * resolve to a protocol-relative URL once the browser parses it.
++ */
++export function safeRedirectPath(value: string | null | undefined, fallback: string): string {
++  if (!value) return fallback
++
++  const normalized = value
++    .replace(TAB_OR_NEWLINE, '')
++    .trim()
++    .replace(/\\/g, '/')
++
++  if (!normalized.startsWith('/') || normalized.startsWith('//')) {
++    return fallback
++  }
++
++  try {
++    // A same-app path never parses as a standalone absolute URL. If it
++    // does, it smuggled a scheme in and must be rejected.
++    new URL(normalized)
++    return fallback
++  } catch {
++    return value
++  }
++}
+diff --git a/tests/safeRedirectPath.test.ts b/tests/safeRedirectPath.test.ts
+new file mode 100644
+index 0000000..364f88d
+--- /dev/null
++++ b/tests/safeRedirectPath.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, it } from 'bun:test'
++import { safeRedirectPath } from '../app/Http/Support/safeRedirectPath.js'
++
++const FALLBACK = '/dashboard'
++
++describe('safeRedirectPath', () => {
++  it('keeps a same-app path', () => {
++    expect(safeRedirectPath('/posts/3/edit', FALLBACK)).toBe('/posts/3/edit')
++  })
++
++  it('falls back when no redirect value is given', () => {
++    expect(safeRedirectPath('', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath(undefined, FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath(null, FALLBACK)).toBe(FALLBACK)
++  })
++
++  it('rejects an absolute URL to another origin', () => {
++    expect(safeRedirectPath('https://evil.example', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath('http://evil.example/path', FALLBACK)).toBe(FALLBACK)
++  })
++
++  it('rejects a protocol-relative URL', () => {
++    expect(safeRedirectPath('//evil.example', FALLBACK)).toBe(FALLBACK)
++  })
++
++  it('rejects backslash variants that browsers treat as protocol-relative', () => {
++    expect(safeRedirectPath('/\\evil.example', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath('\\\\evil.example', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath('\\/evil.example', FALLBACK)).toBe(FALLBACK)
++  })
++
++  it('rejects a value that hides a protocol-relative URL behind stripped whitespace', () => {
++    expect(safeRedirectPath('/\n/evil.example', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath('/\t/evil.example', FALLBACK)).toBe(FALLBACK)
++  })
++
++  it('rejects values with no leading slash', () => {
++    expect(safeRedirectPath('evil.example', FALLBACK)).toBe(FALLBACK)
++    expect(safeRedirectPath('javascript:alert(1)', FALLBACK)).toBe(FALLBACK)
++  })
++})

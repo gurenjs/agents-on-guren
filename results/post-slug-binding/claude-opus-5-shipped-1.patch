@@ -1,0 +1,746 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..71b443c 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -58,7 +58,7 @@ export interface ApiRoutes {
+   }
+   'posts.show': {
+     method: 'GET'
+-    path: '/posts/:id'
++    path: '/posts/:slug'
+   }
+   'posts.store': {
+     method: 'POST'
+@@ -313,7 +313,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+   'posts.index': { method: 'GET', path: '/posts' },
+   'posts.search': { method: 'QUERY', path: '/posts/search' },
+-  'posts.show': { method: 'GET', path: '/posts/:id' },
++  'posts.show': { method: 'GET', path: '/posts/:slug' },
+   'posts.store': { method: 'POST', path: '/posts' },
+   'posts.update': { method: 'PUT', path: '/posts/:id' },
+   'profile.edit': { method: 'GET', path: '/profile' },
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..357ef35 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -12,6 +12,8 @@ export namespace Data {
+   export type Post = {
+   id: number
+   title: string
++  // The post's address: pages link to `/posts/<slug>`, never to `/posts/<id>`.
++  slug: string
+   excerpt: string
+   body: string
+   authorId: number
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7d9e8aa 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -12,7 +12,7 @@ export const routeManifest = {
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+   'posts.index': { method: 'GET', path: '/posts' },
+   'posts.search': { method: 'QUERY', path: '/posts/search' },
+-  'posts.show': { method: 'GET', path: '/posts/:id' },
++  'posts.show': { method: 'GET', path: '/posts/:slug' },
+   'posts.store': { method: 'POST', path: '/posts' },
+   'posts.update': { method: 'PUT', path: '/posts/:id' },
+   'profile.edit': { method: 'GET', path: '/profile' },
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..7875b27 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,12 +1,14 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, NotFoundHttpException, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, PostSlugParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
++const NUMERIC_SEGMENT = /^[0-9]+$/
++
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+@@ -51,8 +53,22 @@ export default class PostController extends Controller {
+   }
+ 
+   async show(): Promise<Response> {
+-    const { id } = this.validateParams(PostIdParamSchema)
+-    const post = await Post.findWithOrFail(id, 'author')
++    const { slug } = this.validateParams(PostSlugParamSchema)
++
++    // Links published before slugs existed point at `/posts/<id>`. Send them
++    // on with a 301 so search engines transfer the address permanently; an id
++    // that matches nothing falls through and is tried as a slug.
++    if (NUMERIC_SEGMENT.test(slug)) {
++      const legacy = await Post.find(Number(slug))
++      if (legacy) {
++        return this.redirect(`/posts/${legacy.slug}`, { status: 301 })
++      }
++    }
++
++    const post = await Post.newQuery().with('author').where({ slug }).first()
++    if (!post) {
++      throw NotFoundHttpException.forModel('Post', slug)
++    }
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+@@ -68,11 +84,13 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const data = await this.validateBody(PostPayloadSchema)
+-    // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+-    // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const slug = await Post.uniqueSlugFor(data.title)
++    // forceCreate, because `authorId` and `slug` are deliberately absent from
++    // Post.fillable: one comes from the session and the other is derived from
++    // the title, and a request must never be able to set either.
++    const post = await Post.forceCreate({ ...data, slug, authorId: author.id })
+ 
+-    return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
++    return this.redirect(post?.slug ? `/posts/${post.slug}` : '/posts')
+   }
+ 
+   async edit(): Promise<Response> {
+@@ -91,9 +109,11 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const data = await this.validateBody(PostPayloadSchema)
++    // `slug` is not fillable, so a retitled post keeps the address it was
++    // published under — the URL a reader bookmarked never moves.
+     await Post.update({ id: post.id }, data)
+ 
+-    return this.redirect(`/posts/${post.id}`)
++    return this.redirect(`/posts/${post.slug}`)
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index f798f49..39872ea 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -7,6 +7,8 @@ type PostWithAuthor = WithRelations<typeof Post, 'author'>
+ export interface PostResourceData extends Record<string, unknown> {
+   id: number
+   title: string
++  // The post's address: pages link to `/posts/<slug>`, never to `/posts/<id>`.
++  slug: string
+   excerpt: string
+   body: string
+   authorId: number
+@@ -23,6 +25,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor> {
+     return {
+       id: post.id as number,
+       title: post.title as string,
++      slug: post.slug as string,
+       excerpt: post.excerpt as string,
+       body: post.body as string,
+       authorId: post.authorId as number,
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..6d64be8 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -4,6 +4,12 @@ export const PostIdParamSchema = z.object({
+   id: z.coerce.number().int().positive(),
+ })
+ 
++// `/posts/:slug` also answers the legacy `/posts/:id` addresses with a 301, so
++// the segment is accepted as a plain string and told apart in the controller.
++export const PostSlugParamSchema = z.object({
++  slug: z.string().min(1),
++})
++
+ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index 4c4a643..ce49c48 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -1,5 +1,6 @@
+ import { defineModel, type BelongsToRecord } from '@guren/core'
+ import { posts } from '../../db/schema.js'
++import { slugify } from '../Support/slug.js'
+ import type { UserRecord } from './User.js'
+ 
+ export type PostRecord = typeof posts.$inferSelect
+@@ -7,12 +8,38 @@ export type NewPostRecord = typeof posts.$inferInsert
+ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts) {
+-  // `authorId` is set from the signed-in user, never from request input.
++  // `authorId` is set from the signed-in user, and `slug` is derived from the
++  // title at creation — neither may come from request input.
+   static fillable = ['title', 'excerpt', 'body']
+ 
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+   }
++
++  /**
++   * The slug a new post with this title should get: the slugified title, or
++   * `<slug>-2`, `<slug>-3`, … when earlier posts already hold the shorter
++   * forms. Only called on create — an existing post keeps its slug forever,
++   * so its address never breaks.
++   */
++  static async uniqueSlugFor(title: string): Promise<string> {
++    const base = slugify(title)
++    // One query for the whole family: the base and every `base-<n>` variant.
++    // `base` is letters, digits and `-` only, so it carries no LIKE wildcard.
++    const family = await this.newQuery().where('slug', 'like', `${base}%`).get()
++    const taken = new Set(family.map((post) => post.slug as string))
++
++    if (!taken.has(base)) {
++      return base
++    }
++
++    let suffix = 2
++    while (taken.has(`${base}-${suffix}`)) {
++      suffix += 1
++    }
++
++    return `${base}-${suffix}`
++  }
+ }
+ 
+ Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
+diff --git a/app/Support/slug.ts b/app/Support/slug.ts
+new file mode 100644
+index 0000000..37faba5
+--- /dev/null
++++ b/app/Support/slug.ts
+@@ -0,0 +1,24 @@
++const FALLBACK_SLUG = 'post'
++
++// Combining marks left behind by the NFKD decomposition below.
++const COMBINING_MARKS = /[\u0300-\u036f]/g
++
++/**
++ * Turns a title into a URL-safe slug: lowercase ASCII letters and digits,
++ * words joined by a single `-`, no leading or trailing `-`.
++ *
++ * Accented letters fold to their ASCII base (`Café` → `cafe`); anything that
++ * survives neither (emoji, CJK) is dropped, so a title made only of such
++ * characters falls back to `post` and is numbered by the uniqueness pass in
++ * `Post.uniqueSlugFor()`.
++ */
++export function slugify(title: string): string {
++  const slug = title
++    .normalize('NFKD')
++    .replace(COMBINING_MARKS, '')
++    .toLowerCase()
++    .replace(/[^a-z0-9]+/g, '-')
++    .replace(/^-+|-+$/g, '')
++
++  return slug.length > 0 ? slug : FALLBACK_SLUG
++}
+diff --git a/db/migrations/20260818043947_add_post_slug/migration.sql b/db/migrations/20260818043947_add_post_slug/migration.sql
+new file mode 100644
+index 0000000..0762d68
+--- /dev/null
++++ b/db/migrations/20260818043947_add_post_slug/migration.sql
+@@ -0,0 +1,21 @@
++-- Hand-edited after generation: drizzle-kit emits a bare `ADD COLUMN slug
++-- text NOT NULL`, which SQLite rejects on a table that already has rows, and
++-- its table rebuild copies every column except the new one. The rebuild below
++-- backfills existing posts with `post-<id>` — unique and well-formed, so old
++-- rows get a working address without inventing one from their title.
++PRAGMA foreign_keys=OFF;--> statement-breakpoint
++CREATE TABLE `__new_posts` (
++	`id` integer PRIMARY KEY AUTOINCREMENT,
++	`title` text NOT NULL,
++	`slug` text NOT NULL UNIQUE,
++	`excerpt` text NOT NULL,
++	`body` text NOT NULL,
++	`author_id` integer NOT NULL,
++	`created_at` text NOT NULL,
++	CONSTRAINT `fk_posts_author_id_users_id_fk` FOREIGN KEY (`author_id`) REFERENCES `users`(`id`)
++);
++--> statement-breakpoint
++INSERT INTO `__new_posts`(`id`, `title`, `slug`, `excerpt`, `body`, `author_id`, `created_at`) SELECT `id`, `title`, 'post-' || `id`, `excerpt`, `body`, `author_id`, `created_at` FROM `posts`;--> statement-breakpoint
++DROP TABLE `posts`;--> statement-breakpoint
++ALTER TABLE `__new_posts` RENAME TO `posts`;--> statement-breakpoint
++PRAGMA foreign_keys=ON;
+diff --git a/db/migrations/20260818043947_add_post_slug/snapshot.json b/db/migrations/20260818043947_add_post_slug/snapshot.json
+new file mode 100644
+index 0000000..5606da2
+--- /dev/null
++++ b/db/migrations/20260818043947_add_post_slug/snapshot.json
+@@ -0,0 +1,210 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "c809f8ec-2671-423d-a69c-739520e44216",
++  "prevIds": [
++    "064ebde9-8b69-42ff-8515-64f20f1250c8"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "slug",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "slug"
++      ],
++      "nameExplicit": false,
++      "name": "posts_slug_unique",
++      "entityType": "uniques",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..796ab86 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -13,6 +13,9 @@ export const users = sqliteTable('users', {
+ export const posts = sqliteTable('posts', {
+   id: integer('id').primaryKey({ autoIncrement: true }),
+   title: text('title').notNull(),
++  // Derived from the title when the post is created, then frozen: the post
++  // keeps the address it was published under even if the title changes.
++  slug: text('slug').notNull().unique(),
+   excerpt: text('excerpt').notNull(),
+   body: text('body').notNull(),
+   authorId: integer('author_id')
+diff --git a/db/seeders/002_posts.ts b/db/seeders/002_posts.ts
+index 8a2f2cf..1134e04 100644
+--- a/db/seeders/002_posts.ts
++++ b/db/seeders/002_posts.ts
+@@ -1,6 +1,7 @@
+ import { defineSeeder } from '@guren/core'
+ import { eq } from 'drizzle-orm'
+ import type { AppSeederContext } from '../../config/database.js'
++import { slugify } from '../../app/Support/slug.js'
+ import { posts, users } from '../schema.js'
+ import { DEMO_EMAIL } from './001_users.js'
+ 
+@@ -28,5 +29,9 @@ export default defineSeeder(async ({ db }: AppSeederContext) => {
+     return
+   }
+ 
+-  await db.insert(posts).values(SAMPLE_POSTS.map((post) => ({ ...post, authorId: author.id })))
++  // The sample titles are distinct, so slugifying them is already unique —
++  // posts written through the app go through Post.uniqueSlugFor() instead.
++  await db
++    .insert(posts)
++    .values(SAMPLE_POSTS.map((post) => ({ ...post, slug: slugify(post.title), authorId: author.id })))
+ })
+diff --git a/docs/adr/0002-address-posts-by-slug.md b/docs/adr/0002-address-posts-by-slug.md
+new file mode 100644
+index 0000000..0d5085e
+--- /dev/null
++++ b/docs/adr/0002-address-posts-by-slug.md
+@@ -0,0 +1,62 @@
++---
++type: adr
++status: stable
++entities: [Post]
++related:
++  - app/Http/Controllers/PostController.ts
++  - app/Http/Resources/PostResource.ts
++  - app/Models/Post.ts
++  - app/Support/slug.ts
++  - routes/web.ts
++generated: { by: "human:Urata Daiki", at: 2026-08-18T04:42:51.295Z }
++---
++
++# Address posts by slug
++
++## Context
++
++Posts were addressed by their database id (`/posts/42`). Readers and
++search engines get nothing from the number, and links already published
++against those ids must not break.
++
++## Decision
++
++Posts carry a `slug` column: `NOT NULL UNIQUE`, derived from the title at
++creation by `slugify()` in `app/Support/slug.ts` (lowercase ASCII letters
++and digits, words joined by a single `-`). `Post.uniqueSlugFor()` resolves
++collisions by appending the next free number — `hello-world`,
++`hello-world-2`, `hello-world-3`.
++
++The slug is **frozen after creation**: it is absent from `Post.fillable`
++and never recomputed on update, so retitling a post does not move its
++address.
++
++`GET /posts/:slug` serves the post page. The same route also answers the
++legacy id addresses: a purely numeric segment is looked up as an id and,
++when it matches, answered with a **301** to `/posts/<slug>`. Two routes
++cannot do this — `/posts/:id` and `/posts/:slug` are the same pattern, so
++the first registered would swallow every request. A numeric segment that
++matches no id falls through to a slug lookup before 404ing.
++
++Edit, update and delete stay id-based (`/posts/:id/edit`, `PUT /posts/:id`,
++`DELETE /posts/:id`): they are authenticated author-only actions with no
++SEO value, and keeping them on the primary key avoids a second lookup path.
++
++Posts created before this change were backfilled with `post-<id>` by the
++`add_post_slug` migration — unique and well-formed, without inventing a
++title-derived address retroactively.
++
++## Consequences
++
++- Post URLs read as their titles, and `PostResource` exposes `slug`, so
++  every page links through it.
++- Old links keep working permanently, at the cost of one extra lookup for
++  numeric segments.
++- A post whose slug is itself numeric would be shadowed by the legacy id
++  branch. `slugify()` can produce such a slug (title `"2026"`), so this is
++  possible but rare; the id branch wins deliberately, since those are the
++  addresses already published.
++- Slug assignment reads the slug family and then inserts, so two
++  simultaneous creates of the same title can race. The `UNIQUE` constraint
++  is the backstop: the loser's insert fails rather than duplicating an
++  address.
+diff --git a/resources/js/pages/Home.tsx b/resources/js/pages/Home.tsx
+index 353dc86..524c451 100644
+--- a/resources/js/pages/Home.tsx
++++ b/resources/js/pages/Home.tsx
+@@ -37,7 +37,7 @@ export default function Home({ latest }: Props) {
+             <ul className="space-y-4">
+               {latest.map((post) => (
+                 <li key={post.id} className="rounded-lg border border-slate-800 bg-slate-900/40 p-5">
+-                  <Link href={`/posts/${post.id}`} className="text-lg font-medium text-slate-100 transition hover:text-emerald-200">
++                  <Link href={`/posts/${post.slug}`} className="text-lg font-medium text-slate-100 transition hover:text-emerald-200">
+                     {post.title}
+                   </Link>
+                   <p className="mt-2 text-sm text-slate-400">{post.excerpt}</p>
+diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
+index fb3ddf8..50e3986 100644
+--- a/resources/js/pages/posts/Index.tsx
++++ b/resources/js/pages/posts/Index.tsx
+@@ -96,7 +96,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+           {posts.map((post) => (
+             <article key={post.id} className="rounded-lg border border-slate-800 bg-slate-900/40 p-5">
+               <Link
+-                href={route('posts.show', { id: post.id })}
++                href={route('posts.show', { slug: post.slug })}
+                 className="text-lg font-medium text-slate-100 transition hover:text-emerald-200"
+               >
+                 {post.title}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..b21a453 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -30,7 +30,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+     })
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+-    posts.get('/:id', [PostController, 'show']).name('posts.show')
++    // One route for both addresses: a numeric segment is a pre-slug post id,
++    // which `show` answers with a 301 to the post's slug URL. Two separate
++    // routes cannot work — `/posts/:id` and `/posts/:slug` are the same
++    // pattern, so whichever is registered first would swallow every request.
++    posts.get('/:slug', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+     // search criteria in a JSON body. Only fetch-based clients can send it —
+diff --git a/tests/PostSlug.test.ts b/tests/PostSlug.test.ts
+new file mode 100644
+index 0000000..98a916e
+--- /dev/null
++++ b/tests/PostSlug.test.ts
+@@ -0,0 +1,104 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { UserRecord } from '../app/Models/User.js'
++import { slugify } from '../app/Support/slug.js'
++
++async function makeAuthor(): Promise<UserRecord> {
++  const user = await User.create({
++    name: 'Slug Author',
++    email: 'slugs@example.com',
++    password: 'secret',
++  })
++
++  return user as UserRecord
++}
++
++async function makePost(author: UserRecord, title: string) {
++  return Post.forceCreate({
++    title,
++    slug: await Post.uniqueSlugFor(title),
++    excerpt: `${title} — excerpt`,
++    body: `${title} — body`,
++    authorId: author.id,
++  })
++}
++
++describe('slugify', () => {
++  it('lowercases, strips punctuation and joins words with a single dash', () => {
++    expect(slugify('Hello, World!')).toBe('hello-world')
++    expect(slugify('  Guren  &  Bun: 2026 Edition!  ')).toBe('guren-bun-2026-edition')
++  })
++
++  it('folds accents to ASCII and falls back when nothing survives', () => {
++    expect(slugify('Café Déjà Vu')).toBe('cafe-deja-vu')
++    expect(slugify('!!!')).toBe('post')
++  })
++})
++
++describe('post slugs', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  it('numbers duplicate titles from the next free suffix', async () => {
++    const author = await makeAuthor()
++
++    const first = await makePost(author, 'Hello, World!')
++    const second = await makePost(author, 'Hello, World!')
++    const third = await makePost(author, 'Hello, World!')
++
++    expect(first?.slug).toBe('hello-world')
++    expect(second?.slug).toBe('hello-world-2')
++    expect(third?.slug).toBe('hello-world-3')
++  })
++
++  it('serves the post page at its slug and 404s an unknown one', async () => {
++    const author = await makeAuthor()
++    const post = await makePost(author, 'Readable URLs')
++
++    await http.get(`/posts/${post?.slug}`).assertOk()
++    await http.get('/posts/no-such-post').assertNotFound()
++  })
++
++  it('permanently redirects the legacy id address, and 404s an unknown id', async () => {
++    const author = await makeAuthor()
++    const post = await makePost(author, 'Readable URLs')
++
++    await http.get(`/posts/${post?.id}`).assertStatus(301).assertHeader('location', '/posts/readable-urls')
++    await http.get('/posts/99999').assertNotFound()
++  })
++
++  it('keeps the slug when the title changes', async () => {
++    const author = await makeAuthor()
++    const post = await makePost(author, 'Original Title')
++
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .put(`/posts/${post?.id}`, { title: 'A Brand New Title', excerpt: 'Still here.', body: 'Still here.' })
++      .assertRedirect('/posts/original-title')
++
++    await http.get('/posts/a-brand-new-title').assertNotFound()
++    const reloaded = await Post.findOrFail(post?.id as number)
++    expect(reloaded.slug).toBe('original-title')
++    expect(reloaded.title).toBe('A Brand New Title')
++  })
++
++  it('sends the author to the slug URL after creating a post', async () => {
++    const author = await makeAuthor()
++
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .post('/posts', { title: 'Hello, World!', excerpt: 'First one.', body: 'Body text.' })
++      .assertRedirect('/posts/hello-world')
++  })
++})

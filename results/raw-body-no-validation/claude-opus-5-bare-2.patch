@@ -1,0 +1,132 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..9e54d20
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,89 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// PUT /profile validates its body with ProfileUpdateSchema and mass-assigns
++// through User.update(), so only the fillable `name`, `email` and `password`
++// can ever reach the row — see app/Http/Controllers/ProfileController.ts.
++describe('profile.update', () => {
++  let http: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  // The test database file is reused across runs, so clear every address this
++  // suite writes — a leftover `renamed@…` row would trip the uniqueness check.
++  beforeEach(async () => {
++    for (const email of ['profile-owner@example.com', 'renamed@example.com']) {
++      for (const record of await User.where({ email })) {
++        await User.delete({ id: record.id })
++      }
++    }
++
++    user = await User.create({
++      name: 'Original Name',
++      email: 'profile-owner@example.com',
++      password: 'original-password',
++    }) as UserRecord
++  })
++
++  const authed = async () => (await TestApp.fromApp(app)).actingAs(user).withCsrf('/profile')
++
++  it('saves a valid update', async () => {
++    const client = await authed()
++    await client.put('/profile', { name: 'Renamed', email: 'Renamed@Example.com' }).assertOk()
++
++    const refreshed = await User.find(user.id)
++    expect(refreshed?.name).toBe('Renamed')
++    expect(refreshed?.email).toBe('renamed@example.com')
++  })
++
++  it('rejects a badly formatted email and leaves the account untouched', async () => {
++    const client = await authed()
++    await client.put('/profile', { name: 'Renamed', email: 'not-an-email' }).assertUnprocessable()
++
++    const refreshed = await User.find(user.id)
++    expect(refreshed?.name).toBe('Original Name')
++    expect(refreshed?.email).toBe('profile-owner@example.com')
++  })
++
++  it('rejects an empty name', async () => {
++    const client = await authed()
++    await client.put('/profile', { name: '   ', email: 'profile-owner@example.com' }).assertUnprocessable()
++
++    const refreshed = await User.find(user.id)
++    expect(refreshed?.name).toBe('Original Name')
++  })
++
++  it('rejects a too-short password', async () => {
++    const client = await authed()
++    await client
++      .put('/profile', { name: 'Renamed', email: 'profile-owner@example.com', password: 'short' })
++      .assertUnprocessable()
++
++    const refreshed = await User.find(user.id)
++    expect(refreshed?.name).toBe('Original Name')
++  })
++
++  it('ignores fields the profile form does not have', async () => {
++    const client = await authed()
++    await client
++      .put('/profile', {
++        name: 'Renamed',
++        email: 'profile-owner@example.com',
++        id: user.id + 9000,
++        passwordHash: 'injected-hash',
++      })
++      .assertOk()
++
++    const refreshed = await User.find(user.id)
++    expect(refreshed?.id).toBe(user.id)
++    expect(refreshed?.name).toBe('Renamed')
++    expect((refreshed as unknown as { passwordHash: string } | null)?.passwordHash).not.toBe('injected-hash')
++  })
++})

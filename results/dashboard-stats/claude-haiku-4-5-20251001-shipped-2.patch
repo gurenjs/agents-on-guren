@@ -1,0 +1,278 @@
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..eb03d42 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -43,6 +43,8 @@ export interface PagePropsMap {
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
++  postCount?: number
++  recentPosts?: Array<{ id: number; title: string }>
+ }
+   'Home': {
+   latest: PostResourceData[]
+diff --git a/app/Http/Controllers/DashboardController.ts b/app/Http/Controllers/DashboardController.ts
+index dcaddfc..b4cf53f 100644
+--- a/app/Http/Controllers/DashboardController.ts
++++ b/app/Http/Controllers/DashboardController.ts
+@@ -1,5 +1,6 @@
+ import { Controller } from '@guren/core'
+ import type { UserRecord } from '../../Models/User.js'
++import { Post } from '../../Models/Post.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class DashboardController extends Controller {
+@@ -12,6 +13,23 @@ export default class DashboardController extends Controller {
+           email: currentUser.email,
+         }
+       : null
+-    return this.inertia(pages.dashboard.Index, { user }, { title: 'Dashboard' })
++
++    let postCount = 0
++    let recentPosts: Array<{ id: number; title: string }> = []
++
++    if (currentUser) {
++      postCount = await Post.where('authorId', currentUser.id).count()
++      const posts = await Post.where('authorId', currentUser.id)
++        .orderBy('createdAt', 'desc')
++        .limit(5)
++        .get()
++      recentPosts = posts.map((post) => ({ id: post.id, title: post.title }))
++    }
++
++    return this.inertia(
++      pages.dashboard.Index,
++      { user, postCount, recentPosts },
++      { title: 'Dashboard' }
++    )
+   }
+ }
+diff --git a/resources/js/pages/dashboard/Index.tsx b/resources/js/pages/dashboard/Index.tsx
+index 8c5748b..0b6840e 100644
+--- a/resources/js/pages/dashboard/Index.tsx
++++ b/resources/js/pages/dashboard/Index.tsx
+@@ -1,10 +1,13 @@
++import { Link } from '@inertiajs/react'
+ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   user?: { id: number; name: string; email: string } | null
++  postCount?: number
++  recentPosts?: Array<{ id: number; title: string }>
+ }
+ 
+-export default function Dashboard({ user }: Props) {
++export default function Dashboard({ user, postCount = 0, recentPosts = [] }: Props) {
+   return (
+     <Layout>
+       <section className="space-y-6">
+@@ -14,10 +17,43 @@ export default function Dashboard({ user }: Props) {
+         </header>
+ 
+         {user ? (
+-          <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6 shadow-lg shadow-emerald-500/10">
+-            <h2 className="text-xl font-medium text-slate-100">Signed in as {user.name}</h2>
+-            <p className="mt-2 text-sm text-slate-300">Email: {user.email}</p>
+-          </div>
++          <>
++            <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6 shadow-lg shadow-emerald-500/10">
++              <h2 className="text-xl font-medium text-slate-100">Signed in as {user.name}</h2>
++              <p className="mt-2 text-sm text-slate-300">Email: {user.email}</p>
++            </div>
++
++            <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6 shadow-lg shadow-emerald-500/10">
++              <h2 className="text-xl font-medium text-slate-100">
++                You have {postCount} {postCount === 1 ? 'post' : 'posts'}
++              </h2>
++
++              {postCount === 0 ? (
++                <div className="mt-4">
++                  <p className="text-sm text-slate-300">You haven't written any posts yet.</p>
++                  <Link
++                    href="/posts/create"
++                    className="mt-3 inline-block rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
++                  >
++                    Create your first post
++                  </Link>
++                </div>
++              ) : (
++                <div className="mt-4">
++                  <h3 className="text-lg font-medium text-slate-100">Recent posts</h3>
++                  <ul className="mt-3 space-y-2">
++                    {recentPosts.map((post) => (
++                      <li key={post.id}>
++                        <Link href={`/posts/${post.id}`} className="text-emerald-400 hover:text-emerald-300">
++                          {post.title}
++                        </Link>
++                      </li>
++                    ))}
++                  </ul>
++                </div>
++              )}
++            </div>
++          </>
+         ) : (
+           <div className="rounded border border-rose-500/60 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+             You are not signed in.
+diff --git a/tests/DashboardController.test.ts b/tests/DashboardController.test.ts
+new file mode 100644
+index 0000000..7e756fa
+--- /dev/null
++++ b/tests/DashboardController.test.ts
+@@ -0,0 +1,156 @@
++import { beforeAll, beforeEach, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
++
++function extractInertiaProps(html: string): any {
++  const match = html.match(/window\.__INERTIA_PAGE__\s*=\s*({.*?});</s)
++  if (!match) {
++    throw new Error('Could not extract Inertia props from HTML')
++  }
++  const pageData = JSON.parse(match[1])
++  return pageData.props
++}
++
++describe('DashboardController', () => {
++  let http: TestApp
++  let testUser: any
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    // Create a test user
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    // Create another user for isolation test
++    const otherUser = await User.create({
++      name: 'Other User',
++      email: 'other@example.com',
++      password: 'password123',
++    })
++
++    // Create some posts for test user (use forceCreate for authorId)
++    await Post.forceCreate({
++      title: 'First Post',
++      excerpt: 'First excerpt',
++      body: 'First body',
++      authorId: testUser.id,
++    })
++    await Post.forceCreate({
++      title: 'Second Post',
++      excerpt: 'Second excerpt',
++      body: 'Second body',
++      authorId: testUser.id,
++    })
++    await Post.forceCreate({
++      title: 'Third Post',
++      excerpt: 'Third excerpt',
++      body: 'Third body',
++      authorId: testUser.id,
++    })
++
++    // Create a post for the other user
++    await Post.forceCreate({
++      title: 'Other User Post',
++      excerpt: 'Other excerpt',
++      body: 'Other body',
++      authorId: otherUser.id,
++    })
++  })
++
++  it('shows post count for authenticated user', async () => {
++    const response = await http.actingAs(testUser).get('/dashboard')
++    response.assertOk()
++
++    const body = await response.text()
++    const props = extractInertiaProps(body)
++
++    expect(props.postCount).toBe(3)
++    expect(props.recentPosts).toHaveLength(3)
++    expect(props.user.id).toBe(testUser.id)
++  })
++
++  it('includes recent posts in the correct order', async () => {
++    const response = await http.actingAs(testUser).get('/dashboard')
++    response.assertOk()
++
++    const body = await response.text()
++    const props = extractInertiaProps(body)
++
++    // The recentPosts should be ordered newest first by createdAt
++    expect(props.recentPosts.length).toBe(3)
++    // All posts should be present
++    const titles = props.recentPosts.map((p: any) => p.title)
++    expect(titles).toContain('First Post')
++    expect(titles).toContain('Second Post')
++    expect(titles).toContain('Third Post')
++  })
++
++  it('only shows posts by the current user', async () => {
++    const response = await http.actingAs(testUser).get('/dashboard')
++    response.assertOk()
++
++    const body = await response.text()
++    const props = extractInertiaProps(body)
++
++    const titles = props.recentPosts.map((p: any) => p.title)
++    expect(titles).toContain('First Post')
++    expect(titles).toContain('Second Post')
++    expect(titles).toContain('Third Post')
++    // Verify other user's post is not included
++    expect(titles).not.toContain('Other User Post')
++  })
++
++  it('shows empty state for user with no posts', async () => {
++    const emptyUser = await User.create({
++      name: 'Empty User',
++      email: 'empty@example.com',
++      password: 'password123',
++    })
++
++    const response = await http.actingAs(emptyUser).get('/dashboard')
++    response.assertOk()
++
++    const body = await response.text()
++    const props = extractInertiaProps(body)
++
++    expect(props.postCount).toBe(0)
++    expect(props.recentPosts).toHaveLength(0)
++  })
++
++  it('limits recent posts to 5', async () => {
++    // Create 3 more posts for a total of 6
++    for (let i = 4; i <= 6; i++) {
++      await Post.forceCreate({
++        title: `Post ${i}`,
++        excerpt: `Excerpt ${i}`,
++        body: `Body ${i}`,
++        authorId: testUser.id,
++      })
++    }
++
++    const response = await http.actingAs(testUser).get('/dashboard')
++    response.assertOk()
++
++    const body = await response.text()
++    const props = extractInertiaProps(body)
++
++    expect(props.postCount).toBe(6)
++    // Only 5 posts should be in the recent posts list
++    expect(props.recentPosts).toHaveLength(5)
++  })
++
++  it('redirects unauthenticated user to login', async () => {
++    await http.get('/dashboard').assertRedirect('/login')
++  })
++})

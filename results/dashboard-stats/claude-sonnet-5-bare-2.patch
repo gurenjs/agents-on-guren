@@ -1,0 +1,192 @@
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..845dcef 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -43,6 +43,8 @@ export interface PagePropsMap {
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+   'Home': {
+   latest: PostResourceData[]
+diff --git a/app/Http/Controllers/DashboardController.ts b/app/Http/Controllers/DashboardController.ts
+index dcaddfc..3bd3ad8 100644
+--- a/app/Http/Controllers/DashboardController.ts
++++ b/app/Http/Controllers/DashboardController.ts
+@@ -1,5 +1,6 @@
+ import { Controller } from '@guren/core'
+ import type { UserRecord } from '../../Models/User.js'
++import { Post } from '../../Models/Post.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class DashboardController extends Controller {
+@@ -12,6 +13,27 @@ export default class DashboardController extends Controller {
+           email: currentUser.email,
+         }
+       : null
+-    return this.inertia(pages.dashboard.Index, { user }, { title: 'Dashboard' })
++
++    const [postCount, recentPosts] = currentUser
++      ? await Promise.all([
++          Post.newQuery().where('authorId', currentUser.id).count(),
++          Post.newQuery()
++            .where('authorId', currentUser.id)
++            .orderBy('createdAt', 'desc')
++            .orderBy('id', 'desc')
++            .limit(5)
++            .get(),
++        ])
++      : [0, []]
++
++    return this.inertia(
++      pages.dashboard.Index,
++      {
++        user,
++        postCount,
++        recentPosts: recentPosts.map((post) => ({ id: post.id, title: post.title })),
++      },
++      { title: 'Dashboard' },
++    )
+   }
+ }
+diff --git a/resources/js/pages/dashboard/Index.tsx b/resources/js/pages/dashboard/Index.tsx
+index 8c5748b..fb3405c 100644
+--- a/resources/js/pages/dashboard/Index.tsx
++++ b/resources/js/pages/dashboard/Index.tsx
+@@ -1,10 +1,14 @@
++import { Link } from '@inertiajs/react'
++import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+ 
+-export default function Dashboard({ user }: Props) {
++export default function Dashboard({ user, postCount, recentPosts }: Props) {
+   return (
+     <Layout>
+       <section className="space-y-6">
+@@ -23,6 +27,38 @@ export default function Dashboard({ user }: Props) {
+             You are not signed in.
+           </div>
+         )}
++
++        <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6 shadow-lg shadow-emerald-500/10">
++          <h2 className="text-xl font-medium text-slate-100">
++            You have {postCount} {postCount === 1 ? 'post' : 'posts'}
++          </h2>
++
++          <div className="mt-4">
++            <h3 className="text-sm font-medium uppercase tracking-wide text-slate-400">Recent posts</h3>
++            {recentPosts.length > 0 ? (
++              <ul className="mt-2 space-y-2">
++                {recentPosts.map((post) => (
++                  <li key={post.id}>
++                    <Link
++                      href={route('posts.show', { id: post.id })}
++                      className="text-emerald-300 transition hover:text-emerald-200 hover:underline"
++                    >
++                      {post.title}
++                    </Link>
++                  </li>
++                ))}
++              </ul>
++            ) : (
++              <p className="mt-2 text-sm text-slate-300">
++                You haven't written any posts yet.{' '}
++                <Link href={route('posts.create')} className="text-emerald-300 transition hover:text-emerald-200 hover:underline">
++                  Write your first post
++                </Link>
++                .
++              </p>
++            )}
++          </div>
++        </div>
+       </section>
+     </Layout>
+   )
+diff --git a/tests/DashboardController.test.ts b/tests/DashboardController.test.ts
+new file mode 100644
+index 0000000..4ff0677
+--- /dev/null
++++ b/tests/DashboardController.test.ts
+@@ -0,0 +1,74 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp, readInertiaResponse } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
++
++describe('dashboard', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('redirects a guest to login', async () => {
++    await http.get('/dashboard').assertRedirect('/login')
++  })
++
++  it('shows the signed-in user post count and recent posts, newest first, capped at 5', async () => {
++    const owner = await User.create({ name: 'Dashboard Owner', email: `owner-${Date.now()}@example.com`, password: 'password123' })
++    const other = await User.create({ name: 'Someone Else', email: `other-${Date.now()}@example.com`, password: 'password123' })
++
++    // Six posts by the owner, in creation order — the newest five should show up, newest first.
++    const ownerPosts = []
++    for (let i = 0; i < 6; i++) {
++      ownerPosts.push(
++        await Post.forceCreate({
++          title: `Owner Post ${i}`,
++          excerpt: 'excerpt',
++          body: 'body',
++          authorId: owner.id,
++        }),
++      )
++    }
++
++    // A post by another user must never show up on the owner's dashboard.
++    await Post.forceCreate({ title: 'Not Mine', excerpt: 'excerpt', body: 'body', authorId: other.id })
++
++    const response = await http.actingAs(owner).get('/dashboard')
++    const { payload } = await readInertiaResponse(response.raw)
++
++    const props = payload.props as { postCount: number; recentPosts: Array<{ id: number; title: string }> }
++
++    if (props.postCount !== 6) {
++      throw new Error(`expected postCount to be 6, got ${props.postCount}`)
++    }
++    if (props.recentPosts.length !== 5) {
++      throw new Error(`expected 5 recent posts, got ${props.recentPosts.length}`)
++    }
++
++    const expectedTitles = [ownerPosts[5], ownerPosts[4], ownerPosts[3], ownerPosts[2], ownerPosts[1]].map((post) => post.title)
++    const actualTitles = props.recentPosts.map((post) => post.title)
++    if (JSON.stringify(actualTitles) !== JSON.stringify(expectedTitles)) {
++      throw new Error(`expected recent posts ${JSON.stringify(expectedTitles)}, got ${JSON.stringify(actualTitles)}`)
++    }
++    if (actualTitles.includes('Not Mine')) {
++      throw new Error('recent posts leaked another user\'s post')
++    }
++  })
++
++  it('shows a zero count and empty list for a user with no posts', async () => {
++    const user = await User.create({ name: 'No Posts', email: `noposts-${Date.now()}@example.com`, password: 'password123' })
++
++    const response = await http.actingAs(user).get('/dashboard')
++    const { payload } = await readInertiaResponse(response.raw)
++    const props = payload.props as { postCount: number; recentPosts: Array<{ id: number; title: string }> }
++
++    if (props.postCount !== 0) {
++      throw new Error(`expected postCount to be 0, got ${props.postCount}`)
++    }
++    if (props.recentPosts.length !== 0) {
++      throw new Error(`expected 0 recent posts, got ${props.recentPosts.length}`)
++    }
++  })
++})

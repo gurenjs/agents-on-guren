@@ -1,0 +1,108 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..e79e21a 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -40,8 +40,8 @@ export default class PostController extends Controller {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
++      .where('published', true)
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..8191331 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,14 +1,15 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post, type PostRecord } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import { DEMO_EMAIL } from '../db/seeders/001_users.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+ // to the route feeds codegen and `guren audit`, while body parsing stays in
+ // the controller so the request stream is read once — so an invalid payload
+-// gets a 422 without the database ever being touched. That keeps this starter
+-// test green without migrations or fixtures; cover the happy path with real
+-// feature tests once your test database is set up.
++// gets a 422 without the database ever being touched.
+ describe('posts.search', () => {
+   let http: TestApp
+ 
+@@ -19,4 +20,69 @@ describe('posts.search', () => {
+   it('rejects a search without keywords', async () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
++
++  describe('published-only filtering', () => {
++    let published: PostRecord
++    let unpublished: PostRecord
++    let decoy: PostRecord
++
++    beforeAll(async () => {
++      const author = await User.newQuery().where('email', DEMO_EMAIL).firstOrFail()
++
++      published = await Post.forceCreate({
++        title: 'zephyrquill marmalade launch notes',
++        excerpt: 'A published post about zephyrquill.',
++        body: 'body',
++        authorId: author.id,
++        published: true,
++      })
++      unpublished = await Post.forceCreate({
++        title: 'zephyrquill marmalade draft',
++        excerpt: 'An unpublished post about zephyrquill.',
++        body: 'body',
++        authorId: author.id,
++        published: false,
++      })
++      decoy = await Post.forceCreate({
++        title: 'completely unrelated post',
++        excerpt: 'Shares no keyword with the search.',
++        body: 'body',
++        authorId: author.id,
++        published: true,
++      })
++    })
++
++    afterAll(async () => {
++      await Post.delete({ id: published.id })
++      await Post.delete({ id: unpublished.id })
++      await Post.delete({ id: decoy.id })
++    })
++
++    it('excludes unpublished posts from single-keyword results', async () => {
++      const res = await http.query('/posts/search', { keywords: ['zephyrquill'] }).assertOk()
++      const { data } = (await res.json()) as { data: PostRecord[] }
++      const ids = data.map((post) => post.id)
++
++      expect(ids).toContain(published.id)
++      expect(ids).not.toContain(unpublished.id)
++      expect(ids).not.toContain(decoy.id)
++    })
++
++    it('excludes unpublished posts from multi-keyword results', async () => {
++      const res = await http.query('/posts/search', { keywords: ['zephyrquill', 'marmalade'] }).assertOk()
++      const { data } = (await res.json()) as { data: PostRecord[] }
++      const ids = data.map((post) => post.id)
++
++      expect(ids).toContain(published.id)
++      expect(ids).not.toContain(unpublished.id)
++      expect(ids).not.toContain(decoy.id)
++    })
++
++    it('returns nothing for a keyword that only appears in an unpublished post', async () => {
++      const res = await http.query('/posts/search', { keywords: ['draft'] }).assertOk()
++      const { data } = (await res.json()) as { data: PostRecord[] }
++
++      expect(data).toHaveLength(0)
++    })
++  })
+ })

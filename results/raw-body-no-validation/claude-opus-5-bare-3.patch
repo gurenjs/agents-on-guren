@@ -1,0 +1,110 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..6229412
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,67 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// profile.update validates its body with ProfileUpdateSchema before touching
++// the account, so a badly formatted email is a 422 and the stored row is
++// untouched — and fields outside the schema (id, passwordHash) never reach
++// the update at all.
++describe('profile.update', () => {
++  let http: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    // Booting the app configures the ORM the model calls below go through.
++    const client = await TestApp.fromApp(app)
++
++    // The test database persists between runs, and these tests rename the
++    // account they own — clear both spellings so a rerun starts clean.
++    await User.delete({ email: 'profile-tester@example.com' })
++    await User.delete({ email: 'renamed-tester@example.com' })
++
++    user = (await User.create({
++      name: 'Profile Tester',
++      email: 'profile-tester@example.com',
++      password: 'secret-password',
++    })) as UserRecord
++
++    http = await client.actingAs(user).withCsrf('/profile')
++  })
++
++  it('rejects a badly formatted email and leaves the account alone', async () => {
++    await http.put('/profile', { name: 'Renamed', email: 'not-an-email' }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    expect(stored?.email).toBe('profile-tester@example.com')
++    expect(stored?.name).toBe('Profile Tester')
++  })
++
++  it('rejects an empty name', async () => {
++    await http.put('/profile', { name: '   ', email: 'profile-tester@example.com' }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Profile Tester')
++  })
++
++  it('ignores fields the profile form does not have', async () => {
++    const originalHash = (await User.find(user.id))?.passwordHash
++
++    await http
++      .put('/profile', {
++        name: 'Renamed Tester',
++        email: 'Renamed-Tester@Example.com',
++        id: user.id + 1000,
++        passwordHash: 'overwritten',
++      })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Renamed Tester')
++    // Stored lowercased, as the registration form does.
++    expect(stored?.email).toBe('renamed-tester@example.com')
++    expect(stored?.passwordHash).toBe(originalHash)
++  })
++})

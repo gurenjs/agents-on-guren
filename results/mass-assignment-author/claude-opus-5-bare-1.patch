@@ -1,0 +1,119 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..cdb98d6 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,10 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    // Validated input only, and a plain `update` so Post.fillable applies:
++    // `authorId` is outside the allowlist, so no request can reassign a post.
++    const data = await this.validateBody(PostPayloadSchema)
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostUpdate.test.ts b/tests/PostUpdate.test.ts
+new file mode 100644
+index 0000000..9891d67
+--- /dev/null
++++ b/tests/PostUpdate.test.ts
+@@ -0,0 +1,97 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// posts.update writes to the database, so this file migrates the test database
++// (./data/guren.test.db — see config/database.ts) and creates its own author,
++// bystander and post. It covers the rule the edit endpoint exists to keep:
++// ownership comes from the post, never from the request body.
++describe('posts.update', () => {
++  let http: TestApp
++  let author: { id: number }
++  let bystander: { id: number }
++
++  async function makePost(): Promise<{ id: number }> {
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author.id,
++    })
++
++    return post as { id: number }
++  }
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++
++    const stamp = `${process.pid}-${performance.now()}`
++    author = await User.create({ name: 'Author', email: `author-${stamp}@example.com`, password: 'secret123' })
++    bystander = await User.create({ name: 'Bystander', email: `bystander-${stamp}@example.com`, password: 'secret123' })
++  })
++
++  it('ignores an authorId in the request body', async () => {
++    const post = await makePost()
++    const client = await (await TestApp.fromApp(app)).actingAs(author).withCsrf()
++
++    await client
++      .put(`/posts/${post.id}`, {
++        title: 'Renamed',
++        excerpt: 'Still mine?',
++        body: 'Body stays.',
++        authorId: bystander.id,
++      })
++      .assertRedirect()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.authorId).toBe(author.id)
++    expect(updated.title).toBe('Renamed')
++  })
++
++  it('does not write fields outside the edit form', async () => {
++    const post = await makePost()
++    const original = await Post.findOrFail(post.id)
++    const client = await (await TestApp.fromApp(app)).actingAs(author).withCsrf()
++
++    await client
++      .put(`/posts/${post.id}`, {
++        title: 'Renamed again',
++        excerpt: 'Fresh excerpt',
++        body: 'Fresh body.',
++        createdAt: '1999-01-01T00:00:00.000Z',
++      })
++      .assertRedirect()
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.createdAt).toBe(original.createdAt)
++  })
++
++  it('rejects an invalid edit with 422 and leaves the post untouched', async () => {
++    const post = await makePost()
++    const client = await (await TestApp.fromApp(app)).actingAs(author).withCsrf()
++
++    await client
++      .put(`/posts/${post.id}`, { title: '', excerpt: 'Excerpt', body: 'Body.' })
++      .assertStatus(422)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe('Original title')
++  })
++
++  it('refuses an edit by a user who is not the author', async () => {
++    const post = await makePost()
++    const client = await (await TestApp.fromApp(app)).actingAs(bystander).withCsrf()
++
++    await client
++      .put(`/posts/${post.id}`, { title: 'Taken over', excerpt: 'Excerpt', body: 'Body.' })
++      .assertStatus(403)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe('Original title')
++    expect(updated.authorId).toBe(author.id)
++  })
++})

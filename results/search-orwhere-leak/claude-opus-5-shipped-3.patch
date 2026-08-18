@@ -1,0 +1,120 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..866c399 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -35,13 +35,16 @@ export default class PostController extends Controller {
+ 
+     const posts = await Post.newQuery()
+       .with('author')
++      // The keyword matches are OR'd inside a callback group so the
++      // `published` filter below stays an AND — inlining it would OR it away
++      // and leak unpublished posts (plus every published post) into results.
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
++      .where('published', true)
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..2be9219 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,14 +1,16 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, beforeEach, describe, it, expect } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+ // to the route feeds codegen and `guren audit`, while body parsing stays in
+ // the controller so the request stream is read once — so an invalid payload
+-// gets a 422 without the database ever being touched. That keeps this starter
+-// test green without migrations or fixtures; cover the happy path with real
+-// feature tests once your test database is set up.
++// gets a 422 without the database ever being touched.
+ describe('posts.search', () => {
+   let http: TestApp
+ 
+@@ -20,3 +22,72 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.search results', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    const author = await User.create({ name: 'Editor', email: 'editor@example.com', password: 'secret' })
++    const authorId = author?.id as number
++
++    await Post.forceCreate({
++      title: 'A zephyrquill draft',
++      excerpt: 'Not ready for readers yet.',
++      body: 'Unpublished body.',
++      authorId,
++      published: false,
++    })
++    await Post.forceCreate({
++      title: 'The zephyrquill chronicles',
++      excerpt: 'Published and searchable.',
++      body: 'Published body.',
++      authorId,
++      published: true,
++    })
++    await Post.forceCreate({
++      title: 'Marmalade mornings',
++      excerpt: 'Also published, different word.',
++      body: 'Another published body.',
++      authorId,
++      published: true,
++    })
++    await Post.forceCreate({
++      title: 'Something else entirely',
++      excerpt: 'No keyword in here at all.',
++      body: 'Filler.',
++      authorId,
++      published: true,
++    })
++  })
++
++  async function search(keywords: string[]): Promise<string[]> {
++    const response = await http.query('/posts/search', { keywords })
++    response.assertOk()
++    const payload = await response.json<{ data: PostResourceData[] }>()
++    return payload.data.map((post) => post.title)
++  }
++
++  it('returns only published posts matching the keyword', async () => {
++    expect(await search(['zephyrquill'])).toEqual(['The zephyrquill chronicles'])
++  })
++
++  it('keeps unpublished posts out when several keywords are given', async () => {
++    const titles = await search(['zephyrquill', 'marmalade'])
++
++    expect(titles.sort()).toEqual(['Marmalade mornings', 'The zephyrquill chronicles'])
++  })
++
++  it('returns nothing for a word that only appears in unpublished posts', async () => {
++    expect(await search(['ready for readers'])).toEqual([])
++  })
++
++  it('does not pad results with posts that do not match', async () => {
++    expect(await search(['marmalade'])).toEqual(['Marmalade mornings'])
++  })
++})

@@ -1,0 +1,108 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index cccd770..c952131 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -35,13 +35,17 @@ export default class PostController extends Controller {
+ 
+     const posts = await Post.newQuery()
+       .with('author')
++      // The keyword ORs stay inside the callback so they group in
++      // parentheses; `published` is a sibling AND, or every published post
++      // would be OR'd back into the results — and every unpublished match
++      // would leak out.
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+-        q.orWhere('published', true)
+       })
++      .where('published', true)
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+diff --git a/tests/PostSearch.test.ts b/tests/PostSearch.test.ts
+new file mode 100644
+index 0000000..f912b4b
+--- /dev/null
++++ b/tests/PostSearch.test.ts
+@@ -0,0 +1,79 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// Regression cover for the search leak: posts.search used to OR `published`
++// in with the keyword conditions, which both padded the results with posts
++// that matched no keyword and let unpublished posts through.
++describe('posts.search visibility', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++
++    const author = await User.create({
++      name: 'Editor',
++      email: 'editor@example.com',
++      password: 'password',
++    })
++
++    const authorId = author.id
++
++    await Post.forceCreate({
++      title: 'A zephyrquill morning',
++      excerpt: 'Published and matching.',
++      body: '...',
++      authorId,
++      published: true,
++    })
++    await Post.forceCreate({
++      title: 'Draft zephyrquill notes',
++      excerpt: 'Unpublished and matching.',
++      body: '...',
++      authorId,
++      published: false,
++    })
++    await Post.forceCreate({
++      title: 'Secret marmalade recipe',
++      excerpt: 'Unpublished, other keyword.',
++      body: '...',
++      authorId,
++      published: false,
++    })
++    await Post.forceCreate({
++      title: 'Unrelated ramblings',
++      excerpt: 'No keyword here.',
++      body: '...',
++      authorId,
++      published: true,
++    })
++  })
++
++  it('returns only published posts matching a keyword', async () => {
++    const response = await http.query('/posts/search', { keywords: ['zephyrquill'] })
++    response.assertOk()
++
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data.map((post) => post.title)).toEqual(['A zephyrquill morning'])
++  })
++
++  it('never leaks unpublished posts across several keywords', async () => {
++    const response = await http.query('/posts/search', { keywords: ['zephyrquill', 'marmalade'] })
++    response.assertOk()
++
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data.map((post) => post.title)).toEqual(['A zephyrquill morning'])
++  })
++
++  it('returns nothing for a word that only unpublished posts contain', async () => {
++    const response = await http.query('/posts/search', { keywords: ['marmalade'] })
++    response.assertOk()
++
++    const body = await response.json<{ data: Array<{ title: string }> }>()
++    expect(body.data).toEqual([])
++  })
++})

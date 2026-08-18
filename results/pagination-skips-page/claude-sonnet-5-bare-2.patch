@@ -1,0 +1,91 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..41ea5c4 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,8 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { getDatabase, resetDatabase } from '../config/database.js'
++import { posts, users } from '../db/schema.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +22,63 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// Regression coverage for a controller bug where `page` (already 1-indexed
++// by ListPostsQuerySchema's default) was passed to the ORM as `page + 1`,
++// so requesting page 1 actually fetched the ORM's page 2 — skipping the 10
++// newest posts and never showing them on any page.
++describe('posts.index pagination', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = (await TestApp.fromApp(app)).withHeader('X-Inertia', 'true')
++
++    // Start from a clean slate: resetDatabase() drops and re-migrates, so
++    // any posts/users seeded by app boot elsewhere are gone before we seed
++    // our own fixtures.
++    await resetDatabase()
++    const db = (await getDatabase()) as any
++    const [author] = await db
++      .insert(users)
++      .values({ name: 'Pagination Author', email: 'pagination-author@example.com', passwordHash: 'test-hash' })
++      .returning()
++
++    // Post N is inserted Nth, so higher N gets a higher id — the newest post.
++    for (let n = 1; n <= 25; n++) {
++      await db.insert(posts).values({ title: `Post ${n}`, excerpt: `Excerpt ${n}`, body: `Body ${n}`, authorId: author.id })
++    }
++  })
++
++  it('shows the 10 newest posts on page 1 by default', async () => {
++    const response = await http.get('/posts').assertOk().assertInertia('posts/Index')
++    const { props } = await response.json<{ props: { data: { title: string }[]; pagination: { meta: Record<string, unknown> } } }>()
++
++    expect(props.data).toHaveLength(10)
++    expect(props.data.map((post) => post.title)).toEqual(Array.from({ length: 10 }, (_, i) => `Post ${25 - i}`))
++    expect(props.pagination.meta).toEqual({ currentPage: 1, lastPage: 3, perPage: 10, total: 25, from: 1, to: 10 })
++  })
++
++  it('?page=1 shows the same newest 10 posts, not the 11th–20th', async () => {
++    const response = await http.get('/posts?page=1').assertOk().assertInertia('posts/Index')
++    const { props } = await response.json<{ props: { data: { title: string }[]; pagination: { meta: Record<string, unknown> } } }>()
++
++    expect(props.data[0]?.title).toBe('Post 25')
++    expect(props.pagination.meta).toEqual({ currentPage: 1, lastPage: 3, perPage: 10, total: 25, from: 1, to: 10 })
++  })
++
++  it('?page=2 shows the next 10 posts', async () => {
++    const response = await http.get('/posts?page=2').assertOk().assertInertia('posts/Index')
++    const { props } = await response.json<{ props: { data: { title: string }[]; pagination: { meta: Record<string, unknown> } } }>()
++
++    expect(props.data.map((post) => post.title)).toEqual(Array.from({ length: 10 }, (_, i) => `Post ${15 - i}`))
++    expect(props.pagination.meta).toEqual({ currentPage: 2, lastPage: 3, perPage: 10, total: 25, from: 11, to: 20 })
++  })
++
++  it('?page=3 shows the remaining 5 oldest posts, none missing', async () => {
++    const response = await http.get('/posts?page=3').assertOk().assertInertia('posts/Index')
++    const { props } = await response.json<{ props: { data: { title: string }[]; pagination: { meta: Record<string, unknown> } } }>()
++
++    expect(props.data.map((post) => post.title)).toEqual(Array.from({ length: 5 }, (_, i) => `Post ${5 - i}`))
++    expect(props.pagination.meta).toEqual({ currentPage: 3, lastPage: 3, perPage: 10, total: 25, from: 21, to: 25 })
++  })
++})

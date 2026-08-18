@@ -1,0 +1,207 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..c61be97 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,11 +1,14 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { DEFAULT_REDIRECT, safeRedirectPath, sanitizeRedirectPath } from '../../Support/redirect.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+-    const redirect = this.request.query('redirect') ?? ''
++    // Only a same-app path survives — the form must not carry an off-site
++    // target back to `store()`.
++    const redirect = sanitizeRedirectPath(this.request.query('redirect')) ?? ''
+     return this.inertia(pages.auth.Login, { email, redirect }, { title: 'Login' })
+   }
+ 
+@@ -20,8 +23,15 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in — but
++    // only when that page belongs to this app. Anything pointing at another
++    // origin is dropped for the default destination, so the login page can
++    // never be used as an open redirect towards a phishing site.
++    const target =
++      sanitizeRedirectPath(redirect) ??
++      safeRedirectPath(this.request.query('redirect'), DEFAULT_REDIRECT)
++
++    return this.redirect(target)
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Http/Support/redirect.ts b/app/Http/Support/redirect.ts
+new file mode 100644
+index 0000000..6434bcc
+--- /dev/null
++++ b/app/Http/Support/redirect.ts
+@@ -0,0 +1,67 @@
++/**
++ * Guards for user-supplied post-login (and post-action) redirect targets.
++ *
++ * A redirect value coming from a query string or a form field must never be
++ * able to send the browser to another site: an attacker can mail a link to
++ * our own login page and have the victim handed to a look-alike host after
++ * they sign in. Only plain paths inside this app are accepted.
++ */
++
++/** Where a sign-in without a usable redirect value lands. */
++export const DEFAULT_REDIRECT = '/dashboard'
++
++/**
++ * Browsers drop control characters (tabs and newlines in particular) while
++ * parsing a URL, so a value like `/<TAB>/evil.example` would navigate to
++ * `//evil.example`. Strip them before inspecting the value.
++ */
++function stripControlCharacters(value: string): string {
++  return Array.from(value)
++    .filter((character) => {
++      const code = character.codePointAt(0) ?? 0
++      return code > 0x1f && code !== 0x7f
++    })
++    .join('')
++}
++
++/**
++ * Returns the value as a safe same-app path, or `null` when it points
++ * anywhere else — absolute URLs with a scheme, protocol-relative `//host`,
++ * their backslash variants, or anything that is not rooted at `/`.
++ */
++export function sanitizeRedirectPath(value: unknown): string | null {
++  if (typeof value !== 'string') {
++    return null
++  }
++
++  const candidate = stripControlCharacters(value).trim()
++  if (candidate === '') {
++    return null
++  }
++
++  // Browsers treat a backslash as a path separator, so `/\evil.example` is
++  // read as `//evil.example`. Normalize first, then judge what it really is.
++  const normalized = candidate.replace(/\\/g, '/')
++
++  // Must be rooted at this app: rejects `https://evil.example`,
++  // `javascript:...`, `evil.example` and other scheme/relative forms.
++  if (!normalized.startsWith('/')) {
++    return null
++  }
++
++  // `//evil.example` (and `/\evil.example`, normalized above) is
++  // protocol-relative — a different origin.
++  if (normalized.startsWith('//')) {
++    return null
++  }
++
++  return normalized
++}
++
++/**
++ * Same as {@link sanitizeRedirectPath}, but falls back to the default
++ * destination instead of returning `null`.
++ */
++export function safeRedirectPath(value: unknown, fallback: string = DEFAULT_REDIRECT): string {
++  return sanitizeRedirectPath(value) ?? fallback
++}
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..d9a1aaa
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,90 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { sanitizeRedirectPath } from '../app/Http/Support/redirect.js'
++
++// The login page takes a `redirect` value so a user lands back where they
++// came from. It must never be usable to hand the browser to another site.
++describe('sanitizeRedirectPath', () => {
++  it('keeps same-app paths', () => {
++    expect(sanitizeRedirectPath('/posts/3/edit')).toBe('/posts/3/edit')
++    expect(sanitizeRedirectPath('/posts?page=2#top')).toBe('/posts?page=2#top')
++  })
++
++  it('rejects anything pointing off-site', () => {
++    for (const value of [
++      'https://evil.example',
++      'http://evil.example',
++      '//evil.example',
++      '/\\evil.example',
++      '\\\\evil.example',
++      'javascript:alert(1)',
++      'evil.example',
++      '',
++      '   ',
++      undefined,
++      null,
++    ]) {
++      expect(sanitizeRedirectPath(value)).toBeNull()
++    }
++  })
++})
++
++describe('login redirect', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await resetDatabase()
++    http = await TestApp.fromApp(app)
++    await User.create({ name: 'Ada', email: 'ada@example.com', password: 'secret123' })
++  })
++
++  const credentials = { email: 'ada@example.com', password: 'secret123' }
++
++  it('returns the user to a same-app path', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { ...credentials, redirect: '/posts/3/edit' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('ignores an absolute URL and uses the default destination', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { ...credentials, redirect: 'https://evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a protocol-relative value', async () => {
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { ...credentials, redirect: '//evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('ignores a backslash variant', async () => {
++    const csrf = await http.withCsrf()
++    await csrf.post('/login', { ...credentials, redirect: '/\\evil.example' }).assertRedirect('/dashboard')
++  })
++
++  it('ignores an off-site redirect passed on the query string', async () => {
++    const csrf = await http.withCsrf()
++    await csrf.post('/login?redirect=https://evil.example', credentials).assertRedirect('/dashboard')
++  })
++
++  it('does not sign in with a wrong password', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: credentials.email, password: 'wrong-password', redirect: '/posts' })
++      .assertStatus(422)
++  })
++
++  it('drops an off-site redirect from the login page props', async () => {
++    // Ask for the Inertia JSON payload rather than the HTML shell.
++    const inertia = http.withHeader('X-Inertia', 'true')
++    await inertia.get('/login?redirect=https://evil.example').assertInertia('auth/Login', { redirect: '' })
++    await inertia
++      .get('/login?redirect=/posts/3/edit')
++      .assertInertia('auth/Login', { redirect: '/posts/3/edit' })
++  })
++})

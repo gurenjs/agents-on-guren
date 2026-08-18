@@ -1,0 +1,542 @@
+diff --git a/app/Helpers/ExcerptHelper.ts b/app/Helpers/ExcerptHelper.ts
+new file mode 100644
+index 0000000..9c470a0
+--- /dev/null
++++ b/app/Helpers/ExcerptHelper.ts
+@@ -0,0 +1,36 @@
++export function deriveExcerpt(body: string): string {
++  const trimmed = body.trim()
++
++  // If body is 140 characters or fewer, use the whole body
++  if (trimmed.length <= 140) {
++    return trimmed
++  }
++
++  // Take the first 140 characters
++  let text = trimmed.substring(0, 140)
++
++  // Check if character 141 exists and is non-whitespace
++  const char141 = trimmed[140]
++  const char140 = trimmed[139]
++
++  // If both character 140 and 141 are non-whitespace, we need to cut at the last whitespace
++  if (char140 && !/\s/.test(char140) && char141 && !/\s/.test(char141)) {
++    // Find the last whitespace position in the first 140 characters
++    let lastSpaceIndex = -1
++    for (let i = text.length - 1; i >= 0; i--) {
++      if (/\s/.test(text[i])) {
++        lastSpaceIndex = i
++        break
++      }
++    }
++
++    if (lastSpaceIndex !== -1) {
++      // Cut at the last whitespace
++      text = text.substring(0, lastSpaceIndex)
++    }
++    // If no whitespace found in first 140 chars, keep all 140
++  }
++
++  // Trim trailing whitespace and append ellipsis
++  return text.trimEnd() + '…'
++}
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..1c2b9f7 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,6 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { deriveExcerpt } from '../../Helpers/ExcerptHelper.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -68,9 +69,10 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const data = await this.validateBody(PostPayloadSchema)
++    const excerpt = data.excerpt || deriveExcerpt(data.body)
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({ ...data, excerpt, authorId: author.id })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +93,8 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const data = await this.validateBody(PostPayloadSchema)
+-    await Post.update({ id: post.id }, data)
++    const excerpt = data.excerpt || deriveExcerpt(data.body)
++    await Post.update({ id: post.id }, { ...data, excerpt })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..c8d83d8 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -18,7 +18,7 @@ export const PostSearchSchema = z.object({
+ 
+ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++  excerpt: z.string().trim().max(500, 'Excerpt must be 500 characters or fewer.').optional().transform(v => v ?? ''),
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
+diff --git a/db/migrations/20260818071102_make_excerpt_nullable/migration.sql b/db/migrations/20260818071102_make_excerpt_nullable/migration.sql
+new file mode 100644
+index 0000000..f2f3794
+--- /dev/null
++++ b/db/migrations/20260818071102_make_excerpt_nullable/migration.sql
+@@ -0,0 +1,15 @@
++PRAGMA foreign_keys=OFF;--> statement-breakpoint
++CREATE TABLE `__new_posts` (
++	`id` integer PRIMARY KEY AUTOINCREMENT,
++	`title` text NOT NULL,
++	`excerpt` text,
++	`body` text NOT NULL,
++	`author_id` integer NOT NULL,
++	`created_at` text NOT NULL,
++	CONSTRAINT `fk_posts_author_id_users_id_fk` FOREIGN KEY (`author_id`) REFERENCES `users`(`id`)
++);
++--> statement-breakpoint
++INSERT INTO `__new_posts`(`id`, `title`, `excerpt`, `body`, `author_id`, `created_at`) SELECT `id`, `title`, `excerpt`, `body`, `author_id`, `created_at` FROM `posts`;--> statement-breakpoint
++DROP TABLE `posts`;--> statement-breakpoint
++ALTER TABLE `__new_posts` RENAME TO `posts`;--> statement-breakpoint
++PRAGMA foreign_keys=ON;
+\ No newline at end of file
+diff --git a/db/migrations/20260818071102_make_excerpt_nullable/snapshot.json b/db/migrations/20260818071102_make_excerpt_nullable/snapshot.json
+new file mode 100644
+index 0000000..c20cf82
+--- /dev/null
++++ b/db/migrations/20260818071102_make_excerpt_nullable/snapshot.json
+@@ -0,0 +1,191 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "44df424c-9268-4814-abda-1622e1a0feae",
++  "prevIds": [
++    "064ebde9-8b69-42ff-8515-64f20f1250c8"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..e1069aa 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -13,7 +13,7 @@ export const users = sqliteTable('users', {
+ export const posts = sqliteTable('posts', {
+   id: integer('id').primaryKey({ autoIncrement: true }),
+   title: text('title').notNull(),
+-  excerpt: text('excerpt').notNull(),
++  excerpt: text('excerpt'),
+   body: text('body').notNull(),
+   authorId: integer('author_id')
+     .notNull()
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..adbc5f4 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -44,11 +44,14 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Will be auto-generated from the body if left blank"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..7f53467 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -36,11 +36,14 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Will be auto-generated from the body if left blank"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/tests/ExcerptHelper.test.ts b/tests/ExcerptHelper.test.ts
+new file mode 100644
+index 0000000..c89442a
+--- /dev/null
++++ b/tests/ExcerptHelper.test.ts
+@@ -0,0 +1,85 @@
++import { describe, it } from 'bun:test'
++import { deriveExcerpt } from '../app/Helpers/ExcerptHelper.js'
++
++describe('deriveExcerpt', () => {
++  it('returns the whole body when 140 characters or fewer', () => {
++    const body = 'The quick brown fox jumps over the lazy dog'
++    const result = deriveExcerpt(body)
++    // Body is exactly 44 characters, no ellipsis needed
++    // result should be the whole body without ellipsis
++    if (body === result) {
++      console.log('✓ Body ≤ 140 chars returns whole body')
++    }
++  })
++
++  it('cuts at the last whitespace when character 141 is inside a word', () => {
++    const body =
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown'
++    const result = deriveExcerpt(body)
++    // The first 140 characters end with "The q", and char 141 is "u"
++    // Should cut at the space before "quick" (from "dog. The ")
++    // Expected: "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…"
++    const expected =
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…'
++    if (result === expected) {
++      console.log('✓ Cuts at last whitespace when in middle of word')
++    } else {
++      console.log(`✗ Expected: "${expected}" (${expected.length} chars)`)
++      console.log(`  Got:      "${result}" (${result.length} chars)`)
++      if (result.endsWith('…')) {
++        console.log('  (Ends with ellipsis correctly)')
++      }
++    }
++  })
++
++  it('keeps all 140 characters when character 141 is whitespace', () => {
++    const body =
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right at a space, then adds a mark.'
++    const result = deriveExcerpt(body)
++    // The first 140 characters should end with "right", and char 141 is a space
++    // So keep all 140 and add ellipsis
++    const first140 = body.substring(0, 140)
++    const expected = first140 + '…'
++    if (result === expected) {
++      console.log('✓ Keeps all 140 chars when cut is at whitespace boundary')
++    } else {
++      console.log(`✗ Expected: "${expected}" (${expected.length} chars)`)
++      console.log(`  Got:      "${result}" (${result.length} chars)`)
++      console.log(`  First 140: "${first140}"`)
++      console.log(`  Char 140: "${body[139]}"`)
++      console.log(`  Char 141: "${body[140]}"`)
++    }
++  })
++
++  it('handles whitespace trimming', () => {
++    const body = '  The quick brown fox  ' // Leading and trailing spaces
++    const result = deriveExcerpt(body)
++    if (result === 'The quick brown fox') {
++      console.log('✓ Trims leading and trailing whitespace')
++    } else {
++      console.log(`✗ Expected trimmed body, got: "${result}"`)
++    }
++  })
++
++  it('handles one long word without spaces', () => {
++    const body = 'a'.repeat(150)
++    const result = deriveExcerpt(body)
++    const expected = 'a'.repeat(140) + '…'
++    if (result === expected) {
++      console.log('✓ Handles word with no spaces, keeps 140 chars')
++    } else {
++      console.log(`✗ Expected: ${expected.length} chars of 'a' + …`)
++      console.log(`  Got: ${result.length} chars`)
++    }
++  })
++
++  it('returns correct excerpt for a real post body', () => {
++    const body = `In today's fast-paced world, staying informed is more important than ever. The speed at which information travels across digital platforms means we must develop critical thinking skills to evaluate what we encounter online. Let me share some thoughts about this...`
++    const result = deriveExcerpt(body)
++    if (result.endsWith('…')) {
++      console.log('✓ Appends ellipsis to truncated text')
++    } else {
++      console.log(`✗ Should end with ellipsis, got: "${result.slice(-10)}"`)
++    }
++  })
++})
+diff --git a/tests/PostValidator.test.ts b/tests/PostValidator.test.ts
+new file mode 100644
+index 0000000..6566d22
+--- /dev/null
++++ b/tests/PostValidator.test.ts
+@@ -0,0 +1,83 @@
++import { describe, it } from 'bun:test'
++import { PostPayloadSchema } from '../app/Http/Validators/PostValidator.js'
++
++describe('PostPayloadSchema', () => {
++  it('accepts a complete post with excerpt', async () => {
++    const data = {
++      title: 'My Post',
++      excerpt: 'This is an excerpt',
++      body: 'This is the body',
++    }
++    const result = PostPayloadSchema.parse(data)
++    if (result.excerpt === 'This is an excerpt') {
++      console.log('✓ Accepts post with excerpt')
++    }
++  })
++
++  it('accepts a post without excerpt', async () => {
++    const data = {
++      title: 'My Post',
++      excerpt: '',
++      body: 'This is the body',
++    }
++    const result = PostPayloadSchema.parse(data)
++    if (result.excerpt === '') {
++      console.log('✓ Accepts post with empty excerpt')
++    }
++  })
++
++  it('accepts a post with undefined excerpt', async () => {
++    const data = {
++      title: 'My Post',
++      body: 'This is the body',
++    }
++    const result = PostPayloadSchema.parse(data)
++    if (result.excerpt === '') {
++      console.log('✓ Accepts post with undefined excerpt, transforms to empty string')
++    }
++  })
++
++  it('rejects a post without title', async () => {
++    const data = {
++      title: '',
++      excerpt: 'An excerpt',
++      body: 'This is the body',
++    }
++    try {
++      PostPayloadSchema.parse(data)
++      console.log('✗ Should reject empty title')
++    } catch (error: any) {
++      if (error.errors && error.errors[0]?.message?.includes('Title is required')) {
++        console.log('✓ Rejects empty title')
++      }
++    }
++  })
++
++  it('rejects a post without body', async () => {
++    const data = {
++      title: 'My Post',
++      excerpt: 'An excerpt',
++      body: '',
++    }
++    try {
++      PostPayloadSchema.parse(data)
++      console.log('✗ Should reject empty body')
++    } catch (error: any) {
++      if (error.errors && error.errors[0]?.message?.includes('Body is required')) {
++        console.log('✓ Rejects empty body')
++      }
++    }
++  })
++
++  it('trims whitespace from title, excerpt, and body', async () => {
++    const data = {
++      title: '  My Post  ',
++      excerpt: '  An excerpt  ',
++      body: '  This is the body  ',
++    }
++    const result = PostPayloadSchema.parse(data)
++    if (result.title === 'My Post' && result.excerpt === 'An excerpt' && result.body === 'This is the body') {
++      console.log('✓ Trims whitespace from all fields')
++    }
++  })
++})

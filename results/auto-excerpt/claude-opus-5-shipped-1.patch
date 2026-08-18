@@ -1,0 +1,339 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..dbd3c2c 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt?: string; body: string }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt?: string; body: string }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..233f7f2 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,6 +3,7 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
++import { resolveExcerpt } from '../../Support/excerpt.js'
+ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+@@ -70,7 +71,11 @@ export default class PostController extends Controller {
+     const data = await this.validateBody(PostPayloadSchema)
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({
++      ...data,
++      excerpt: resolveExcerpt(data.excerpt, data.body),
++      authorId: author.id,
++    })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +96,9 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const data = await this.validateBody(PostPayloadSchema)
+-    await Post.update({ id: post.id }, data)
++    // A cleared excerpt re-derives from the body being saved, so the stored
++    // teaser always matches the current text.
++    await Post.update({ id: post.id }, { ...data, excerpt: resolveExcerpt(data.excerpt, data.body) })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..a510f34 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -18,7 +18,9 @@ export const PostSearchSchema = z.object({
+ 
+ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++  // Optional: a blank excerpt is derived from the body — see
++  // `app/Support/excerpt.ts`, applied in PostController.
++  excerpt: z.string().trim().max(500, 'Excerpt must be 500 characters or fewer.').optional(),
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
+diff --git a/app/Support/excerpt.ts b/app/Support/excerpt.ts
+new file mode 100644
+index 0000000..f1ff961
+--- /dev/null
++++ b/app/Support/excerpt.ts
+@@ -0,0 +1,54 @@
++/**
++ * Longest excerpt this module derives before it starts cutting, counted in
++ * `String.length` units.
++ */
++export const EXCERPT_LENGTH = 140
++
++/** Single U+2026 character — not three periods. */
++const ELLIPSIS = '…'
++
++function isWhitespace(character: string | undefined): boolean {
++  return character !== undefined && /\s/.test(character)
++}
++
++function lastWhitespaceIndex(text: string): number {
++  for (let index = text.length - 1; index >= 0; index -= 1) {
++    if (isWhitespace(text[index])) return index
++  }
++  return -1
++}
++
++/**
++ * Builds the teaser shown on post cards from the body of a post, for writers
++ * who leave the excerpt blank.
++ *
++ * A body of `EXCERPT_LENGTH` characters or fewer is returned as-is. A longer
++ * one is cut to `EXCERPT_LENGTH`, backing off to the last whitespace when the
++ * cut would land inside a word, and gains a trailing ellipsis.
++ */
++export function deriveExcerpt(body: string): string {
++  const trimmed = body.trim()
++  if (trimmed.length <= EXCERPT_LENGTH) return trimmed
++
++  const head = trimmed.slice(0, EXCERPT_LENGTH)
++  let kept = head
++
++  // The cut splits a word only when the characters on both sides of it are
++  // non-whitespace; otherwise the full head is a clean stop already.
++  if (!isWhitespace(head[EXCERPT_LENGTH - 1]) && !isWhitespace(trimmed[EXCERPT_LENGTH])) {
++    const boundary = lastWhitespaceIndex(head)
++    // No whitespace at all in the head — an unbroken run gets cut at the limit.
++    if (boundary !== -1) kept = head.slice(0, boundary)
++  }
++
++  return `${kept.replace(/\s+$/, '')}${ELLIPSIS}`
++}
++
++/**
++ * Resolves the excerpt to store: what the writer typed when they typed
++ * something, otherwise one derived from the body.
++ */
++export function resolveExcerpt(excerpt: string | undefined, body: string): string {
++  const provided = excerpt?.trim() ?? ''
++  return provided.length > 0 ? provided : deriveExcerpt(body)
++}
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..f0ce0f7 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -15,7 +15,7 @@ const fieldClass =
+ export default function EditPost({ post }: Props) {
+   const form = useForm<PostFormData>({
+     title: post.title,
+-    excerpt: post.excerpt,
++    excerpt: post.excerpt ?? '',
+     body: post.body,
+   })
+ 
+@@ -44,11 +44,14 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+-              value={form.data.excerpt}
++              value={form.data.excerpt ?? ''}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Leave blank to use the opening of the body"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..1ab451d 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -36,11 +36,14 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+-              value={form.data.excerpt}
++              value={form.data.excerpt ?? ''}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Leave blank to use the opening of the body"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/tests/PostExcerpt.test.ts b/tests/PostExcerpt.test.ts
+new file mode 100644
+index 0000000..c37c575
+--- /dev/null
++++ b/tests/PostExcerpt.test.ts
+@@ -0,0 +1,76 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++import app from '../src/app.js'
++
++const LONG_BODY =
++  'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown'
++
++const LONG_BODY_EXCERPT =
++  'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…'
++
++describe('post excerpt fallback', () => {
++  let http: TestApp
++  // Signed in as the author with session + XSRF cookies primed: the mutating
++  // post routes sit behind both auth and CSRF.
++  let asAuthor: TestApp
++  let author: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    author = (await User.create({
++      name: 'Excerpt Writer',
++      email: 'writer@example.com',
++      password: 'secret',
++    })) as UserRecord
++    asAuthor = (await http.actingAs(author).withCsrf()).json()
++  })
++
++  it('derives the excerpt from the body when it is omitted on create', async () => {
++    await asAuthor.post('/posts', { title: 'Derived', body: LONG_BODY }).assertRedirect()
++
++    expect((await Post.first({ title: 'Derived' }))?.excerpt).toBe(LONG_BODY_EXCERPT)
++  })
++
++  it('derives the excerpt when it is only whitespace', async () => {
++    await asAuthor.post('/posts', { title: 'Blank', excerpt: '   ', body: 'A short body.' }).assertRedirect()
++
++    expect((await Post.first({ title: 'Blank' }))?.excerpt).toBe('A short body.')
++  })
++
++  it('keeps a provided excerpt, trimmed', async () => {
++    await asAuthor
++      .post('/posts', { title: 'Typed', excerpt: '  Hand written.  ', body: LONG_BODY })
++      .assertRedirect()
++
++    expect((await Post.first({ title: 'Typed' }))?.excerpt).toBe('Hand written.')
++  })
++
++  it('still refuses a blank title or body', async () => {
++    await asAuthor.post('/posts', { title: '  ', body: LONG_BODY }).assertUnprocessable()
++    await asAuthor.post('/posts', { title: 'Ok', body: '  ' }).assertUnprocessable()
++
++    expect(await Post.newQuery().count()).toBe(0)
++  })
++
++  it('re-derives from the new body when an update clears the excerpt', async () => {
++    const post = await Post.forceCreate({
++      title: 'Existing',
++      excerpt: 'Old teaser.',
++      body: 'Old body.',
++      authorId: author.id,
++    })
++
++    await asAuthor
++      .put(`/posts/${post?.id}`, { title: 'Existing', excerpt: '', body: 'A brand new body.' })
++      .assertRedirect()
++
++    expect((await Post.find(post?.id as number))?.excerpt).toBe('A brand new body.')
++  })
++})
+diff --git a/tests/excerpt.test.ts b/tests/excerpt.test.ts
+new file mode 100644
+index 0000000..ccac036
+--- /dev/null
++++ b/tests/excerpt.test.ts
+@@ -0,0 +1,70 @@
++import { describe, expect, it } from 'bun:test'
++import { deriveExcerpt, resolveExcerpt } from '../app/Support/excerpt.js'
++
++const SENTENCE = 'The quick brown fox jumps over the lazy dog. '
++
++describe('deriveExcerpt', () => {
++  it('returns a short body untouched, with no ellipsis', () => {
++    expect(deriveExcerpt('A tiny post.')).toBe('A tiny post.')
++  })
++
++  it('trims the body before measuring it', () => {
++    expect(deriveExcerpt('  \n A tiny post.\t ')).toBe('A tiny post.')
++  })
++
++  it('keeps a body of exactly 140 characters whole', () => {
++    const body = 'x'.repeat(140)
++    expect(deriveExcerpt(body)).toBe(body)
++  })
++
++  it('backs off to the last whitespace when the cut lands inside a word', () => {
++    // 150 characters; character 141 is the "u" of "quick".
++    const body =
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown'
++    expect(body).toHaveLength(150)
++
++    const excerpt = deriveExcerpt(body)
++    expect(excerpt).toBe(
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…',
++    )
++    expect(excerpt).toHaveLength(139)
++  })
++
++  it('keeps all 140 characters when the cut lands on a word boundary', () => {
++    const body =
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right at a space, then adds a mark.'
++    expect(body).toHaveLength(170)
++
++    const excerpt = deriveExcerpt(body)
++    expect(excerpt).toBe(
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right…',
++    )
++    expect(excerpt).toHaveLength(141)
++  })
++
++  it('cuts at 140 when the opening is one unbroken run', () => {
++    const excerpt = deriveExcerpt('y'.repeat(200))
++    expect(excerpt).toBe(`${'y'.repeat(140)}…`)
++  })
++
++  it('appends a single U+2026 rather than three periods', () => {
++    const excerpt = deriveExcerpt(SENTENCE.repeat(10))
++    expect(excerpt.endsWith('…')).toBe(true)
++    expect(excerpt.endsWith('...')).toBe(false)
++  })
++})
++
++describe('resolveExcerpt', () => {
++  it('prefers a provided excerpt', () => {
++    expect(resolveExcerpt('Hand written.', SENTENCE.repeat(10))).toBe('Hand written.')
++  })
++
++  it('derives from the body when the excerpt is missing', () => {
++    expect(resolveExcerpt(undefined, 'A tiny post.')).toBe('A tiny post.')
++  })
++
++  it('derives from the body when the excerpt is blank or whitespace', () => {
++    expect(resolveExcerpt('', 'A tiny post.')).toBe('A tiny post.')
++    expect(resolveExcerpt('   \n\t ', 'A tiny post.')).toBe('A tiny post.')
++  })
++})

@@ -1,0 +1,132 @@
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..d6f40d2
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,14 @@
++import { Controller } from '@guren/core'
++import { checkDatabaseConnection } from '../../Support/HealthCheck.js'
++
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    const db = await checkDatabaseConnection()
++    const healthy = db.status === 'ok'
++
++    return this.json(
++      { status: healthy ? 'ok' : 'error', checks: { db } },
++      { status: healthy ? 200 : 503 },
++    )
++  }
++}
+diff --git a/app/Support/HealthCheck.ts b/app/Support/HealthCheck.ts
+new file mode 100644
+index 0000000..049553b
+--- /dev/null
++++ b/app/Support/HealthCheck.ts
+@@ -0,0 +1,26 @@
++import { sql } from 'drizzle-orm'
++import type { SQLiteBunDatabase } from 'drizzle-orm/bun-sqlite'
++import { getDatabase } from '../../config/database.js'
++
++export interface HealthCheckResult {
++  status: 'ok' | 'error'
++  message?: string
++}
++
++/**
++ * Runs a trivial round trip against the database so `/health` reflects
++ * whether the connection actually works, not just that the process is up.
++ * Takes a resolver (defaulting to the real `getDatabase`) so tests can
++ * simulate an unreachable database without touching the real connection.
++ */
++export async function checkDatabaseConnection(
++  resolveDatabase: () => Promise<unknown> = getDatabase,
++): Promise<HealthCheckResult> {
++  try {
++    const database = (await resolveDatabase()) as SQLiteBunDatabase
++    await database.run(sql`select 1`)
++    return { status: 'ok' }
++  } catch (error) {
++    return { status: 'error', message: error instanceof Error ? error.message : String(error) }
++  }
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..e6b0f9b 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,5 +1,6 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+@@ -14,8 +15,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. Touches the
++  // database on every probe and answers 503 when it can't be reached, so a
++  // deploy with a broken database gets drained instead of staying in rotation.
++  router.get('/health', [HealthController, 'index']).name('health')
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/HealthController.test.ts b/tests/HealthController.test.ts
+new file mode 100644
+index 0000000..406a415
+--- /dev/null
++++ b/tests/HealthController.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'bun:test'
++import { checkDatabaseConnection } from '../app/Support/HealthCheck.js'
++
++describe('checkDatabaseConnection', () => {
++  it('reports ok when the round-trip query succeeds', async () => {
++    const result = await checkDatabaseConnection(async () => ({
++      run: async () => undefined,
++    }))
++
++    expect(result).toEqual({ status: 'ok' })
++  })
++
++  it('reports error when the query throws', async () => {
++    const result = await checkDatabaseConnection(async () => ({
++      run: async () => {
++        throw new Error('database is locked')
++      },
++    }))
++
++    expect(result.status).toBe('error')
++    expect(result.message).toBe('database is locked')
++  })
++
++  it('reports error when the connection cannot be opened', async () => {
++    const result = await checkDatabaseConnection(async () => {
++      throw new Error('connection refused')
++    })
++
++    expect(result.status).toBe('error')
++    expect(result.message).toBe('connection refused')
++  })
++})
+diff --git a/tests/HomeController.test.ts b/tests/HomeController.test.ts
+index a051255..c80fa8e 100644
+--- a/tests/HomeController.test.ts
++++ b/tests/HomeController.test.ts
+@@ -14,7 +14,11 @@ describe('app', () => {
+     http = await TestApp.fromApp(app)
+   })
+ 
+-  it('answers the health check', async () => {
+-    await http.get('/health').assertOk()
++  it('answers the health check with a real database round trip', async () => {
++    await http
++      .get('/health')
++      .assertOk()
++      .assertJsonPath('status', 'ok')
++      .assertJsonPath('checks.db.status', 'ok')
+   })
+ })

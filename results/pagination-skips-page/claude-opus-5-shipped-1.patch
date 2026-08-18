@@ -1,0 +1,124 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
+index fb3ddf8..ae9b060 100644
+--- a/resources/js/pages/posts/Index.tsx
++++ b/resources/js/pages/posts/Index.tsx
+@@ -115,7 +115,10 @@ export default function PostsIndex({ data, pagination }: Props) {
+               <Link
+                 key={page.page}
+                 href={page.url ?? '#'}
+-                className="rounded border border-slate-800 px-3 py-1 text-sm text-slate-300 transition hover:border-emerald-500 hover:text-emerald-200"
++                aria-current={page.active ? 'page' : undefined}
++                className={`rounded border px-3 py-1 text-sm transition hover:border-emerald-500 hover:text-emerald-200 ${
++                  page.active ? 'border-emerald-500 text-emerald-200' : 'border-slate-800 text-slate-300'
++                }`}
+               >
+                 {page.page}
+               </Link>
+diff --git a/tests/PostListPagination.test.ts b/tests/PostListPagination.test.ts
+new file mode 100644
+index 0000000..b9566ad
+--- /dev/null
++++ b/tests/PostListPagination.test.ts
+@@ -0,0 +1,89 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// The list is offset-paginated, newest first, 10 per page. These tests pin the
++// page → slice mapping: `?page=1` (and no query at all) must start at the very
++// newest post, and every post must appear on exactly one page.
++describe('posts.index pagination', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await resetDatabase()
++    http = (await TestApp.fromApp(app)).withHeader('X-Inertia', 'true')
++
++    const author = await User.create({
++      name: 'Ada Lovelace',
++      email: 'ada@example.com',
++      password: 'secret-password',
++    })
++
++    for (let index = 1; index <= 25; index += 1) {
++      await Post.forceCreate({
++        title: `Post ${index}`,
++        excerpt: `Excerpt ${index}`,
++        body: `Body ${index}`,
++        authorId: (author as { id: number }).id,
++      })
++    }
++  })
++
++  it('starts page 1 at the newest post', async () => {
++    const response = await http.get('/posts')
++    response.assertOk()
++    const page = await response.json<{
++      props: {
++        data: Array<{ title: string }>
++        pagination: { meta: Record<string, unknown>; links: { pages: Array<{ page: number; active: boolean }> } }
++      }
++    }>()
++
++    expect(page.props.data.map((post) => post.title)).toEqual(
++      Array.from({ length: 10 }, (_, index) => `Post ${25 - index}`),
++    )
++    expect(page.props.pagination.meta).toMatchObject({
++      currentPage: 1,
++      lastPage: 3,
++      perPage: 10,
++      total: 25,
++      from: 1,
++      to: 10,
++    })
++    expect(page.props.pagination.links.pages.find((link) => link.active)?.page).toBe(1)
++  })
++
++  it('serves an explicit ?page=1 identically to no query', async () => {
++    const first = await (await http.get('/posts')).json<{ props: { data: Array<{ id: number }> } }>()
++    const explicit = await (await http.get('/posts?page=1')).json<{ props: { data: Array<{ id: number }> } }>()
++
++    expect(explicit.props.data.map((post) => post.id)).toEqual(first.props.data.map((post) => post.id))
++  })
++
++  it('walks every post exactly once across the pages', async () => {
++    const seen: string[] = []
++    for (const pageNumber of [1, 2, 3]) {
++      const response = await http.get(`/posts?page=${pageNumber}`)
++      response.assertOk()
++      const body = await response.json<{
++        props: { data: Array<{ title: string }>; pagination: { meta: { currentPage: number } } }
++      }>()
++      expect(body.props.pagination.meta.currentPage).toBe(pageNumber)
++      seen.push(...body.props.data.map((post) => post.title))
++    }
++
++    expect(seen).toEqual(Array.from({ length: 25 }, (_, index) => `Post ${25 - index}`))
++  })
++
++  it('reports the last page as a partial page', async () => {
++    const response = await http.get('/posts?page=3')
++    const body = await response.json<{
++      props: { data: unknown[]; pagination: { meta: Record<string, unknown> } }
++    }>()
++
++    expect(body.props.data).toHaveLength(5)
++    expect(body.props.pagination.meta).toMatchObject({ currentPage: 3, from: 21, to: 25 })
++  })
++})

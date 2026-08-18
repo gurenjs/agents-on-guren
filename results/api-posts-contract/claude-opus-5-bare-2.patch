@@ -1,0 +1,281 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..8743384 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: Array<Data.Post> }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/README.md b/README.md
+index daca2ea..4b1a1d7 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,16 @@ the database container.
+     --data '{"keywords":["guren"]}'
+   ```
+ 
++- `GET /api/posts` — public, unauthenticated JSON feed of posts, newest first,
++  ten to a page. Both query parameters are optional and declared on the route
++  contract in `routes/api.ts`, so the generated client and `guren audit` see
++  them: `page` (positive integer, default `1`) and `author` (a user id, which
++  narrows the listing and `meta.total` to that author). Anything else is a 422.
++
++  ```bash
++  curl 'http://localhost:3333/api/posts?author=1&page=2'
++  ```
++
+ - `/login`, `/register`, `/dashboard`, `/profile` — session authentication
+ 
+ Posts belong to their author. `app/Providers/AuthorizationProvider.ts` binds
+@@ -46,7 +56,7 @@ Write/Dashboard/Log out controls.
+ 
+ ## Project Structure
+ 
+-- `routes/web.ts`, `routes/auth.ts` — route definitions
++- `routes/web.ts`, `routes/auth.ts`, `routes/api.ts` — route definitions
+ - `app/Http/Controllers/` — request handlers
+ - `app/Http/Validators/` — Zod schemas, bound to routes and reused by the pages
+ - `app/Http/Resources/` — the shapes controllers hand to pages
+diff --git a/app/Http/Controllers/Api/PostController.ts b/app/Http/Controllers/Api/PostController.ts
+new file mode 100644
+index 0000000..7697f08
+--- /dev/null
++++ b/app/Http/Controllers/Api/PostController.ts
+@@ -0,0 +1,48 @@
++import { Controller, paginate } from '@guren/core'
++import { Post } from '../../../Models/Post.js'
++import { PostResource } from '../../Resources/PostResource.js'
++import { ApiListPostsQuerySchema } from '../../Validators/PostValidator.js'
++
++const PER_PAGE = 10
++
++// Public JSON feed of posts — no session, no CSRF token. Kept apart from the
++// Inertia PostController because nothing here renders a page: partners read it
++// straight, and our own front-end reaches it through the generated client.
++export default class PostController extends Controller {
++  async index(): Promise<Response> {
++    // The same schema the route declares as its query contract. The router
++    // records it for codegen and `guren audit`; validating here is what turns
++    // a bad ?page= or ?author= into a 422 before the database is touched.
++    const { page, author } = this.validateQuery(ApiListPostsQuerySchema)
++
++    // Counted and sliced by hand rather than through `paginate({ page })`,
++    // which resolves no eager loads — the partner contract requires `author`
++    // on every post, so the listing query has to be the one carrying `with()`.
++    const total = await this.postsBy(author).count()
++    const posts = await this.postsBy(author)
++      .with('author')
++      .orderBy('id', 'desc')
++      .limit(PER_PAGE)
++      .offset((page - 1) * PER_PAGE)
++      .get()
++
++    // The filter rides along in the page links, or paging a filtered feed
++    // would silently drop back to every author.
++    const paginator = paginate(posts, total, PER_PAGE, page, {
++      path: this.request.path ?? '/api/posts',
++      query: author !== undefined ? { author: String(author) } : undefined,
++    })
++
++    return this.json({
++      data: PostResource.collection(posts),
++      meta: paginator.meta(),
++      links: paginator.links(),
++    })
++  }
++
++  /** A fresh builder per call: `count()` must not see the listing's limit/offset. */
++  private postsBy(author?: number) {
++    const query = Post.newQuery()
++    return author === undefined ? query : query.where('authorId', author)
++  }
++}
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..217c27e 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -8,6 +8,15 @@ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+ 
++// Bound to the `api.posts.index` route contract and re-validated in the
++// controller. Query values always arrive as strings, so both fields coerce —
++// `?page=2&author=3` parses, while `abc` and `0` fail the int/positive checks
++// and come back as a 422.
++export const ApiListPostsQuerySchema = z.object({
++  page: z.coerce.number().int().positive().default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
+ export const PostSearchSchema = z.object({
+   keywords: z
+     .array(z.string().trim().min(1, 'Keywords must not be blank.'))
+diff --git a/routes/api.ts b/routes/api.ts
+new file mode 100644
+index 0000000..3cc0cd7
+--- /dev/null
++++ b/routes/api.ts
+@@ -0,0 +1,21 @@
++import type { Router } from '@guren/core'
++import ApiPostController from '../app/Http/Controllers/Api/PostController.js'
++import { PostResource } from '../app/Http/Resources/PostResource.js'
++import { ApiListPostsQuerySchema } from '../app/Http/Validators/PostValidator.js'
++
++// Public, unauthenticated JSON for external consumers. Registered outside the
++// 'auth' scopes routes/web.ts opens on purpose — a partner has no session, and
++// a GET carries no CSRF token either way.
++export function registerApiRoutes(router: Router<'auth' | 'guest'>): void {
++  router.group('/api', (api) => {
++    // `query` declares the accepted parameters on the route itself, so the
++    // contract is visible to codegen and `guren audit` instead of living only
++    // in the controller; `resource` declares the response shape the controller
++    // builds with PostResource, which is what types the client's json().
++    api.get('/posts', {
++      name: 'api.posts.index',
++      query: ApiListPostsQuerySchema,
++      resource: { data: [PostResource] },
++    }, [ApiPostController, 'index'])
++  })
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..5073d9a 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -4,6 +4,7 @@ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
++import { registerApiRoutes } from './api.js'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
+   // Named rather than inline so `guren audit` can see which routes are
+@@ -18,6 +19,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+   router.get('/health', (c) => c.json({ status: 'ok' }))
+ 
+   registerAuthRoutes(router)
++  registerApiRoutes(router)
+ 
+   router.group('/posts', (posts) => {
+     // Registered before '/:id', or "create" is read as a post id.
+diff --git a/tests/ApiPostController.test.ts b/tests/ApiPostController.test.ts
+new file mode 100644
+index 0000000..37250fa
+--- /dev/null
++++ b/tests/ApiPostController.test.ts
+@@ -0,0 +1,76 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++
++interface ApiPostsResponse {
++  data: Array<{
++    id: number
++    title: string
++    excerpt: string
++    createdAt: string
++    author?: { id: number; name: string }
++  }>
++  meta: { currentPage: number; lastPage: number; perPage: number; total: number }
++}
++
++// `api.posts.index` is public JSON — no session, no CSRF token. The route
++// declares its query contract (page, author) so codegen and `guren audit` can
++// see it, and the controller validates the same schema, which is what turns a
++// bad parameter into a 422 before the database is touched. The invalid cases
++// therefore need no fixtures; the reads below assert the envelope against
++// whatever the test database happens to hold.
++describe('api.posts.index', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('rejects invalid query parameters with a 422', async () => {
++    await http.get('/api/posts?page=0').assertStatus(422)
++    await http.get('/api/posts?page=abc').assertStatus(422)
++    await http.get('/api/posts?author=abc').assertStatus(422)
++    await http.get('/api/posts?author=0').assertStatus(422)
++  })
++
++  it('lists posts newest first, ten to a page, without signing in', async () => {
++    const response = await http.get('/api/posts').assertStatus(200)
++    expect(response.headers.get('content-type')).toContain('application/json')
++
++    const body = (await response.json()) as ApiPostsResponse
++    expect(body.meta.perPage).toBe(10)
++    expect(body.meta.currentPage).toBe(1)
++    expect(body.data.length).toBeLessThanOrEqual(10)
++
++    const ids = body.data.map((post) => post.id)
++    expect(ids).toEqual([...ids].sort((a, b) => b - a))
++
++    for (const post of body.data) {
++      expect(typeof post.title).toBe('string')
++      expect(typeof post.excerpt).toBe('string')
++      expect(new Date(post.createdAt).toISOString()).toBe(post.createdAt)
++      expect(typeof post.author?.id).toBe('number')
++      expect(typeof post.author?.name).toBe('string')
++    }
++  })
++
++  it('narrows the feed — and the total — to a single author', async () => {
++    const all = (await (await http.get('/api/posts').assertStatus(200)).json()) as ApiPostsResponse
++    const authorId = all.data[0]?.author?.id
++    if (authorId === undefined) return
++
++    const filtered = (await (await http.get(`/api/posts?author=${authorId}`).assertStatus(200)).json()) as ApiPostsResponse
++    expect(filtered.data.every((post) => post.author?.id === authorId)).toBe(true)
++    expect(filtered.meta.total).toBeGreaterThan(0)
++    expect(filtered.meta.total).toBeLessThanOrEqual(all.meta.total)
++  })
++
++  it('answers 200 with an empty page for an author who has no posts', async () => {
++    const response = await http.get('/api/posts?author=999999&page=2').assertStatus(200)
++
++    const body = (await response.json()) as ApiPostsResponse
++    expect(body.data).toEqual([])
++    expect(body.meta.total).toBe(0)
++    expect(body.meta.currentPage).toBe(2)
++  })
++})

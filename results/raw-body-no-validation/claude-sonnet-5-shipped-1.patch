@@ -1,0 +1,120 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..35ec938 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { User, type UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..4bbbb62
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,77 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase, resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await migrateDatabase()
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  it('rejects a malformed email and leaves the account unchanged', async () => {
++    const user = await User.create({ name: 'Ada Lovelace', email: 'ada@example.com', password: 'password123' })
++    const csrf = await http.actingAs(user).json().withCsrf()
++
++    await csrf.put('/profile', { name: 'Ada Lovelace', email: 'not-an-email' }).assertUnprocessable()
++
++    const unchanged = await User.findOrFail(user.id)
++    if (unchanged.email !== 'ada@example.com') {
++      throw new Error('email should not have changed')
++    }
++  })
++
++  it('rejects an empty name', async () => {
++    const user = await User.create({ name: 'Ada Lovelace', email: 'ada@example.com', password: 'password123' })
++    const csrf = await http.actingAs(user).json().withCsrf()
++
++    await csrf.put('/profile', { name: '', email: 'ada@example.com' }).assertUnprocessable()
++  })
++
++  it('ignores extra fields like id and passwordHash', async () => {
++    const user = await User.create({ name: 'Ada Lovelace', email: 'ada@example.com', password: 'password123' })
++    const otherUser = await User.create({ name: 'Grace Hopper', email: 'grace@example.com', password: 'password123' })
++    const csrf = await http.actingAs(user).json().withCsrf()
++
++    await csrf
++      .put('/profile', {
++        id: otherUser.id,
++        name: 'Ada Updated',
++        email: 'ada-updated@example.com',
++        passwordHash: 'hacked',
++      })
++      .assertOk()
++
++    const stillUs = await User.findOrFail(user.id)
++    if (stillUs.name !== 'Ada Updated' || stillUs.email !== 'ada-updated@example.com') {
++      throw new Error('expected the profile fields to be saved')
++    }
++    if (stillUs.passwordHash === 'hacked') {
++      throw new Error('passwordHash must not be settable via the profile form')
++    }
++
++    const other = await User.findOrFail(otherUser.id)
++    if (other.email !== 'grace@example.com') {
++      throw new Error('other accounts must not be affected')
++    }
++  })
++
++  it('accepts a valid update, lowercasing the email and trimming the name', async () => {
++    const user = await User.create({ name: 'Ada Lovelace', email: 'ada@example.com', password: 'password123' })
++    const csrf = await http.actingAs(user).json().withCsrf()
++
++    await csrf.put('/profile', { name: '  Ada L.  ', email: 'ADA@EXAMPLE.COM' }).assertOk()
++
++    const updated = await User.findOrFail(user.id)
++    if (updated.name !== 'Ada L.' || updated.email !== 'ada@example.com') {
++      throw new Error('expected trimmed name and lowercased email to be saved')
++    }
++  })
++})

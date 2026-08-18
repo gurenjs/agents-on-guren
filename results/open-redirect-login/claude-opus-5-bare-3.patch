@@ -1,0 +1,141 @@
+diff --git a/README.md b/README.md
+index daca2ea..2ac3ae5 100644
+--- a/README.md
++++ b/README.md
+@@ -53,6 +53,7 @@ Write/Dashboard/Log out controls.
+ - `app/Models/` — ORM models (`Post` belongs to `User`)
+ - `app/Policies/` — authorization rules
+ - `app/Providers/` — the auth model binding, shared page props, and the policy binding
++- `app/Support/` — small shared helpers (e.g. the post-login redirect guard)
+ - `resources/js/pages/` — React pages (rendered via Inertia.js)
+ - `db/schema.ts` — Drizzle table definitions
+ - `db/seeders/` — the demo user and sample posts
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..f873a9f 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -1,11 +1,14 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
++import { DEFAULT_REDIRECT, safeRedirectPath } from '../../../Support/redirect.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+-    const redirect = this.request.query('redirect') ?? ''
++    // Off-site destinations are dropped here too, so the form never carries
++    // one back to store().
++    const redirect = safeRedirectPath(this.request.query('redirect'), '')
+     return this.inertia(pages.auth.Login, { email, redirect }, { title: 'Login' })
+   }
+ 
+@@ -20,8 +23,12 @@ export default class LoginController extends Controller {
+       throw ValidationException.withMessages({ message: 'Invalid credentials.' })
+     }
+ 
+-    // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // Send the user back to the page they were on before signing in. The
++    // destination is attacker-controlled, so only same-app paths survive —
++    // anything pointing at another origin falls back to the default.
++    const destination = redirect || this.request.query('redirect') || DEFAULT_REDIRECT
++
++    return this.redirect(safeRedirectPath(destination))
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Support/redirect.ts b/app/Support/redirect.ts
+new file mode 100644
+index 0000000..e2cb2ce
+--- /dev/null
++++ b/app/Support/redirect.ts
+@@ -0,0 +1,39 @@
++// Where a sign-in goes when no usable `redirect` was supplied.
++export const DEFAULT_REDIRECT = '/dashboard'
++
++// Browsers drop tab, newline and carriage return anywhere inside a URL, so
++// "/\t/evil.example" navigates to //evil.example. Strip them before deciding
++// whether a destination stays inside the app.
++const STRIPPED_BY_BROWSERS = /[\t\n\r]/g
++
++// Any other control character has no business in a redirect target and only
++// serves to confuse the checks below (or the Location header we emit).
++function hasControlCharacter(value: string): boolean {
++  for (const character of value) {
++    const code = character.codePointAt(0) ?? 0
++    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true
++  }
++  return false
++}
++
++/**
++ * Narrows a user-supplied redirect target to a path inside this app.
++ *
++ * Only plain same-app paths are accepted — a single leading slash followed by
++ * the rest of the path. Absolute URLs (they carry a scheme), protocol-relative
++ * values starting with `//`, and backslash variants such as `/\evil.example`
++ * (browsers read `\` as `/`) would all leave our origin, so they fall back to
++ * the default destination instead.
++ */
++export function safeRedirectPath(value: unknown, fallback: string = DEFAULT_REDIRECT): string {
++  if (typeof value !== 'string') return fallback
++
++  const candidate = value.replace(STRIPPED_BY_BROWSERS, '')
++
++  if (!candidate.startsWith('/')) return fallback
++  if (candidate.startsWith('//')) return fallback
++  if (candidate.includes('\\')) return fallback
++  if (hasControlCharacter(candidate)) return fallback
++
++  return candidate
++}
+diff --git a/tests/redirect.test.ts b/tests/redirect.test.ts
+new file mode 100644
+index 0000000..600bc44
+--- /dev/null
++++ b/tests/redirect.test.ts
+@@ -0,0 +1,43 @@
++import { describe, expect, it } from 'bun:test'
++import { DEFAULT_REDIRECT, safeRedirectPath } from '../app/Support/redirect.js'
++
++// The sign-in page takes a `redirect` target straight from the URL, so this
++// guard is what stops /login?redirect=https://evil.example from handing a
++// freshly authenticated user to a look-alike site.
++describe('safeRedirectPath', () => {
++  it('keeps same-app paths', () => {
++    expect(safeRedirectPath('/posts/3/edit')).toBe('/posts/3/edit')
++    expect(safeRedirectPath('/dashboard?tab=drafts#top')).toBe('/dashboard?tab=drafts#top')
++    expect(safeRedirectPath('/')).toBe('/')
++  })
++
++  it('rejects destinations that leave the app', () => {
++    const offSite = [
++      'https://evil.example',
++      'http://evil.example/path',
++      '//evil.example',
++      '/\\evil.example',
++      '\\\\evil.example',
++      '/\t/evil.example',
++      '/\n//evil.example',
++      'javascript:alert(1)',
++      'posts/3',
++      '',
++    ]
++
++    for (const value of offSite) {
++      expect(safeRedirectPath(value)).toBe(DEFAULT_REDIRECT)
++    }
++  })
++
++  it('falls back when nothing usable was supplied', () => {
++    expect(safeRedirectPath(undefined)).toBe(DEFAULT_REDIRECT)
++    expect(safeRedirectPath(null)).toBe(DEFAULT_REDIRECT)
++    expect(safeRedirectPath(['/posts'])).toBe(DEFAULT_REDIRECT)
++  })
++
++  it('honours a caller-supplied fallback', () => {
++    expect(safeRedirectPath('https://evil.example', '')).toBe('')
++    expect(safeRedirectPath('/posts', '')).toBe('/posts')
++  })
++})

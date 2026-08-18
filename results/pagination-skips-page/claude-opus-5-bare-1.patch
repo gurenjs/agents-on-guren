@@ -1,0 +1,120 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..bdbf7ca 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,12 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++import type { PaginatedPageProps } from '@guren/core'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++
++type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +26,88 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// The list is offset-paginated over the real table, so this exercises the
++// database the app boots with (NODE_ENV=test points it at its own SQLite
++// file). Assertions are written against the rows actually present rather
++// than a fixed count, so the seeded posts do not have to be cleared first.
++describe('posts.index pagination', () => {
++  const PER_PAGE = 10
++  let http: TestApp
++  let total: number
++  let newestIds: number[]
++  const createdIds: number[] = []
++
++  async function pageOf(page?: number): Promise<PostsIndexProps> {
++    const path = page === undefined ? '/posts' : `/posts?page=${page}`
++    const response = await http.withHeader('X-Inertia', 'true').get(path).assertOk()
++    const body = (await response.json()) as { props: PostsIndexProps }
++    return body.props
++  }
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    const author = await User.newQuery().orderBy('id', 'asc').firstOrFail()
++    // More than two pages worth, so a page-1 that is really page 2 leaves a
++    // gap instead of merely reordering the list.
++    for (let index = 0; index < 25; index += 1) {
++      const post = await Post.forceCreate({
++        title: `Pagination post ${index + 1}`,
++        excerpt: `Excerpt ${index + 1}`,
++        body: `Body ${index + 1}`,
++        authorId: author.id,
++      })
++      if (post?.id) {
++        createdIds.push(post.id)
++      }
++    }
++
++    total = await Post.newQuery().count()
++    const newest = await Post.newQuery().orderBy('id', 'desc').limit(PER_PAGE * 2).get()
++    newestIds = newest.map((post) => post.id)
++  })
++
++  // The test database file outlives the run, so leave the table as it was
++  // found instead of growing it by 25 rows on every `bun test`.
++  afterAll(async () => {
++    for (const id of createdIds) {
++      await Post.delete({ id })
++    }
++  })
++
++  it('starts at the newest post', async () => {
++    const { data, pagination } = await pageOf()
++
++    expect(data.map((post: PostResourceData) => post.id)).toEqual(newestIds.slice(0, PER_PAGE))
++    expect(pagination.meta.currentPage).toBe(1)
++    expect(pagination.meta.total).toBe(total)
++    expect(pagination.meta.from).toBe(1)
++    expect(pagination.meta.to).toBe(PER_PAGE)
++    expect(pagination.links.pages.find((link) => link.active)?.page).toBe(1)
++    expect(pagination.links.prev).toBeNull()
++  })
++
++  it('treats ?page=1 as the first page and ?page=2 as the next slice', async () => {
++    const first = await pageOf(1)
++    const second = await pageOf(2)
++
++    expect(first.data.map((post: PostResourceData) => post.id)).toEqual(newestIds.slice(0, PER_PAGE))
++    expect(second.data.map((post: PostResourceData) => post.id)).toEqual(newestIds.slice(PER_PAGE))
++    expect(second.pagination.meta.currentPage).toBe(2)
++    expect(second.pagination.meta.from).toBe(PER_PAGE + 1)
++  })
++
++  it('shows every post exactly once across the pager', async () => {
++    const { pagination } = await pageOf()
++    const seen: number[] = []
++
++    for (let page = 1; page <= pagination.meta.lastPage; page += 1) {
++      const { data } = await pageOf(page)
++      seen.push(...data.map((post: PostResourceData) => post.id))
++    }
++
++    expect(seen.length).toBe(total)
++    expect(new Set(seen).size).toBe(total)
++  })
++})

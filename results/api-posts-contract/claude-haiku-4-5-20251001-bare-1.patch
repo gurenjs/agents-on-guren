@@ -1,0 +1,172 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..8743384 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: Array<Data.Post> }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..3c8d3a6 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,7 +3,7 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema, ApiPostsQuerySchema } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -50,6 +50,29 @@ export default class PostController extends Controller {
+     return this.json({ data: PostResource.collection(posts) })
+   }
+ 
++  async indexApi(): Promise<Response> {
++    const { page, author } = this.validateQuery(ApiPostsQuerySchema)
++
++    let query = Post.newQuery().with('author').orderBy('id', 'desc')
++
++    if (author) {
++      query = query.where('authorId', author)
++    }
++
++    const result = await query.paginate({ page, perPage: 10 })
++    const paginator = paginate(result, { path: this.request.path ?? '/api/posts' })
++
++    return this.json({
++      data: result.data.map((post) => new PostResource(post).toJSON()),
++      meta: {
++        currentPage: paginator.currentPage(),
++        lastPage: paginator.lastPage(),
++        perPage: 10,
++        total: paginator.total(),
++      },
++    })
++  }
++
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..2367f5d 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -22,4 +22,9 @@ export const PostPayloadSchema = z.object({
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
++export const ApiPostsQuerySchema = z.object({
++  page: z.coerce.number().int().min(1).default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/routes/api.ts b/routes/api.ts
+new file mode 100644
+index 0000000..9be1cc4
+--- /dev/null
++++ b/routes/api.ts
+@@ -0,0 +1,14 @@
++import type { Router } from '@guren/core'
++import PostController from '../app/Http/Controllers/PostController.js'
++import { PostResource } from '../app/Http/Resources/PostResource.js'
++import { ApiPostsQuerySchema } from '../app/Http/Validators/PostValidator.js'
++
++export function registerApiRoutes(router: Router): void {
++  router.get('/api/posts', {
++    name: 'api.posts.index',
++    query: ApiPostsQuerySchema,
++    resource: {
++      data: [PostResource],
++    },
++  }, [PostController, 'indexApi'])
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..1a05c51 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -4,8 +4,10 @@ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
++import { registerApiRoutes } from './api.js'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
++  registerApiRoutes(baseRouter)
+   // Named rather than inline so `guren audit` can see which routes are
+   // protected — it cannot inspect a middleware passed as a call result.
+   const router = baseRouter
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..45d9dc2 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -20,3 +20,27 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('api.posts.index', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('rejects page=0', async () => {
++    await http.get('/api/posts?page=0').assertStatus(422)
++  })
++
++  it('rejects page=abc', async () => {
++    await http.get('/api/posts?page=abc').assertStatus(422)
++  })
++
++  it('rejects author=abc', async () => {
++    await http.get('/api/posts?author=abc').assertStatus(422)
++  })
++
++  it('rejects author=0', async () => {
++    await http.get('/api/posts?author=0').assertStatus(422)
++  })
++})

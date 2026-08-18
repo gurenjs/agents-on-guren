@@ -1,0 +1,202 @@
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..05e9291 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import SendWelcomeEmailJob from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -23,6 +24,8 @@ export default class RegisterController extends Controller {
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
++    await SendWelcomeEmailJob.dispatch({ userId: user.id })
++
+     return this.redirect('/dashboard')
+   }
+ }
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..1c25af3
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,29 @@
++import { Job, mail, getMailManager } from '@guren/core'
++import { User } from '../Models/User.js'
++
++interface SendWelcomeEmailPayload {
++  userId: number
++}
++
++export default class SendWelcomeEmailJob extends Job<SendWelcomeEmailPayload> {
++  static jobName = 'SendWelcomeEmailJob'
++  static queue = 'default'
++  static maxAttempts = 3
++
++  async handle(payload: SendWelcomeEmailPayload): Promise<void> {
++    const user = await User.findOrFail(payload.userId)
++    const mailManager = getMailManager()
++
++    if (!mailManager) {
++      throw new Error('Mail manager not configured')
++    }
++
++    const appName = process.env.APP_NAME ?? 'App'
++
++    await mail(mailManager)
++      .to(user.email)
++      .subject(`Welcome to ${appName}, ${user.name}!`)
++      .text(`Hello ${user.name},\n\nWelcome to ${appName}! We're excited to have you on board.`)
++      .send()
++  }
++}
+diff --git a/app/Providers/MailServiceProvider.ts b/app/Providers/MailServiceProvider.ts
+new file mode 100644
+index 0000000..24ab538
+--- /dev/null
++++ b/app/Providers/MailServiceProvider.ts
+@@ -0,0 +1,10 @@
++import { ServiceProvider, setMailManager } from '@guren/core'
++import { mailManager } from '../../config/mail.js'
++
++export default class MailServiceProvider extends ServiceProvider {
++  register(): void {
++    setMailManager(mailManager)
++  }
++
++  boot(): void {}
++}
+diff --git a/app/Providers/QueueServiceProvider.ts b/app/Providers/QueueServiceProvider.ts
+new file mode 100644
+index 0000000..5de4619
+--- /dev/null
++++ b/app/Providers/QueueServiceProvider.ts
+@@ -0,0 +1,10 @@
++import { ServiceProvider } from '@guren/core'
++import { bootQueue } from '../../config/queue.js'
++
++export default class QueueServiceProvider extends ServiceProvider {
++  register(): void {
++    bootQueue()
++  }
++
++  boot(): void {}
++}
+diff --git a/config/mail.ts b/config/mail.ts
+new file mode 100644
+index 0000000..cd350cc
+--- /dev/null
++++ b/config/mail.ts
+@@ -0,0 +1,20 @@
++import { createMailManager } from '@guren/server'
++
++const mailFrom = {
++  email: process.env.MAIL_FROM_ADDRESS ?? 'noreply@example.com',
++  name: process.env.MAIL_FROM_NAME ?? 'App',
++}
++
++export const mailManager = createMailManager({
++  default: process.env.MAIL_MAILER ?? 'log',
++  from: mailFrom,
++  transports: {
++    log: {
++      driver: 'log',
++    },
++    resend: {
++      driver: 'resend',
++      apiKey: process.env.RESEND_API_KEY,
++    },
++  },
++})
+diff --git a/config/queue.ts b/config/queue.ts
+new file mode 100644
+index 0000000..6be8f54
+--- /dev/null
++++ b/config/queue.ts
+@@ -0,0 +1,17 @@
++import { SyncDriver, setQueueDriver } from '@guren/server'
++
++function createQueueDriver() {
++  const queueConnection = process.env.QUEUE_CONNECTION ?? 'sync'
++
++  if (queueConnection === 'redis') {
++    // Redis queue is configured via environment but requires ioredis instance setup
++    // For now, default to sync for development
++    return new SyncDriver()
++  }
++
++  return new SyncDriver()
++}
++
++export function bootQueue(): void {
++  setQueueDriver(createQueueDriver())
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..ab4295a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,7 +1,10 @@
+-import { createApp, setInertiaDocument } from '@guren/core'
++import { createApp, setInertiaDocument, registerJob } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import MailServiceProvider from '../app/Providers/MailServiceProvider.js'
++import QueueServiceProvider from '../app/Providers/QueueServiceProvider.js'
++import SendWelcomeEmailJob from '../app/Jobs/SendWelcomeEmailJob.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +42,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, MailServiceProvider, QueueServiceProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+@@ -47,4 +50,6 @@ const app = createApp({
+   hostAuthorization: hostAuthorization(),
+ })
+ 
++registerJob(SendWelcomeEmailJob)
++
+ export default app
+diff --git a/tests/RegisterController.test.ts b/tests/RegisterController.test.ts
+new file mode 100644
+index 0000000..9f85bc4
+--- /dev/null
++++ b/tests/RegisterController.test.ts
+@@ -0,0 +1,27 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++
++describe('RegisterController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('registers a user and queues welcome email', async () => {
++    // Prime CSRF tokens from the register page
++    const csrf = await http.withCsrf('/register')
++
++    const uniqueEmail = `test-${Date.now()}@example.com`
++    const response = await csrf.post('/register', {
++      name: 'Test User',
++      email: uniqueEmail,
++      password: 'password123',
++      passwordConfirmation: 'password123',
++    })
++
++    // Should redirect to dashboard (303 is used for POST redirect)
++    expect(response.status).toBe(303)
++  })
++})

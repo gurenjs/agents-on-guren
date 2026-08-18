@@ -1,0 +1,98 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..86ebb1c 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -2,6 +2,17 @@ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const DEFAULT_REDIRECT = '/dashboard'
++
++// Only same-app paths are safe post-login destinations. Reject anything a
++// browser would treat as pointing off-origin: absolute URLs with a scheme,
++// protocol-relative URLs ("//evil.example"), and the backslash variants
++// ("/\evil.example") browsers normalize the same way.
++function sanitizeRedirect(value: string | undefined | null): string {
++  const trimmed = value?.trim() ?? ''
++  return /^\/(?!\/|\\)/.test(trimmed) ? trimmed : DEFAULT_REDIRECT
++}
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+@@ -21,7 +32,7 @@ export default class LoginController extends Controller {
+     }
+ 
+     // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    return this.redirect(sanitizeRedirect(redirect || this.request.query('redirect')))
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..3f1eb47
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,61 @@
++import { afterAll, beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++
++// Regression coverage for the open-redirect fix in LoginController: the
++// `redirect` param must only ever send a signed-in user to a same-app path.
++describe('login', () => {
++  let http: TestApp
++  const email = 'login-redirect-test@example.com'
++  const password = 'correct-horse-battery-staple'
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await User.create({ name: 'Redirect Test', email, password })
++  })
++
++  afterAll(async () => {
++    await User.delete({ email })
++  })
++
++  it('sends the user to the requested in-app path after signing in', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password, redirect: '/posts/3/edit' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('falls back to the default destination when there is no redirect', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf.post('/login', { email, password }).assertRedirect('/dashboard')
++  })
++
++  it('ignores an absolute URL redirect and uses the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password, redirect: 'https://evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a protocol-relative redirect and uses the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password, redirect: '//evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a backslash redirect variant and uses the default destination', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password, redirect: '/\\evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('rejects an invalid password without signing the user in', async () => {
++    const csrf = await http.withCsrf('/login')
++    await csrf
++      .post('/login', { email, password: 'wrong-password', redirect: '/posts/3/edit' })
++      .assertUnprocessable()
++  })
++})

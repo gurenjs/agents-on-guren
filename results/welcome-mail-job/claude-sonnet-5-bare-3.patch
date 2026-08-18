@@ -1,0 +1,175 @@
+diff --git a/app/Http/Controllers/Auth/RegisterController.ts b/app/Http/Controllers/Auth/RegisterController.ts
+index db0e338..66dd052 100644
+--- a/app/Http/Controllers/Auth/RegisterController.ts
++++ b/app/Http/Controllers/Auth/RegisterController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { RegisterSchema } from '../../Validators/RegisterValidator.js'
+ import { User } from '../../../Models/User.js'
++import { SendWelcomeEmailJob } from '../../../Jobs/SendWelcomeEmailJob.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+ export default class RegisterController extends Controller {
+@@ -23,6 +24,10 @@ export default class RegisterController extends Controller {
+     this.auth.session()?.regenerate()
+     await this.auth.login(user)
+ 
++    // Queued rather than sent inline, so a slow or down mail provider can
++    // never make sign-up hang or fail.
++    await SendWelcomeEmailJob.dispatch({ email: user.email, name: user.name })
++
+     return this.redirect('/dashboard')
+   }
+ }
+diff --git a/app/Jobs/SendWelcomeEmailJob.ts b/app/Jobs/SendWelcomeEmailJob.ts
+new file mode 100644
+index 0000000..1a3a8e7
+--- /dev/null
++++ b/app/Jobs/SendWelcomeEmailJob.ts
+@@ -0,0 +1,25 @@
++import { Job, getMailManager } from '@guren/core'
++import { WelcomeMail } from '../Mail/WelcomeMail.js'
++
++export interface SendWelcomeEmailPayload {
++  email: string
++  name: string
++}
++
++export class SendWelcomeEmailJob extends Job<SendWelcomeEmailPayload> {
++  static override queue = 'default'
++  static override maxAttempts = 3
++
++  async handle({ email, name }: SendWelcomeEmailPayload): Promise<void> {
++    const manager = getMailManager()
++    if (!manager) {
++      throw new Error('Mail manager not configured. Call setMailManager() first.')
++    }
++
++    await new WelcomeMail(manager, { name }).to(email).send()
++  }
++
++  async failed(payload: SendWelcomeEmailPayload, error: Error): Promise<void> {
++    console.error(`SendWelcomeEmailJob failed for ${payload.email}:`, error.message)
++  }
++}
+diff --git a/app/Mail/WelcomeMail.ts b/app/Mail/WelcomeMail.ts
+new file mode 100644
+index 0000000..55316b7
+--- /dev/null
++++ b/app/Mail/WelcomeMail.ts
+@@ -0,0 +1,23 @@
++import { Mail, type MailManager } from '@guren/core'
++
++export interface WelcomeMailData {
++  name: string
++}
++
++export class WelcomeMail extends Mail {
++  constructor(
++    manager: MailManager,
++    public readonly data: WelcomeMailData,
++  ) {
++    super(manager)
++  }
++
++  build(): this {
++    const appName = process.env.APP_NAME ?? 'Guren'
++    const { name } = this.data
++
++    return this
++      .subject(`Welcome to ${appName}, ${name}!`)
++      .text(`Hi ${name},\n\nWelcome to ${appName}! We're glad to have you with us.\n\n— The ${appName} team`)
++  }
++}
+diff --git a/app/Providers/MailProvider.ts b/app/Providers/MailProvider.ts
+new file mode 100644
+index 0000000..ff81839
+--- /dev/null
++++ b/app/Providers/MailProvider.ts
+@@ -0,0 +1,29 @@
++import { ServiceProvider, createMailManager, setMailManager, type MailManager } from '@guren/core'
++
++export default class MailProvider extends ServiceProvider {
++  register(): void {
++    const manager = createMailManager({
++      // MAIL_MAILER=log (dev default) writes messages to the server output;
++      // MAIL_MAILER=resend sends through the Resend API in production.
++      default: process.env.MAIL_MAILER === 'resend' ? 'resend' : 'log',
++      from: {
++        email: process.env.MAIL_FROM_ADDRESS ?? 'hello@example.com',
++        name: process.env.MAIL_FROM_NAME ?? process.env.APP_NAME ?? 'Guren',
++      },
++      transports: {
++        log: { driver: 'log' },
++        resend: { driver: 'resend', apiKey: process.env.RESEND_API_KEY ?? '' },
++      },
++    })
++
++    this.container.instance('mail', manager)
++  }
++
++  boot(): void {
++    // Queued jobs run outside a request/controller context, so they read the
++    // mail manager off this global rather than resolving it from the
++    // container.
++    const manager = this.container.make<MailManager>('mail')
++    setMailManager(manager)
++  }
++}
+diff --git a/app/Providers/QueueProvider.ts b/app/Providers/QueueProvider.ts
+new file mode 100644
+index 0000000..e76b384
+--- /dev/null
++++ b/app/Providers/QueueProvider.ts
+@@ -0,0 +1,29 @@
++import { ServiceProvider, SyncDriver, RedisDriver, createQueueManager, registerJob, type QueueManager } from '@guren/core'
++import { createRedisClient } from '@guren/core/redis'
++import { SendWelcomeEmailJob } from '../Jobs/SendWelcomeEmailJob.js'
++
++export default class QueueProvider extends ServiceProvider {
++  register(): void {
++    const queue = createQueueManager({
++      // QUEUE_CONNECTION=sync (dev default) runs jobs inline on dispatch, no
++      // worker needed; QUEUE_CONNECTION=redis queues them for a separate
++      // `queue:work` process in production.
++      default: process.env.QUEUE_CONNECTION === 'redis' ? 'redis' : 'sync',
++      drivers: {
++        sync: () => new SyncDriver(),
++        redis: () => new RedisDriver(createRedisClient({ url: process.env.REDIS_URL })),
++      },
++    })
++
++    this.container.instance('queue', queue)
++  }
++
++  boot(): void {
++    // Register job classes before resolving the driver — a sync dispatch
++    // runs the job inline, and needs the class in the registry to do it.
++    registerJob(SendWelcomeEmailJob)
++
++    const queue = this.container.make<QueueManager>('queue')
++    queue.driver()
++  }
++}
+diff --git a/src/app.ts b/src/app.ts
+index bee46fb..e179e36 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -2,6 +2,8 @@ import { createApp, setInertiaDocument } from '@guren/core'
+ import DatabaseProvider from '../app/Providers/DatabaseProvider.js'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
++import MailProvider from '../app/Providers/MailProvider.js'
++import QueueProvider from '../app/Providers/QueueProvider.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -39,7 +41,7 @@ function hostAuthorization() {
+ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider],
++  providers: [DatabaseProvider, AuthProvider, AuthorizationProvider, MailProvider, QueueProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().

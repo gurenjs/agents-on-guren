@@ -1,0 +1,105 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..4c547d7 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -2,6 +2,20 @@ import { Controller, ValidationException } from '@guren/core'
+ import { LoginSchema } from '../../Validators/LoginValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const DEFAULT_POST_LOGIN_REDIRECT = '/dashboard'
++
++// Only a same-app path is a safe post-login destination. Anything else —
++// an absolute URL (`https://evil.example`), a protocol-relative URL
++// (`//evil.example`), or a backslash variant (`/\evil.example`, which
++// browsers normalize the same as `//evil.example`) — is rejected in favor
++// of the default, closing the open-redirect reported against this page.
++function resolveSafeRedirect(value: string | null | undefined): string {
++  if (!value || !/^\/(?!\/|\\)/.test(value)) {
++    return DEFAULT_POST_LOGIN_REDIRECT
++  }
++  return value
++}
++
+ export default class LoginController extends Controller {
+   async show(): Promise<Response> {
+     const email = this.request.query('email') ?? ''
+@@ -21,7 +35,7 @@ export default class LoginController extends Controller {
+     }
+ 
+     // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    return this.redirect(resolveSafeRedirect(redirect || this.request.query('redirect')))
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..d5c44f1
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,65 @@
++import { beforeAll, beforeEach, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase, resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// Regression coverage for the open-redirect report: `redirect` must only be
++// honored when it is a same-app path. Absolute URLs, protocol-relative URLs,
++// and backslash variants are all attacker-controlled ways to leave the site
++// from a link that otherwise starts on our own domain.
++describe('login.store redirect handling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    await migrateDatabase()
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    await User.create({ name: 'Ada', email: 'ada@example.com', password: 'correct-horse' })
++  })
++
++  it('redirects to a same-app path passed via redirect', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct-horse', redirect: '/posts/3/edit' })
++      .assertRedirect('/posts/3/edit')
++  })
++
++  it('falls back to the default destination with no redirect value', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct-horse' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores an absolute URL redirect', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct-horse', redirect: 'https://evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a protocol-relative redirect', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct-horse', redirect: '//evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('ignores a backslash-variant redirect', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'correct-horse', redirect: '/\\evil.example' })
++      .assertRedirect('/dashboard')
++  })
++
++  it('still rejects a wrong password even with a malicious redirect', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', { email: 'ada@example.com', password: 'wrong-password', redirect: 'https://evil.example' })
++      .assertUnprocessable()
++  })
++})

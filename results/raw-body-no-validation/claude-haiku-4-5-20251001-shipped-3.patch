@@ -1,0 +1,334 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..f0bcd26 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,20 +24,20 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
+-    const emailChanged = email !== user.email
++    const input = await this.validateBody(ProfileUpdateSchema)
++    const { password, ...updateData } = input
++    const emailChanged = updateData.email !== user.email
+ 
+     if (emailChanged) {
+-      const existing = await User.where({ email })
++      const existing = await User.where({ email: updateData.email })
+       const conflict = existing.find((candidate) => candidate.id !== user.id)
+       if (conflict) {
+         throw ValidationException.withMessages({ email: 'Email is already in use.' })
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      ...updateData,
+       ...(password ? { password } : {}),
+     })
+ 
+@@ -48,7 +47,7 @@ export default class ProfileController extends Controller {
+     }
+ 
+     return this.inertia(pages.profile.Edit, {
+-      profile: { name, email },
++      profile: { name: updateData.name, email: updateData.email },
+       status: 'Profile updated successfully.',
+     }, { title: 'Profile' })
+   }
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..70d775e 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,6 +3,7 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { ProfileUpdateSchema } from '../app/Http/Validators/ProfileValidator.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+@@ -17,6 +18,6 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+     authed.post('/logout', [LoginController, 'destroy']).name('logout')
+     authed.get('/dashboard', [DashboardController, 'index']).name('dashboard')
+     authed.get('/profile', [ProfileController, 'edit']).name('profile.edit')
+-    authed.put('/profile', [ProfileController, 'update']).name('profile.update')
++    authed.put('/profile', { name: 'profile.update', body: ProfileUpdateSchema }, [ProfileController, 'update'])
+   })
+ }
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..10c9580
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,257 @@
++import { beforeAll, describe, it, expect, afterEach } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { resetDatabase } from '../config/database.js'
++
++describe('ProfileController', () => {
++  let http: TestApp
++  let testUser: any
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  afterEach(async () => {
++    await resetDatabase()
++  })
++
++  it('edit renders profile page for authenticated user', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    await http.actingAs(testUser).get('/profile').assertOk()
++  })
++
++  it('update with valid data succeeds', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'newemail@example.com',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.name).toBe('Updated Name')
++    expect(updated?.email).toBe('newemail@example.com')
++  })
++
++  it('update rejects invalid email', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'not-an-email',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.email.0', 'Enter a valid email address.')
++
++    const unchanged = await User.find(testUser.id)
++    expect(unchanged?.email).toBe('test@example.com')
++  })
++
++  it('update rejects empty name', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: '',
++        email: 'test@example.com',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.name.0', 'Name is required.')
++
++    const unchanged = await User.find(testUser.id)
++    expect(unchanged?.name).toBe('Test User')
++  })
++
++  it('update lowercases email', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'NewEmail@EXAMPLE.COM',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.email).toBe('newemail@example.com')
++  })
++
++  it('update with password changes password', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'test@example.com',
++        password: 'newpassword123',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.name).toBe('Updated Name')
++  })
++
++  it('update rejects password shorter than 8 characters', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'test@example.com',
++        password: 'short',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.password.0', 'Password must be at least 8 characters.')
++
++    const unchanged = await User.find(testUser.id)
++    expect(unchanged?.name).toBe('Test User')
++  })
++
++  it('update ignores extra fields like id', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'newemail@example.com',
++        id: 99999,
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.id).toBe(testUser.id)
++    expect(updated?.name).toBe('Updated Name')
++    expect(updated?.email).toBe('newemail@example.com')
++  })
++
++  it('update ignores extra fields like passwordHash', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const originalHash = testUser.passwordHash
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'test@example.com',
++        passwordHash: 'fake-hash-value',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.passwordHash).toBe(originalHash)
++    expect(updated?.name).toBe('Updated Name')
++  })
++
++  it('update rejects duplicate email', async () => {
++    const user1 = await User.create({
++      name: 'User One',
++      email: 'user1@example.com',
++      password: 'password123',
++    })
++    const user2 = await User.create({
++      name: 'User Two',
++      email: 'user2@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(user2).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: 'User Two',
++        email: 'user1@example.com',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.email.0', 'Email is already in use.')
++
++    const unchanged = await User.find(user2.id)
++    expect(unchanged?.email).toBe('user2@example.com')
++  })
++
++  it('update trims whitespace from name', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: '  Trimmed Name  ',
++        email: 'test@example.com',
++      })
++      .assertOk()
++
++    const updated = await User.find(testUser.id)
++    expect(updated?.name).toBe('Trimmed Name')
++  })
++
++  it('update rejects name longer than 120 characters', async () => {
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++
++    const longName = 'a'.repeat(121)
++    const csrf = await http.actingAs(testUser).withCsrf()
++    await csrf
++      .put('/profile', {
++        name: longName,
++        email: 'test@example.com',
++      })
++      .assertUnprocessable()
++      .assertJsonPath('errors.name.0', 'Name must be 120 characters or fewer.')
++
++    const unchanged = await User.find(testUser.id)
++    expect(unchanged?.name).toBe('Test User')
++  })
++})

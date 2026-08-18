@@ -1,0 +1,174 @@
+diff --git a/app/Http/Controllers/HealthController.ts b/app/Http/Controllers/HealthController.ts
+new file mode 100644
+index 0000000..87e1349
+--- /dev/null
++++ b/app/Http/Controllers/HealthController.ts
+@@ -0,0 +1,15 @@
++import { Controller } from '@guren/core'
++import { getDatabase } from '../../../config/database.js'
++import { checkDatabaseHealth, type HealthCheckConnection } from '../Health.js'
++
++export default class HealthController extends Controller {
++  async index(): Promise<Response> {
++    const db = await checkDatabaseHealth(async () => (await getDatabase()) as HealthCheckConnection)
++    const healthy = db.status === 'ok'
++
++    return this.json(
++      { status: healthy ? 'ok' : 'error', checks: { db } },
++      { status: healthy ? 200 : 503 },
++    )
++  }
++}
+diff --git a/app/Http/Health.ts b/app/Http/Health.ts
+new file mode 100644
+index 0000000..d341acd
+--- /dev/null
++++ b/app/Http/Health.ts
+@@ -0,0 +1,61 @@
++import { sql } from 'drizzle-orm'
++
++export type HealthCheckStatus = 'ok' | 'error'
++
++export interface HealthCheckResult {
++  status: HealthCheckStatus
++  latencyMs: number
++  message?: string
++}
++
++/** Minimal shape `/health` needs from a drizzle database handle. */
++export interface HealthCheckConnection {
++  get(query: unknown): Promise<unknown>
++}
++
++const DEFAULT_TIMEOUT_MS = 5000
++
++/**
++ * Runs a cheap round trip against the database — not a cached flag — so a
++ * probe always reflects whether the database is reachable right now. Never
++ * throws: a failed query, a failed connection, or a hang past `timeoutMs`
++ * all resolve to `{ status: 'error' }` so the caller can turn that into a
++ * 503 instead of an unhandled 500.
++ */
++export async function checkDatabaseHealth(
++  connect: () => Promise<HealthCheckConnection>,
++  timeoutMs = DEFAULT_TIMEOUT_MS,
++): Promise<HealthCheckResult> {
++  const startedAt = performance.now()
++
++  try {
++    await withTimeout(connect().then((db) => db.get(sql`select 1`)), timeoutMs)
++    return { status: 'ok', latencyMs: elapsedMs(startedAt) }
++  } catch (error) {
++    return {
++      status: 'error',
++      latencyMs: elapsedMs(startedAt),
++      message: error instanceof Error ? error.message : String(error),
++    }
++  }
++}
++
++function elapsedMs(startedAt: number): number {
++  return Math.round(performance.now() - startedAt)
++}
++
++function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error(`database check timed out after ${ms}ms`)), ms)
++    promise.then(
++      (value) => {
++        clearTimeout(timer)
++        resolve(value)
++      },
++      (error) => {
++        clearTimeout(timer)
++        reject(error)
++      },
++    )
++  })
++}
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..9252c29 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,4 +1,5 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
++import HealthController from '../app/Http/Controllers/HealthController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+@@ -14,8 +15,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+-  // Health check endpoint for load balancers and uptime monitors
+-  router.get('/health', (c) => c.json({ status: 'ok' }))
++  // Health check endpoint for load balancers and uptime monitors. Runs a
++  // real database round trip on every probe (see HealthController) so a
++  // deploy with an unreachable database gets drained instead of staying in
++  // rotation.
++  router.get('/health', [HealthController, 'index'])
+ 
+   registerAuthRoutes(router)
+ 
+diff --git a/tests/Health.test.ts b/tests/Health.test.ts
+new file mode 100644
+index 0000000..95a0e38
+--- /dev/null
++++ b/tests/Health.test.ts
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from 'bun:test'
++import { checkDatabaseHealth } from '../app/Http/Health.js'
++
++describe('checkDatabaseHealth', () => {
++  it('reports ok when the round trip succeeds', async () => {
++    const result = await checkDatabaseHealth(async () => ({ get: async () => ({ 1: 1 }) }))
++
++    expect(result.status).toBe('ok')
++    expect(result.message).toBeUndefined()
++  })
++
++  it('reports error when the query throws', async () => {
++    const result = await checkDatabaseHealth(async () => ({
++      get: async () => {
++        throw new Error('connection refused')
++      },
++    }))
++
++    expect(result.status).toBe('error')
++    expect(result.message).toContain('connection refused')
++  })
++
++  it('reports error when the connection cannot be opened', async () => {
++    const result = await checkDatabaseHealth(async () => {
++      throw new Error('ECONNREFUSED')
++    })
++
++    expect(result.status).toBe('error')
++  })
++
++  it('reports error when the query hangs past the timeout', async () => {
++    const result = await checkDatabaseHealth(
++      async () => ({ get: () => new Promise<unknown>(() => {}) }),
++      20,
++    )
++
++    expect(result.status).toBe('error')
++    expect(result.message).toContain('timed out')
++  })
++})
+diff --git a/tests/HomeController.test.ts b/tests/HomeController.test.ts
+index a051255..43a9499 100644
+--- a/tests/HomeController.test.ts
++++ b/tests/HomeController.test.ts
+@@ -15,6 +15,10 @@ describe('app', () => {
+   })
+ 
+   it('answers the health check', async () => {
+-    await http.get('/health').assertOk()
++    await http
++      .get('/health')
++      .assertOk()
++      .assertJsonPath('status', 'ok')
++      .assertJsonPath('checks.db.status', 'ok')
+   })
+ })

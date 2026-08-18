@@ -1,0 +1,210 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..62b058b 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,6 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { ExcerptService } from '../../Services/ExcerptService.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -68,9 +69,10 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const data = await this.validateBody(PostPayloadSchema)
++    const excerpt = data.excerpt || ExcerptService.derive(data.body)
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({ ...data, excerpt, authorId: author.id })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +93,8 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const data = await this.validateBody(PostPayloadSchema)
+-    await Post.update({ id: post.id }, data)
++    const excerpt = data.excerpt || ExcerptService.derive(data.body)
++    await Post.update({ id: post.id }, { ...data, excerpt })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..2acef16 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -18,7 +18,7 @@ export const PostSearchSchema = z.object({
+ 
+ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++  excerpt: z.string().trim().optional().default('').pipe(z.string().max(500, 'Excerpt must be 500 characters or fewer.')),
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
+diff --git a/app/Services/ExcerptService.ts b/app/Services/ExcerptService.ts
+new file mode 100644
+index 0000000..2e5a291
+--- /dev/null
++++ b/app/Services/ExcerptService.ts
+@@ -0,0 +1,28 @@
++export class ExcerptService {
++  static derive(body: string): string {
++    const trimmed = body.trim()
++
++    if (trimmed.length <= 140) {
++      return trimmed
++    }
++
++    const first140 = trimmed.slice(0, 140)
++    const char141 = trimmed.charAt(140)
++
++    let keepCount = 140
++    if (char141 && !/\s/.test(char141)) {
++      let lastWhitespace = -1
++      for (let i = first140.length - 1; i >= 0; i--) {
++        if (/\s/.test(first140.charAt(i))) {
++          lastWhitespace = i
++          break
++        }
++      }
++      if (lastWhitespace !== -1) {
++        keepCount = lastWhitespace
++      }
++    }
++
++    return first140.slice(0, keepCount).trimEnd() + '…'
++  }
++}
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..3c3b801 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -44,9 +44,12 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
++              placeholder="Derived from body if not provided"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
+               className={fieldClass}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..6f24567 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -36,9 +36,12 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
++              placeholder="Derived from body if not provided"
+               value={form.data.excerpt}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
+               className={fieldClass}
+diff --git a/tests/ExcerptService.test.ts b/tests/ExcerptService.test.ts
+new file mode 100644
+index 0000000..5a646dd
+--- /dev/null
++++ b/tests/ExcerptService.test.ts
+@@ -0,0 +1,87 @@
++import { describe, it } from 'bun:test'
++import { expect } from 'bun:test'
++import { ExcerptService } from '../app/Services/ExcerptService.js'
++
++describe('ExcerptService.derive', () => {
++  it('returns the whole body if 140 characters or fewer', () => {
++    const body = 'Short body'
++    const result = ExcerptService.derive(body)
++    expect(result).toBe('Short body')
++  })
++
++  it('returns the whole body without ellipsis if exactly 140 characters', () => {
++    const body = 'a'.repeat(140)
++    const result = ExcerptService.derive(body)
++    expect(result).toBe('a'.repeat(140))
++  })
++
++  it('trims leading and trailing whitespace from body', () => {
++    const body = '   Short body   '
++    const result = ExcerptService.derive(body)
++    expect(result).toBe('Short body')
++  })
++
++  it('works example 1: cut lands inside a word', () => {
++    const body =
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown'
++    const result = ExcerptService.derive(body)
++    expect(result).toBe(
++      'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The…'
++    )
++    expect(result.length).toBe(139)
++  })
++
++  it('works example 2: cut lands exactly on a word boundary', () => {
++    const body =
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right at a space, then adds a mark.'
++    const result = ExcerptService.derive(body)
++    expect(result).toBe(
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right…'
++    )
++    expect(result.length).toBe(141)
++  })
++
++  it('handles body with no whitespace in first 140 chars', () => {
++    const body = 'a'.repeat(140) + 'b more text'
++    const result = ExcerptService.derive(body)
++    expect(result).toBe('a'.repeat(140) + '…')
++  })
++
++  it('appends ellipsis when truncating a sentence', () => {
++    const body =
++      'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam.'
++    const result = ExcerptService.derive(body)
++    expect(result.length).toBeLessThanOrEqual(141)
++    expect(result.endsWith('…')).toBe(true)
++  })
++
++  it('does not append ellipsis when body fits in 140 chars', () => {
++    const body = 'Short body here.'
++    const result = ExcerptService.derive(body)
++    expect(result.endsWith('…')).toBe(false)
++  })
++
++  it('handles long text with tabs as whitespace', () => {
++    const body =
++      'The quick brown fox\tjumps over the lazy dog and continues for much longer with tabs and more text and even more material here for sure now going on.'
++    const result = ExcerptService.derive(body)
++    expect(result).toContain('fox')
++    expect(result.endsWith('…')).toBe(true)
++  })
++
++  it('handles long text with newlines as whitespace', () => {
++    const body =
++      'The quick brown fox\njumps over the lazy dog and continues for much longer with newlines and additional text to exceed limit and more text still.'
++    const result = ExcerptService.derive(body)
++    expect(result).toContain('fox')
++    expect(result.endsWith('…')).toBe(true)
++  })
++
++  it('trims trailing whitespace before appending ellipsis', () => {
++    const body =
++      'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam   '
++    const result = ExcerptService.derive(body)
++    expect(result.endsWith('…')).toBe(true)
++    expect(/\s…/.test(result)).toBe(false)
++  })
++})

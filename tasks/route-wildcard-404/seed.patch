@@ -1,0 +1,114 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..e6fc91a 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -34,6 +34,10 @@ export interface ApiRoutes {
+     method: 'POST'
+     path: '/logout'
+   }
++  'posts.archive': {
++    method: 'GET'
++    path: '/posts/archive/:date*'
++  }
+   'posts.create': {
+     method: 'GET'
+     path: '/posts/create'
+@@ -308,6 +312,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..f8b71ee 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,6 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
++  'posts.archive': { method: 'GET', path: '/posts/archive/:date*' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+@@ -77,6 +78,7 @@ export const routes = {
+   ),
+   logout: (query?: RouteQuery) => route('logout', query),
+   posts: {
++    archive: (params: RouteParams<'posts.archive'>, query?: RouteQuery) => route('posts.archive', params, query),
+     create: (query?: RouteQuery) => route('posts.create', query),
+     destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
+     edit: (params: RouteParams<'posts.edit'>, query?: RouteQuery) => route('posts.edit', params, query),
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..d15bcbb 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,7 +3,13 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import {
++  ArchiveParamSchema,
++  PostIdParamSchema,
++  PostPayloadSchema,
++  PostSearchSchema,
++  ListPostsQuerySchema,
++} from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -50,6 +56,23 @@ export default class PostController extends Controller {
+     return this.json({ data: PostResource.collection(posts) })
+   }
+ 
++  // Monthly / yearly archive as JSON: `{ data: [...] }` of the posts created in
++  // that period, newest first. `created_at` is stored as an ISO 8601 string, so
++  // a `YYYY-MM-` (or `YYYY-`) prefix match selects the period without parsing.
++  async archive(): Promise<Response> {
++    const { date } = this.validateParams(ArchiveParamSchema)
++    const [year, month] = date.split('/')
++    const prefix = month ? `${year}-${month.padStart(2, '0')}-` : `${year}-`
++
++    const posts = await Post.newQuery()
++      .with('author')
++      .where('createdAt', 'like', `${prefix}%`)
++      .orderBy('id', 'desc')
++      .get()
++
++    return this.json({ data: PostResource.collection(posts) })
++  }
++
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..83d0495 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -23,3 +23,9 @@ export const PostPayloadSchema = z.object({
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
++
++// The archive route captures everything after /posts/archive/ into one `date`
++// param: "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
++export const ArchiveParamSchema = z.object({
++  date: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
++})
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..480678a 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -30,6 +30,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+     })
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
++    // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
++    // Registered before '/:id', or "archive" is read as a post id.
++    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its

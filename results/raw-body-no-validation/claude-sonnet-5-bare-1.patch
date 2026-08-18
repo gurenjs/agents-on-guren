@@ -1,0 +1,138 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..35ec938 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { User, type UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..ba1c0ad
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,95 @@
++import { afterAll, beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    user = await User.create({
++      name: 'Original Name',
++      email: `profile-test-${crypto.randomUUID()}@example.com`,
++      password: 'original-password',
++    })
++  })
++
++  afterAll(async () => {
++    await User.delete({ id: user.id })
++  })
++
++  it('rejects a malformed email and leaves the account unchanged', async () => {
++    const authed = http.actingAs(user)
++    const csrf = await authed.withCsrf()
++
++    await csrf.put('/profile', { name: 'Still Fine', email: 'not-an-email' }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    if (stored?.email !== user.email) {
++      throw new Error(`expected email to remain ${user.email}, got ${stored?.email}`)
++    }
++  })
++
++  it('rejects an empty name and leaves the account unchanged', async () => {
++    const authed = http.actingAs(user)
++    const csrf = await authed.withCsrf()
++
++    await csrf.put('/profile', { name: '', email: user.email }).assertStatus(422)
++
++    const stored = await User.find(user.id)
++    if (stored?.name !== user.name) {
++      throw new Error(`expected name to remain ${user.name}, got ${stored?.name}`)
++    }
++  })
++
++  it('ignores fields outside the profile form, such as id and passwordHash', async () => {
++    const authed = http.actingAs(user)
++    const csrf = await authed.withCsrf()
++    const originalHash = user.passwordHash
++
++    await csrf
++      .put('/profile', {
++        id: user.id + 999,
++        name: 'Updated Name',
++        email: user.email,
++        passwordHash: 'attacker-controlled-hash',
++      })
++      .assertStatus(200)
++
++    const stored = await User.find(user.id)
++    if (!stored) {
++      throw new Error('user row went missing after update')
++    }
++    if (stored.name !== 'Updated Name') {
++      throw new Error(`expected name to be updated, got ${stored.name}`)
++    }
++    if (stored.passwordHash !== originalHash) {
++      throw new Error('passwordHash was overwritten by an unrelated field in the request body')
++    }
++
++    const other = await User.find(user.id + 999)
++    if (other) {
++      throw new Error('a request body id field was able to affect a different row')
++    }
++
++    user = stored
++  })
++
++  it('accepts a valid update', async () => {
++    const authed = http.actingAs(user)
++    const csrf = await authed.withCsrf()
++
++    await csrf
++      .put('/profile', { name: 'Valid Name', email: user.email })
++      .assertStatus(200)
++
++    const stored = await User.find(user.id)
++    if (stored?.name !== 'Valid Name') {
++      throw new Error(`expected name to be Valid Name, got ${stored?.name}`)
++    }
++
++    user = stored
++  })
++})

@@ -1,0 +1,101 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 9b11d8d..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -13,7 +13,7 @@ export default class PostController extends Controller {
+     const result = await Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .paginate({ page: page + 1, perPage: 10 })
++      .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..f34ae02 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,19 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++interface IndexResponseBody {
++  props: {
++    data: { id: number }[]
++    pagination: {
++      meta: { currentPage: number; total: number; from: number | null; to: number | null; lastPage: number }
++      links: { prev: string | null; next: string | null }
++    }
++  }
++}
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +33,62 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.index', () => {
++  let http: TestApp
++  let postIds: number[] // newest first
++
++  beforeAll(async () => {
++    await resetDatabase()
++    const author = await User.forceCreate({ name: 'Author', email: 'author@example.com', password: 'password' })
++    const created: number[] = []
++    for (let i = 1; i <= 25; i++) {
++      const post = await Post.forceCreate({ title: `Post ${i}`, excerpt: 'excerpt', body: 'body', authorId: author.id })
++      created.push(post.id as number)
++    }
++    postIds = [...created].reverse() // newest (highest id) first
++    http = await TestApp.fromApp(app)
++  })
++
++  async function getPage(page?: number): Promise<IndexResponseBody> {
++    const path = page === undefined ? '/posts' : `/posts?page=${page}`
++    const res = await http.withHeader('X-Inertia', 'true').get(path).assertOk()
++    return res.json<IndexResponseBody>()
++  }
++
++  it('page 1 (default, no ?page) shows the 10 newest posts with correct pager metadata', async () => {
++    const body = await getPage()
++    expect(body.props.data.map((post) => post.id)).toEqual(postIds.slice(0, 10))
++    expect(body.props.pagination.meta).toMatchObject({ currentPage: 1, total: 25, from: 1, to: 10, lastPage: 3 })
++    expect(body.props.pagination.links.prev).toBeNull()
++    expect(body.props.pagination.links.next).not.toBeNull()
++  })
++
++  it('?page=1 matches the default request', async () => {
++    const body = await getPage(1)
++    expect(body.props.data.map((post) => post.id)).toEqual(postIds.slice(0, 10))
++    expect(body.props.pagination.meta.currentPage).toBe(1)
++  })
++
++  it('?page=2 shows the next 10 posts', async () => {
++    const body = await getPage(2)
++    expect(body.props.data.map((post) => post.id)).toEqual(postIds.slice(10, 20))
++    expect(body.props.pagination.meta).toMatchObject({ currentPage: 2, total: 25, from: 11, to: 20, lastPage: 3 })
++    expect(body.props.pagination.links.prev).not.toBeNull()
++    expect(body.props.pagination.links.next).not.toBeNull()
++  })
++
++  it('?page=3 shows the remaining 5 posts and is the last page', async () => {
++    const body = await getPage(3)
++    expect(body.props.data.map((post) => post.id)).toEqual(postIds.slice(20, 25))
++    expect(body.props.pagination.meta).toMatchObject({ currentPage: 3, total: 25, from: 21, to: 25, lastPage: 3 })
++    expect(body.props.pagination.links.next).toBeNull()
++  })
++
++  it('every post appears exactly once across pages 1-3', async () => {
++    const [page1, page2, page3] = await Promise.all([getPage(1), getPage(2), getPage(3)])
++    const seenIds = [...page1.props.data, ...page2.props.data, ...page3.props.data].map((post) => post.id)
++    expect(new Set(seenIds).size).toBe(25)
++    expect(seenIds.sort((a, b) => a - b)).toEqual([...postIds].sort((a, b) => a - b))
++  })
++})

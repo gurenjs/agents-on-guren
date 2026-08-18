@@ -1,0 +1,237 @@
+diff --git a/app/Http/Controllers/Auth/LoginController.ts b/app/Http/Controllers/Auth/LoginController.ts
+index 6d3bac0..d62452e 100644
+--- a/app/Http/Controllers/Auth/LoginController.ts
++++ b/app/Http/Controllers/Auth/LoginController.ts
+@@ -21,7 +21,8 @@ export default class LoginController extends Controller {
+     }
+ 
+     // Send the user back to the page they were on before signing in.
+-    return this.redirect(redirect || this.request.query('redirect') || '/dashboard')
++    // redirect has already been validated to be a safe same-origin path.
++    return this.redirect(redirect || '/dashboard')
+   }
+ 
+   async destroy(): Promise<Response> {
+diff --git a/app/Http/Utils/isSafeRedirectUrl.ts b/app/Http/Utils/isSafeRedirectUrl.ts
+new file mode 100644
+index 0000000..ae60c11
+--- /dev/null
++++ b/app/Http/Utils/isSafeRedirectUrl.ts
+@@ -0,0 +1,29 @@
++export function isSafeRedirectUrl(url: string): boolean {
++  if (!url) {
++    return true
++  }
++
++  // Reject protocol-relative URLs (//example.com)
++  if (url.startsWith('//')) {
++    return false
++  }
++
++  // Reject backslash variants that browsers treat as protocol-relative
++  // Browsers treat /\ and similar patterns as //, allowing open redirects
++  if (url.startsWith('/\\')) {
++    return false
++  }
++
++  // Reject URLs with schemes (http://, https://, ftp://, etc.)
++  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
++    return false
++  }
++
++  // Only allow relative paths starting with /
++  if (url.startsWith('/')) {
++    return true
++  }
++
++  // Allow relative paths like "posts/1" but not "//example.com" or things with backslashes
++  return !url.includes('//') && !url.includes('\\')
++}
+diff --git a/app/Http/Validators/LoginValidator.ts b/app/Http/Validators/LoginValidator.ts
+index 501c70d..8cccec2 100644
+--- a/app/Http/Validators/LoginValidator.ts
++++ b/app/Http/Validators/LoginValidator.ts
+@@ -1,4 +1,5 @@
+ import { z } from 'zod'
++import { isSafeRedirectUrl } from '../Utils/isSafeRedirectUrl.js'
+ 
+ export const LoginSchema = z.object({
+   // Lowercased to match how registration stores emails — a case-sensitive
+@@ -23,8 +24,12 @@ export const LoginSchema = z.object({
+     .transform((value) => Boolean(value))
+     .default(false),
+   // Where to send the user after a successful sign-in (e.g. the page that
+-  // asked them to log in). Empty means the default destination.
+-  redirect: z.string().optional(),
++  // asked them to log in). Empty means the default destination. Only same-origin
++  // paths are allowed to prevent open redirect attacks.
++  redirect: z
++    .string()
++    .refine((url) => isSafeRedirectUrl(url), 'Invalid redirect URL.')
++    .optional(),
+ })
+ 
+ export type LoginInput = z.infer<typeof LoginSchema>
+diff --git a/tests/LoginController.test.ts b/tests/LoginController.test.ts
+new file mode 100644
+index 0000000..e232cde
+--- /dev/null
++++ b/tests/LoginController.test.ts
+@@ -0,0 +1,157 @@
++import { beforeAll, describe, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { resetDatabase } from '../config/database.js'
++
++describe('LoginController', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++  })
++
++  describe('open redirect protection', () => {
++    beforeAll(async () => {
++      // Create a test user for authentication attempts
++      await User.create({
++        name: 'Test User',
++        email: 'test@example.com',
++        password: 'password123',
++      })
++    })
++
++    it('allows redirects to internal paths after successful login', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '/posts/3/edit',
++        })
++        .assertRedirect('/posts/3/edit')
++    })
++
++    it('allows redirects to root path', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '/',
++        })
++        .assertRedirect('/')
++    })
++
++    it('rejects redirects to external domains', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: 'https://evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects protocol-relative URLs', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '//evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects backslash protocol-relative variants', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '/\\evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects double backslash variants', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '/\\\\evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects URLs with http scheme', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: 'http://evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects URLs with ftp scheme', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: 'ftp://evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('allows empty redirect and redirects to dashboard', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: '',
++        })
++        .assertRedirect('/dashboard')
++    })
++
++    it('still rejects redirect validation error even with valid credentials', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: 'https://evil.example.com',
++        })
++        .assertStatus(422)
++    })
++
++    it('rejects login with invalid credentials regardless of redirect validity', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'wrongpassword',
++          redirect: '/dashboard',
++        })
++        .assertStatus(422)
++    })
++
++    it('accepts relative paths without leading slash', async () => {
++      const csrf = await http.withCsrf()
++      await csrf
++        .post('/login', {
++          email: 'test@example.com',
++          password: 'password123',
++          redirect: 'posts/3',
++        })
++        .assertRedirect('posts/3')
++    })
++  })
++})

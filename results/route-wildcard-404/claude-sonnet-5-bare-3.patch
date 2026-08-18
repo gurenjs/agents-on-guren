@@ -1,0 +1,104 @@
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..58e7c14 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -31,8 +31,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
++    // `{.+}` is Hono's syntax for a param that may itself contain slashes —
++    // `:date*` is not; it registers a param literally named "date*" that only
++    // ever matches one path segment.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:date{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..131e3ee 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,8 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, afterAll, describe, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +22,72 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++// The archive route captures /posts/archive/<year> and /posts/archive/<year>/<month>
++// into one `date` param that may contain a slash — Hono's `:date{.+}` syntax,
++// not the `:date*` this repo shipped with (which registers a single-segment
++// param literally named "date*" and 404s on the two-segment form). Posts are
++// created in 2010, a year no seeder or other test touches, to keep counts
++// deterministic without needing to isolate the whole database.
++describe('posts.archive', () => {
++  let http: TestApp
++  const postIds: number[] = []
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    const author = await User.first({ email: 'demo@example.com' })
++    if (!author) {
++      throw new Error('Expected the demo user seeder to have run before this test.')
++    }
++
++    for (const [title, createdAt] of [
++      ['Archive test: May 1', '2010-05-03T10:00:00.000Z'],
++      ['Archive test: May 2', '2010-05-20T10:00:00.000Z'],
++      ['Archive test: June 1', '2010-06-01T10:00:00.000Z'],
++    ] as const) {
++      const post = await Post.forceCreate({
++        title,
++        excerpt: 'Fixture post for posts.archive tests.',
++        body: 'Fixture post for posts.archive tests.',
++        authorId: author.id,
++        createdAt,
++      })
++      postIds.push(post.id)
++    }
++  })
++
++  afterAll(async () => {
++    for (const id of postIds) {
++      await Post.delete({ id })
++    }
++  })
++
++  it('lists posts created in a given month, zero-padded', async () => {
++    await http
++      .get('/posts/archive/2010/05')
++      .assertOk()
++      .assertJsonCount(2, 'data')
++      .assertJsonPath('data.0.title', 'Archive test: May 2')
++      .assertJsonPath('data.1.title', 'Archive test: May 1')
++  })
++
++  it('lists posts created in a given month, without the leading zero', async () => {
++    await http.get('/posts/archive/2010/5').assertOk().assertJsonCount(2, 'data')
++  })
++
++  it('lists every post created in a given year', async () => {
++    await http
++      .get('/posts/archive/2010')
++      .assertOk()
++      .assertJsonCount(3, 'data')
++      .assertJsonPath('data.0.title', 'Archive test: June 1')
++  })
++
++  it('returns an empty list for a period with no posts', async () => {
++    await http.get('/posts/archive/2011').assertOk().assertJson({ data: [] })
++  })
++
++  it('rejects a month outside 1-12', async () => {
++    await http.get('/posts/archive/2010/13').assertStatus(422)
++  })
++})

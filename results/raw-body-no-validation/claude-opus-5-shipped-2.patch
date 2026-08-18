@@ -1,0 +1,135 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..043e08d
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,92 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++// profile.update runs the request body through ProfileUpdateSchema, so unknown
++// keys are stripped before the record is written and User.update() applies the
++// fillable allowlist on top of that — `id` and `passwordHash` can never be
++// mass-assigned from the form.
++describe('profile.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function createUser() {
++    return await User.create({
++      name: 'Ada Lovelace',
++      email: 'ada@example.com',
++      password: 'secret-password',
++    })
++  }
++
++  it('rejects a badly formatted email', async () => {
++    const user = await createUser()
++
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'Ada Lovelace', email: 'not-an-email', password: '' })
++      .assertUnprocessable()
++
++    const unchanged = await User.findOrFail(user.id)
++    expect(unchanged.email).toBe('ada@example.com')
++  })
++
++  it('rejects an empty name', async () => {
++    const user = await createUser()
++
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .json()
++      .put('/profile', { name: '   ', email: 'ada@example.com', password: '' })
++      .assertUnprocessable()
++
++    const unchanged = await User.findOrFail(user.id)
++    expect(unchanged.name).toBe('Ada Lovelace')
++  })
++
++  it('rejects a password shorter than 8 characters', async () => {
++    const user = await createUser()
++
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .json()
++      .put('/profile', { name: 'Ada Lovelace', email: 'ada@example.com', password: 'short' })
++      .assertUnprocessable()
++  })
++
++  it('ignores fields the profile form does not have', async () => {
++    const user = await createUser()
++
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .json()
++      .put('/profile', {
++        name: 'Ada King',
++        email: 'ADA.KING@example.com',
++        password: '',
++        id: 9999,
++        passwordHash: 'injected',
++      })
++      .assertOk()
++
++    const updated = await User.findOrFail(user.id)
++    expect(updated.name).toBe('Ada King')
++    // Emails are stored lowercased, matching the registration form.
++    expect(updated.email).toBe('ada.king@example.com')
++    expect(updated.passwordHash).not.toBe('injected')
++    expect(await User.find(9999)).toBeNull()
++  })
++})

@@ -1,0 +1,235 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..dbd3c2c 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt?: string; body: string }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt?: string; body: string }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..94f6acd 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,10 +3,16 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema, type PostPayload } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
++// The excerpt is optional on both forms: left blank, it is derived from the
++// body, on update as well as on create, so a stored excerpt is never empty.
++function withExcerpt(data: PostPayload): PostPayload & { excerpt: string } {
++  return { ...data, excerpt: data.excerpt || Post.excerptFrom(data.body) }
++}
++
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+@@ -67,7 +73,7 @@ export default class PostController extends Controller {
+   async store(): Promise<Response> {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+-    const data = await this.validateBody(PostPayloadSchema)
++    const data = withExcerpt(await this.validateBody(PostPayloadSchema))
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+     const post = await Post.forceCreate({ ...data, authorId: author.id })
+@@ -90,7 +96,7 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    const data = await this.validateBody(PostPayloadSchema)
++    const data = withExcerpt(await this.validateBody(PostPayloadSchema))
+     await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..1870142 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -18,7 +18,8 @@ export const PostSearchSchema = z.object({
+ 
+ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++  // Optional: a blank excerpt is derived from the body by Post.excerptFrom().
++  excerpt: z.string().trim().max(500, 'Excerpt must be 500 characters or fewer.').optional(),
+   body: z.string().trim().min(1, 'Body is required.'),
+ })
+ 
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index 4c4a643..4291e2f 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -6,6 +6,9 @@ export type PostRecord = typeof posts.$inferSelect
+ export type NewPostRecord = typeof posts.$inferInsert
+ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
++// How many characters of the body a derived excerpt keeps before the ellipsis.
++const EXCERPT_LENGTH = 140
++
+ export class Post extends defineModel(posts) {
+   // `authorId` is set from the signed-in user, never from request input.
+   static fillable = ['title', 'excerpt', 'body']
+@@ -13,6 +16,26 @@ export class Post extends defineModel(posts) {
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+   }
++
++  // Excerpt used when the author leaves the field blank: the opening of the
++  // body, cut on a word boundary so no word is sliced in half, plus a single
++  // ellipsis character. Bodies short enough to stand on their own are kept
++  // whole, without an ellipsis.
++  static excerptFrom(body: string): string {
++    const trimmed = body.trim()
++    if (trimmed.length <= EXCERPT_LENGTH) return trimmed
++
++    const head = trimmed.slice(0, EXCERPT_LENGTH)
++    // Only pull back to a word boundary when the cut lands inside a word —
++    // that is, when the characters on both sides of it are non-whitespace.
++    const splitsWord = !/\s/.test(head[head.length - 1] ?? '') && !/\s/.test(trimmed[EXCERPT_LENGTH] ?? '')
++    // Matches the last whitespace run in `head`; -1 when it holds no
++    // whitespace at all, in which case the cut stays at EXCERPT_LENGTH.
++    const lastBoundary = splitsWord ? head.search(/\s\S*$/) : -1
++    const kept = lastBoundary === -1 ? head : head.slice(0, lastBoundary)
++
++    return `${kept.replace(/\s+$/, '')}…`
++  }
+ }
+ 
+ Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..848df26 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -44,11 +44,14 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+-              value={form.data.excerpt}
++              value={form.data.excerpt ?? ''}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Leave blank to use the opening of the body"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..1ab451d 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -36,11 +36,14 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-medium text-slate-200">Excerpt</label>
++            <label className="block text-sm font-medium text-slate-200">
++              Excerpt <span className="text-slate-400">(optional)</span>
++            </label>
+             <input
+               type="text"
+-              value={form.data.excerpt}
++              value={form.data.excerpt ?? ''}
+               onChange={(event) => form.setData('excerpt', event.target.value)}
++              placeholder="Leave blank to use the opening of the body"
+               className={fieldClass}
+             />
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-rose-300">{form.errors.excerpt}</p> : null}
+diff --git a/tests/PostExcerpt.test.ts b/tests/PostExcerpt.test.ts
+new file mode 100644
+index 0000000..f6d269b
+--- /dev/null
++++ b/tests/PostExcerpt.test.ts
+@@ -0,0 +1,73 @@
++import { describe, expect, it } from 'bun:test'
++import { Post } from '../app/Models/Post.js'
++import { PostPayloadSchema } from '../app/Http/Validators/PostValidator.js'
++
++const SENTENCE = 'The quick brown fox jumps over the lazy dog. '
++
++describe('Post.excerptFrom', () => {
++  it('keeps a short body whole, without an ellipsis', () => {
++    expect(Post.excerptFrom('  A short post body.  ')).toBe('A short post body.')
++  })
++
++  it('keeps a body of exactly 140 characters whole', () => {
++    const body = 'a'.repeat(140)
++    expect(Post.excerptFrom(body)).toBe(body)
++  })
++
++  it('cuts back to the last word boundary when the cut splits a word', () => {
++    // 150 characters: the first 140 end mid-way through "quick".
++    const body = `${SENTENCE.repeat(3)}The quick brown`
++    expect(body.length).toBe(150)
++
++    const excerpt = Post.excerptFrom(body)
++    expect(excerpt).toBe(`${SENTENCE.repeat(3)}The…`)
++    expect(excerpt.length).toBe(139)
++  })
++
++  it('keeps all 140 characters when the cut lands on a word boundary', () => {
++    const body =
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right at a space, then adds a mark.'
++    expect(body.length).toBe(170)
++
++    const excerpt = Post.excerptFrom(body)
++    expect(excerpt).toBe(
++      'When a post is saved without an excerpt, the site now writes one for the author by keeping the opening of the body intact and stopping right…',
++    )
++    expect(excerpt.length).toBe(141)
++  })
++
++  it('cuts at 140 when the opening holds no whitespace at all', () => {
++    const body = `${'a'.repeat(200)} tail`
++    expect(Post.excerptFrom(body)).toBe(`${'a'.repeat(140)}…`)
++  })
++
++  it('trims the leading and trailing whitespace of the body first', () => {
++    const body = `\n\n  ${SENTENCE.repeat(4)}  \n`
++    expect(Post.excerptFrom(body).endsWith('…')).toBe(true)
++    expect(Post.excerptFrom(body).startsWith('The quick')).toBe(true)
++  })
++})
++
++describe('PostPayloadSchema', () => {
++  it('accepts a payload without an excerpt', () => {
++    const result = PostPayloadSchema.safeParse({ title: 'A title', body: 'A body' })
++    expect(result.success).toBe(true)
++    expect(result.data?.excerpt).toBeUndefined()
++  })
++
++  it('treats a whitespace-only excerpt as blank', () => {
++    const result = PostPayloadSchema.safeParse({ title: 'A title', excerpt: '   ', body: 'A body' })
++    expect(result.success).toBe(true)
++    expect(result.data?.excerpt).toBe('')
++  })
++
++  it('keeps a provided excerpt, trimmed', () => {
++    const result = PostPayloadSchema.safeParse({ title: 'A title', excerpt: '  Mine  ', body: 'A body' })
++    expect(result.data?.excerpt).toBe('Mine')
++  })
++
++  it('still refuses a blank title or body', () => {
++    expect(PostPayloadSchema.safeParse({ title: '  ', body: 'A body' }).success).toBe(false)
++    expect(PostPayloadSchema.safeParse({ title: 'A title', body: '  ' }).success).toBe(false)
++  })
++})

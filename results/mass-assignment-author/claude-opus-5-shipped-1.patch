@@ -1,0 +1,113 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..6899d05 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,10 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    // Same field rules as `store`; the schema drops anything outside them, and
++    // `update` (not `forceUpdate`) keeps `authorId` off-limits to request input.
++    const data = await this.validateBody(PostPayloadSchema)
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostUpdate.test.ts b/tests/PostUpdate.test.ts
+new file mode 100644
+index 0000000..33f1840
+--- /dev/null
++++ b/tests/PostUpdate.test.ts
+@@ -0,0 +1,91 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post, type PostRecord } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// The edit endpoint must apply the same field rules as creating a post, and a
++// request must never be able to hand the post to another author.
++describe('posts.update', () => {
++  let http: TestApp
++  let author: UserRecord
++  let other: UserRecord
++  let post: PostRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    author = (await User.create({ name: 'Author', email: 'author@example.com', password: 'secret123' })) as UserRecord
++    other = (await User.create({ name: 'Other', email: 'other@example.com', password: 'secret123' })) as UserRecord
++    post = (await Post.forceCreate({
++      title: 'Original',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author.id,
++    })) as PostRecord
++  })
++
++  it('updates the post for its author', async () => {
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, { title: 'Renamed', excerpt: 'New excerpt', body: 'New body' })
++      .assertRedirect(`/posts/${post.id}`)
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.title).toBe('Renamed')
++    expect(updated.authorId).toBe(author.id)
++  })
++
++  it('cannot change the author through request input', async () => {
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf.put(`/posts/${post.id}`, {
++      title: 'Renamed',
++      excerpt: 'Still mine?',
++      body: 'New body',
++      authorId: other.id,
++    })
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.authorId).toBe(author.id)
++  })
++
++  it('rejects an empty title without touching the post', async () => {
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, { title: '', excerpt: 'New excerpt', body: 'New body' })
++      .assertUnprocessable()
++
++    const untouched = await Post.findOrFail(post.id)
++    expect(untouched.title).toBe('Original')
++    expect(untouched.excerpt).toBe('Original excerpt')
++  })
++
++  it('ignores fields outside the edit form', async () => {
++    const createdAt = (await Post.findOrFail(post.id)).createdAt
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf.put(`/posts/${post.id}`, {
++      title: 'Renamed',
++      excerpt: 'New excerpt',
++      body: 'New body',
++      createdAt: '1999-01-01T00:00:00.000Z',
++    })
++
++    const updated = await Post.findOrFail(post.id)
++    expect(updated.createdAt).toEqual(createdAt)
++  })
++
++  it('refuses an edit by a different user', async () => {
++    const csrf = await http.actingAs(other).withCsrf()
++    await csrf
++      .put(`/posts/${post.id}`, { title: 'Hijacked', excerpt: 'Nope', body: 'Nope' })
++      .assertForbidden()
++
++    const untouched = await Post.findOrFail(post.id)
++    expect(untouched.title).toBe('Original')
++  })
++})

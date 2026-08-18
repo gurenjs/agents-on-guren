@@ -1,0 +1,132 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index d15bcbb..b6b3421 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -60,8 +60,8 @@ export default class PostController extends Controller {
+   // that period, newest first. `created_at` is stored as an ISO 8601 string, so
+   // a `YYYY-MM-` (or `YYYY-`) prefix match selects the period without parsing.
+   async archive(): Promise<Response> {
+-    const { date } = this.validateParams(ArchiveParamSchema)
+-    const [year, month] = date.split('/')
++    const { path } = this.validateParams(ArchiveParamSchema)
++    const [year, month] = path.split('/')
+     const prefix = month ? `${year}-${month.padStart(2, '0')}-` : `${year}-`
+ 
+     const posts = await Post.newQuery()
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 83d0495..1948284 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -24,8 +24,8 @@ export const PostPayloadSchema = z.object({
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+ 
+-// The archive route captures everything after /posts/archive/ into one `date`
+-// param: "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
++// The archive route captures everything after /posts/archive/ into the `path` param.
++// "2026" lists a whole year, "2026/08" (or "2026/8") a single month.
+ export const ArchiveParamSchema = z.object({
+-  date: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
++  path: z.string().regex(/^\d{4}(\/(0?[1-9]|1[0-2]))?$/, 'Expected YYYY or YYYY/MM.'),
+ })
+diff --git a/routes/web.ts b/routes/web.ts
+index 480678a..d725d66 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -32,7 +32,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.get('/', [PostController, 'index']).name('posts.index')
+     // Archive by year or by month: /posts/archive/2026 and /posts/archive/2026/08.
+     // Registered before '/:id', or "archive" is read as a post id.
+-    posts.get('/archive/:date*', [PostController, 'archive']).name('posts.archive')
++    posts.get('/archive/:path{.+}', [PostController, 'archive']).name('posts.archive')
+     posts.get('/:id', [PostController, 'show']).name('posts.show')
+ 
+     // HTTP QUERY (RFC 10008): safe and idempotent like GET, but carries its
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..ccab3e8 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -20,3 +20,83 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.archive', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('returns posts for a year', async () => {
++    const res = await http.get('/posts/archive/2026')
++    await res.assertOk()
++    const json = await res.json<{ data: unknown[] }>()
++    if (!Array.isArray(json.data) || json.data.length === 0) {
++      throw new Error('Expected posts to be returned for year 2026')
++    }
++  })
++
++  it('returns posts for a specific month with leading zero', async () => {
++    const res = await http.get('/posts/archive/2026/08')
++    await res.assertOk()
++    const json = await res.json<{ data: unknown[] }>()
++    if (!Array.isArray(json.data) || json.data.length === 0) {
++      throw new Error('Expected posts to be returned for 2026/08')
++    }
++  })
++
++  it('returns posts for a specific month without leading zero', async () => {
++    const res = await http.get('/posts/archive/2026/8')
++    await res.assertOk()
++    const json = await res.json<{ data: unknown[] }>()
++    if (!Array.isArray(json.data) || json.data.length === 0) {
++      throw new Error('Expected posts to be returned for 2026/8')
++    }
++  })
++
++  it('returns empty array for a month with no posts', async () => {
++    const res = await http.get('/posts/archive/2026/01')
++    await res.assertOk()
++    await res.assertJsonPath('data', [])
++  })
++
++  it('returns empty array for a year with no posts', async () => {
++    const res = await http.get('/posts/archive/2025')
++    await res.assertOk()
++    await res.assertJsonPath('data', [])
++  })
++
++  it('rejects an invalid month (13)', async () => {
++    await http.get('/posts/archive/2026/13').assertStatus(422)
++  })
++
++  it('rejects an invalid month (0)', async () => {
++    await http.get('/posts/archive/2026/0').assertStatus(422)
++  })
++
++  it('rejects an invalid month format', async () => {
++    await http.get('/posts/archive/2026/001').assertStatus(422)
++  })
++
++  it('rejects a path that does not match the pattern', async () => {
++    await http.get('/posts/archive/notayear').assertStatus(422)
++  })
++
++  it('rejects a path with extra segments', async () => {
++    await http.get('/posts/archive/2026/08/01').assertStatus(422)
++  })
++
++  it('returns posts sorted newest first', async () => {
++    const res = await http.get('/posts/archive/2026')
++    await res.assertOk()
++    const json = await res.json<{ data: Array<{ id: number }> }>()
++    const ids = json.data.map((p) => p.id)
++    // Verify that ids are in descending order (newest first)
++    for (let i = 1; i < ids.length; i++) {
++      if (ids[i] >= ids[i - 1]) {
++        throw new Error(`Posts not sorted correctly: ${ids[i]} should be < ${ids[i - 1]}`)
++      }
++    }
++  })
++})

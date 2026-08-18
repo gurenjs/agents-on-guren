@@ -1,0 +1,142 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..d6c0187 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -77,6 +77,7 @@ export interface ApiRoutes {
+   'profile.update': {
+     method: 'PUT'
+     path: '/profile'
++    body: { name: string; email: string; password?: string }
+   }
+   'register': {
+     method: 'GET'
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..21df6cf 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
+ import { User, type UserRecord } from '../../Models/User.js'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..70d775e 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,6 +3,7 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import { ProfileUpdateSchema } from '../app/Http/Validators/ProfileValidator.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+@@ -17,6 +18,6 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+     authed.post('/logout', [LoginController, 'destroy']).name('logout')
+     authed.get('/dashboard', [DashboardController, 'index']).name('dashboard')
+     authed.get('/profile', [ProfileController, 'edit']).name('profile.edit')
+-    authed.put('/profile', [ProfileController, 'update']).name('profile.update')
++    authed.put('/profile', { name: 'profile.update', body: ProfileUpdateSchema }, [ProfileController, 'update'])
+   })
+ }
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..332ed2b
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,67 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++describe('profile.update', () => {
++  let http: TestApp
++  let user: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    user = await User.create({ name: 'Original Name', email: 'original@example.com', password: 'correct-password' })
++  })
++
++  it('rejects a malformed email and leaves the account unchanged', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', { name: 'Original Name', email: 'not-an-email' }).assertUnprocessable()
++
++    const stored = await User.findOrFail(user.id)
++    expect(stored.email).toBe('original@example.com')
++  })
++
++  it('rejects an empty name and leaves the account unchanged', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', { name: '', email: 'original@example.com' }).assertUnprocessable()
++
++    const stored = await User.findOrFail(user.id)
++    expect(stored.name).toBe('Original Name')
++  })
++
++  it('rejects a too-short password and leaves the account unchanged', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', { name: 'Original Name', email: 'original@example.com', password: 'short' }).assertUnprocessable()
++  })
++
++  it('ignores fields outside the profile form, such as id or passwordHash', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    const originalHash = (await User.findOrFail(user.id)).passwordHash
++
++    await csrf.put('/profile', {
++      id: 999,
++      passwordHash: 'hijacked',
++      name: 'Updated Name',
++      email: 'updated@example.com',
++    }).assertOk()
++
++    const stored = await User.findOrFail(user.id)
++    expect(stored.id).toBe(user.id)
++    expect(stored.passwordHash).toBe(originalHash)
++    expect(stored.name).toBe('Updated Name')
++    expect(stored.email).toBe('updated@example.com')
++  })
++
++  it('saves a valid update, lowercasing the email', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.put('/profile', { name: '  New Name  ', email: 'NEW@Example.com' }).assertOk()
++
++    const stored = await User.findOrFail(user.id)
++    expect(stored.name).toBe('New Name')
++    expect(stored.email).toBe('new@example.com')
++  })
++})

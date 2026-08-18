@@ -1,0 +1,630 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..9c36a65 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; published?: boolean }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; published?: boolean }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..30c007d 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -15,6 +15,7 @@ export namespace Data {
+   excerpt: string
+   body: string
+   authorId: number
++  published: boolean
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..91ca295 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,6 +1,7 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, NotFoundHttpException, paginate, type PaginatedPageProps, type QueryBuilder } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import type { PostRecord } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+@@ -8,10 +9,23 @@ import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQueryS
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+ export default class PostController extends Controller {
++  // Restricts a query to what `viewer` may see: published posts, plus the
++  // viewer's own (possibly draft) posts when signed in. Guests see only
++  // published posts. Shared by index() and search() so a draft never
++  // surfaces in a listing to anyone but its author.
++  private restrictToVisible(query: QueryBuilder<PostRecord>, viewer: UserRecord | null): QueryBuilder<PostRecord> {
++    if (!viewer) {
++      return query.where('published', true)
++    }
++    return query.where((q) => {
++      q.where('published', true).orWhere('authorId', Number(viewer.id))
++    })
++  }
++
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+-    const result = await Post.newQuery()
+-      .with('author')
++    const viewer = await this.auth.user<UserRecord>()
++    const result = await this.restrictToVisible(Post.newQuery().with('author'), viewer)
+       .orderBy('id', 'desc')
+       .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+@@ -29,13 +43,14 @@ export default class PostController extends Controller {
+   // criteria in a JSON body. Matches posts with any keyword in title or
+   // excerpt; `%` and `_` in a keyword act as SQL LIKE wildcards, which this
+   // starter treats as a feature. All keyword OR pairs sit inside one
+-  // `where(callback)`, keeping this an any-keyword match while AND filters
+-  // added later (a published flag, tenancy) apply to every hit instead of
+-  // being OR'd away.
++  // `where(callback)`, keeping this an any-keyword match while the AND
++  // filter from restrictToVisible() (a published flag, or ownership) applies
++  // to every hit instead of being OR'd away.
+   async search(): Promise<Response> {
+     const { keywords, limit } = await this.validateBody(PostSearchSchema)
++    const viewer = await this.auth.user<UserRecord>()
+ 
+-    const posts = await Post.newQuery()
++    const keywordQuery = Post.newQuery()
+       .with('author')
+       .where((q) => {
+         for (const keyword of keywords) {
+@@ -43,6 +58,8 @@ export default class PostController extends Controller {
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+       })
++
++    const posts = await this.restrictToVisible(keywordQuery, viewer)
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+@@ -53,6 +70,13 @@ export default class PostController extends Controller {
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
++    const viewer = await this.auth.user<UserRecord>()
++
++    // A draft is invisible to anyone but its author — 404, not 403, so a
++    // guest or another user gets no hint the post exists at all.
++    if (!post.published && (!viewer || Number(viewer.id) !== post.authorId)) {
++      throw new NotFoundHttpException()
++    }
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index f798f49..f83daaa 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -10,6 +10,7 @@ export interface PostResourceData extends Record<string, unknown> {
+   excerpt: string
+   body: string
+   authorId: number
++  published: boolean
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
+@@ -26,6 +27,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor> {
+       excerpt: post.excerpt as string,
+       body: post.body as string,
+       authorId: post.authorId as number,
++      published: post.published as boolean,
+       createdAt: new Date(post.createdAt as string | Date).toISOString(),
+       author: this.whenLoaded('author', () => ({
+         id: (post as PostWithAuthor).author?.id,
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..085c1f2 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,7 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
++  published: z.boolean().default(false),
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index 4c4a643..a70ca15 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -8,7 +8,7 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts) {
+   // `authorId` is set from the signed-in user, never from request input.
+-  static fillable = ['title', 'excerpt', 'body']
++  static fillable = ['title', 'excerpt', 'body', 'published']
+ 
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+diff --git a/db/migrations/20260818044238_silent_wind_dancer/migration.sql b/db/migrations/20260818044238_silent_wind_dancer/migration.sql
+new file mode 100644
+index 0000000..d26e1a6
+--- /dev/null
++++ b/db/migrations/20260818044238_silent_wind_dancer/migration.sql
+@@ -0,0 +1 @@
++ALTER TABLE `posts` ADD `published` integer DEFAULT true NOT NULL;
+\ No newline at end of file
+diff --git a/db/migrations/20260818044238_silent_wind_dancer/snapshot.json b/db/migrations/20260818044238_silent_wind_dancer/snapshot.json
+new file mode 100644
+index 0000000..b85a054
+--- /dev/null
++++ b/db/migrations/20260818044238_silent_wind_dancer/snapshot.json
+@@ -0,0 +1,201 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "2c4a4f1e-4db3-497e-bad5-f1e4ddf073cb",
++  "prevIds": [
++    "064ebde9-8b69-42ff-8515-64f20f1250c8"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": "true",
++      "generated": null,
++      "name": "published",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..5e8e771 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -18,5 +18,8 @@ export const posts = sqliteTable('posts', {
+   authorId: integer('author_id')
+     .notNull()
+     .references(() => users.id),
++  // Defaults true at the column level so a migration backfills existing rows
++  // as public; the app layer defaults new posts to draft (see PostPayloadSchema).
++  published: integer('published', { mode: 'boolean' }).notNull().default(true),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
+diff --git a/db/seeders/002_posts.ts b/db/seeders/002_posts.ts
+index 8a2f2cf..81164aa 100644
+--- a/db/seeders/002_posts.ts
++++ b/db/seeders/002_posts.ts
+@@ -28,5 +28,5 @@ export default defineSeeder(async ({ db }: AppSeederContext) => {
+     return
+   }
+ 
+-  await db.insert(posts).values(SAMPLE_POSTS.map((post) => ({ ...post, authorId: author.id })))
++  await db.insert(posts).values(SAMPLE_POSTS.map((post) => ({ ...post, authorId: author.id, published: true })))
+ })
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index f748ca1..9cd1e1d 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -17,6 +17,7 @@ export default function EditPost({ post }: Props) {
+     title: post.title,
+     excerpt: post.excerpt,
+     body: post.body,
++    published: post.published,
+   })
+ 
+   return (
+@@ -65,6 +66,19 @@ export default function EditPost({ post }: Props) {
+             {form.errors.body ? <p className="mt-1 text-sm text-rose-300">{form.errors.body}</p> : null}
+           </div>
+ 
++          <div className="flex items-center gap-2">
++            <input
++              id="published"
++              type="checkbox"
++              checked={form.data.published}
++              onChange={(event) => form.setData('published', event.target.checked)}
++              className="h-4 w-4 rounded border-slate-700 bg-slate-950 text-emerald-500 focus:ring-emerald-400"
++            />
++            <label htmlFor="published" className="text-sm font-medium text-slate-200">
++              Published
++            </label>
++          </div>
++
+           <button
+             type="submit"
+             disabled={form.processing}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index 4807169..1e5b9e8 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -9,7 +9,7 @@ const fieldClass =
+   'mt-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none ring-emerald-400 transition focus:border-emerald-400 focus:ring'
+ 
+ export default function NewPost() {
+-  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
++  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '', published: false })
+ 
+   return (
+     <Layout>
+@@ -57,6 +57,19 @@ export default function NewPost() {
+             {form.errors.body ? <p className="mt-1 text-sm text-rose-300">{form.errors.body}</p> : null}
+           </div>
+ 
++          <div className="flex items-center gap-2">
++            <input
++              id="published"
++              type="checkbox"
++              checked={form.data.published}
++              onChange={(event) => form.setData('published', event.target.checked)}
++              className="h-4 w-4 rounded border-slate-700 bg-slate-950 text-emerald-500 focus:ring-emerald-400"
++            />
++            <label htmlFor="published" className="text-sm font-medium text-slate-200">
++              Published
++            </label>
++          </div>
++
+           <button
+             type="submit"
+             disabled={form.processing}
+diff --git a/tests/PostDrafts.test.ts b/tests/PostDrafts.test.ts
+new file mode 100644
+index 0000000..84aa5db
+--- /dev/null
++++ b/tests/PostDrafts.test.ts
+@@ -0,0 +1,162 @@
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { Post } from '../app/Models/Post.js'
++import { User } from '../app/Models/User.js'
++
++// Exercises the draft/published visibility rules end to end against the real
++// database (SQLite auto-applies pending migrations on first query, so no
++// manual migration step is needed here). Fixtures are created directly
++// through the models and torn down in afterAll to keep the shared test
++// database clean between runs.
++describe('post drafts', () => {
++  let http: TestApp
++  let author: { id: number }
++  let other: { id: number }
++  let draft: { id: number }
++  let publishedPost: { id: number }
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    const stamp = Date.now()
++    author = await User.forceCreate({
++      name: 'Draft Author',
++      email: `draft-author-${stamp}@example.com`,
++      password: 'secretpass',
++    })
++    other = await User.forceCreate({
++      name: 'Second Reader',
++      email: `second-reader-${stamp}@example.com`,
++      password: 'secretpass',
++    })
++
++    draft = await Post.forceCreate({
++      title: 'Zephyrine unfinished notes',
++      excerpt: 'Zephyrine excerpt not yet ready',
++      body: 'Draft body',
++      authorId: author.id,
++      published: false,
++    })
++    publishedPost = await Post.forceCreate({
++      title: 'Announcing the launch',
++      excerpt: 'Launch excerpt',
++      body: 'Published body',
++      authorId: author.id,
++      published: true,
++    })
++  })
++
++  afterAll(async () => {
++    await Post.delete({ id: draft.id })
++    await Post.delete({ id: publishedPost.id })
++    await User.delete({ id: author.id })
++    await User.delete({ id: other.id })
++  })
++
++  it('hides a draft from guests in the post list while keeping the published post', async () => {
++    const response = await http.json().get('/posts')
++    const body = await response.json<{ props: { data: Array<{ id: number }> } }>()
++    const ids = body.props.data.map((post) => post.id)
++    expect(ids).not.toContain(draft.id)
++    expect(ids).toContain(publishedPost.id)
++  })
++
++  it('hides a draft from a signed-in non-author in the post list', async () => {
++    const response = await http.actingAs(other).json().get('/posts')
++    const body = await response.json<{ props: { data: Array<{ id: number }> } }>()
++    expect(body.props.data.map((post) => post.id)).not.toContain(draft.id)
++  })
++
++  it('excludes a draft from keyword search even when the keyword matches', async () => {
++    const response = await http.query('/posts/search', { keywords: ['Zephyrine'] })
++    const body = await response.json<{ data: Array<{ id: number }> }>()
++    expect(body.data.map((post) => post.id)).not.toContain(draft.id)
++  })
++
++  it('finds a published post by keyword search', async () => {
++    const response = await http.query('/posts/search', { keywords: ['Announcing'] })
++    const body = await response.json<{ data: Array<{ id: number }> }>()
++    expect(body.data.map((post) => post.id)).toContain(publishedPost.id)
++  })
++
++  it('answers 404 for a guest opening a draft directly', async () => {
++    await http.get(`/posts/${draft.id}`).assertNotFound()
++  })
++
++  it('answers 404 for a signed-in non-author opening a draft directly', async () => {
++    await http.actingAs(other).get(`/posts/${draft.id}`).assertNotFound()
++  })
++
++  it('opens for the author, with published: false in the post data', async () => {
++    const response = await http.actingAs(author).json().get(`/posts/${draft.id}`)
++    expect(response.status).toBe(200)
++    const body = await response.json<{ props: { post: { published: boolean } } }>()
++    expect(body.props.post.published).toBe(false)
++  })
++
++  it('lets the author open the edit form for their own draft', async () => {
++    await http.actingAs(author).get(`/posts/${draft.id}/edit`).assertOk()
++  })
++
++  it('defaults a newly created post to draft when published is omitted', async () => {
++    const authed = await http.actingAs(author).withCsrf()
++    const response = await authed.post('/posts', {
++      title: 'No published field on create',
++      excerpt: 'Should default to a draft',
++      body: 'Body text',
++    })
++    response.assertRedirect()
++    const id = Number(response.headers.get('location')?.split('/').pop())
++
++    try {
++      const created = await Post.findOrFail(id)
++      expect(created.published).toBe(false)
++    } finally {
++      await Post.delete({ id })
++    }
++  })
++
++  it('publishes immediately when the create form sends published: true', async () => {
++    const authed = await http.actingAs(author).withCsrf()
++    const response = await authed.post('/posts', {
++      title: 'Published right away',
++      excerpt: 'Visible to guests immediately',
++      body: 'Body text',
++      published: true,
++    })
++    response.assertRedirect()
++    const id = Number(response.headers.get('location')?.split('/').pop())
++
++    try {
++      await http.get(`/posts/${id}`).assertOk()
++    } finally {
++      await Post.delete({ id })
++    }
++  })
++
++  it('lets the author publish a draft and take it back to draft via the edit form', async () => {
++    const toggle = await Post.forceCreate({
++      title: 'Toggle post',
++      excerpt: 'Starts as a draft',
++      body: 'Body text',
++      authorId: author.id,
++      published: false,
++    })
++    const authed = await http.actingAs(author).withCsrf()
++
++    try {
++      await authed
++        .put(`/posts/${toggle.id}`, { title: toggle.title, excerpt: toggle.excerpt, body: toggle.body, published: true })
++        .assertRedirect()
++      await http.get(`/posts/${toggle.id}`).assertOk()
++
++      await authed
++        .put(`/posts/${toggle.id}`, { title: toggle.title, excerpt: toggle.excerpt, body: toggle.body, published: false })
++        .assertRedirect()
++      await http.get(`/posts/${toggle.id}`).assertNotFound()
++    } finally {
++      await Post.delete({ id: toggle.id })
++    }
++  })
++})

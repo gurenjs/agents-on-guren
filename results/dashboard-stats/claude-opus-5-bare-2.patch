@@ -1,0 +1,222 @@
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..845dcef 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -43,6 +43,8 @@ export interface PagePropsMap {
+ }
+   'dashboard/Index': {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+   'Home': {
+   latest: PostResourceData[]
+diff --git a/app/Http/Controllers/DashboardController.ts b/app/Http/Controllers/DashboardController.ts
+index dcaddfc..4749fc8 100644
+--- a/app/Http/Controllers/DashboardController.ts
++++ b/app/Http/Controllers/DashboardController.ts
+@@ -1,7 +1,10 @@
+ import { Controller } from '@guren/core'
++import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
++const RECENT_POST_COUNT = 5
++
+ export default class DashboardController extends Controller {
+   async index(): Promise<Response> {
+     const currentUser = await this.auth.user<UserRecord | null>()
+@@ -12,6 +15,29 @@ export default class DashboardController extends Controller {
+           email: currentUser.email,
+         }
+       : null
+-    return this.inertia(pages.dashboard.Index, { user }, { title: 'Dashboard' })
++
++    // Every query is scoped to the signed-in author, so another writer's work
++    // can never reach this page however recently it was published.
++    const postCount = currentUser ? await Post.newQuery().where('authorId', currentUser.id).count() : 0
++    const recent = currentUser
++      ? await Post.newQuery()
++          .where('authorId', currentUser.id)
++          // `createdAt` first for "most recently created"; `id` breaks the ties
++          // that same-second timestamps leave behind.
++          .orderBy('createdAt', 'desc')
++          .orderBy('id', 'desc')
++          .limit(RECENT_POST_COUNT)
++          .get()
++      : []
++
++    return this.inertia(
++      pages.dashboard.Index,
++      {
++        user,
++        postCount,
++        recentPosts: recent.map((post) => ({ id: post.id, title: post.title })),
++      },
++      { title: 'Dashboard' },
++    )
+   }
+ }
+diff --git a/resources/js/pages/dashboard/Index.tsx b/resources/js/pages/dashboard/Index.tsx
+index 8c5748b..3d9d4f5 100644
+--- a/resources/js/pages/dashboard/Index.tsx
++++ b/resources/js/pages/dashboard/Index.tsx
+@@ -1,10 +1,14 @@
++import { Link } from '@inertiajs/react'
++import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
+ }
+ 
+-export default function Dashboard({ user }: Props) {
++export default function Dashboard({ user, postCount, recentPosts }: Props) {
+   return (
+     <Layout>
+       <section className="space-y-6">
+@@ -23,6 +27,35 @@ export default function Dashboard({ user }: Props) {
+             You are not signed in.
+           </div>
+         )}
++
++        <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-6">
++          <p className="text-sm text-slate-300">
++            You have {postCount} {postCount === 1 ? 'post' : 'posts'}
++          </p>
++
++          <h2 className="mt-6 text-xl font-medium text-slate-100">Recent posts</h2>
++          {recentPosts.length > 0 ? (
++            <ul className="mt-3 space-y-2">
++              {recentPosts.map((post) => (
++                <li key={post.id}>
++                  <Link
++                    href={route('posts.show', { id: post.id })}
++                    className="text-slate-100 transition hover:text-emerald-200"
++                  >
++                    {post.title}
++                  </Link>
++                </li>
++              ))}
++            </ul>
++          ) : (
++            <p className="mt-3 text-sm text-slate-400">
++              You haven't written any posts yet.{' '}
++              <Link href={route('posts.create')} className="text-emerald-300 transition hover:text-emerald-200">
++                Write your first post
++              </Link>
++            </p>
++          )}
++        </div>
+       </section>
+     </Layout>
+   )
+diff --git a/tests/DashboardController.test.ts b/tests/DashboardController.test.ts
+new file mode 100644
+index 0000000..5a4ce79
+--- /dev/null
++++ b/tests/DashboardController.test.ts
+@@ -0,0 +1,101 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp, readInertiaResponse } from '@guren/testing'
++import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++const WRITER_EMAIL = 'dashboard-writer@example.com'
++const OTHER_EMAIL = 'dashboard-other@example.com'
++
++interface DashboardProps {
++  user?: { id: number; name: string; email: string } | null
++  postCount: number
++  recentPosts: Array<{ id: number; title: string }>
++}
++
++async function dashboardProps(http: TestApp): Promise<DashboardProps> {
++  const response = await http.get('/dashboard').assertOk()
++  const { payload } = await readInertiaResponse(response.raw)
++  return payload.props as unknown as DashboardProps
++}
++
++// Recreates its own two authors on every run, so the assertions never depend
++// on whatever else the shared test database happens to hold.
++async function freshUser(name: string, email: string): Promise<UserRecord> {
++  const existing = await User.newQuery().where('email', email).first()
++  if (existing) {
++    await Post.delete({ authorId: existing.id })
++    await User.delete({ id: existing.id })
++  }
++  return User.forceCreate({ name, email, password: 'secret123' })
++}
++
++describe('dashboard', () => {
++  let http: TestApp
++  let writer: UserRecord
++  let other: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    await migrateDatabase()
++
++    writer = await freshUser('Dashboard Writer', WRITER_EMAIL)
++    other = await freshUser('Dashboard Other', OTHER_EMAIL)
++
++    // Seven posts for the writer, oldest first — only the newest five belong
++    // on the dashboard.
++    for (let index = 1; index <= 7; index += 1) {
++      await Post.forceCreate({
++        title: `Writer post ${index}`,
++        excerpt: 'excerpt',
++        body: 'body',
++        authorId: writer.id,
++        createdAt: `2026-01-0${index}T00:00:00.000Z`,
++      })
++    }
++
++    // Newer than everything above, but written by somebody else.
++    await Post.forceCreate({
++      title: 'Not yours',
++      excerpt: 'excerpt',
++      body: 'body',
++      authorId: other.id,
++      createdAt: '2026-02-01T00:00:00.000Z',
++    })
++  })
++
++  it('sends guests to the login page', async () => {
++    await http.get('/dashboard').assertRedirect('/login')
++  })
++
++  it('counts only the signed-in user’s posts', async () => {
++    const props = await dashboardProps(http.actingAs(writer))
++    expect(props.postCount).toBe(7)
++  })
++
++  it('lists the five newest posts, newest first, and nobody else’s', async () => {
++    const props = await dashboardProps(http.actingAs(writer))
++    expect(props.recentPosts.map((post) => post.title)).toEqual([
++      'Writer post 7',
++      'Writer post 6',
++      'Writer post 5',
++      'Writer post 4',
++      'Writer post 3',
++    ])
++    expect(props.recentPosts.every((post) => typeof post.id === 'number')).toBe(true)
++  })
++
++  it('shows another author only their own single post', async () => {
++    const props = await dashboardProps(http.actingAs(other))
++    expect(props.postCount).toBe(1)
++    expect(props.recentPosts.map((post) => post.title)).toEqual(['Not yours'])
++  })
++
++  it('reports an empty state for a user without posts', async () => {
++    const empty = await freshUser('Dashboard Empty', 'dashboard-empty@example.com')
++    const props = await dashboardProps(http.actingAs(empty))
++    expect(props.postCount).toBe(0)
++    expect(props.recentPosts).toEqual([])
++  })
++})

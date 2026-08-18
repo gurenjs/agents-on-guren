@@ -1,0 +1,84 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,8 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
++
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostDestroyAuthorization.test.ts b/tests/PostDestroyAuthorization.test.ts
+new file mode 100644
+index 0000000..45d2a67
+--- /dev/null
++++ b/tests/PostDestroyAuthorization.test.ts
+@@ -0,0 +1,65 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++// Deleting a post is author-only: PostController.destroy() runs the same
++// `delete` policy check that `update` already went through.
++describe('posts.destroy authorization', () => {
++  let http: TestApp
++  let author: UserRecord
++  let other: UserRecord
++  let postId: number
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    author = (await User.create({
++      name: 'Author',
++      email: 'author@example.com',
++      password: 'secret123',
++    })) as UserRecord
++    other = (await User.create({
++      name: 'Other',
++      email: 'other@example.com',
++      password: 'secret123',
++    })) as UserRecord
++
++    const post = await Post.forceCreate({
++      title: 'Authored post',
++      excerpt: 'An excerpt',
++      body: 'A body',
++      authorId: author.id,
++    })
++    postId = post!.id
++  })
++
++  it('refuses a signed-in user who is not the author', async () => {
++    const csrf = await http.actingAs(other).withCsrf()
++    await csrf.delete(`/posts/${postId}`).assertForbidden()
++
++    expect(await Post.find(postId)).not.toBeNull()
++  })
++
++  it('refuses a guest', async () => {
++    const csrf = await http.withCsrf()
++    const res = await csrf.delete(`/posts/${postId}`)
++    expect(res.status).toBeGreaterThanOrEqual(300)
++    expect(res.status).not.toBe(204)
++
++    expect(await Post.find(postId)).not.toBeNull()
++  })
++
++  it('lets the author delete their own post', async () => {
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf.delete(`/posts/${postId}`).assertRedirect('/posts')
++
++    expect(await Post.find(postId)).toBeNull()
++  })
++})

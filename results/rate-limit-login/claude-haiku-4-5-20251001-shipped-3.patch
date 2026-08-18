@@ -1,0 +1,272 @@
+diff --git a/app/Http/Middleware/ThrottleLoginAttempts.ts b/app/Http/Middleware/ThrottleLoginAttempts.ts
+new file mode 100644
+index 0000000..f42ac42
+--- /dev/null
++++ b/app/Http/Middleware/ThrottleLoginAttempts.ts
+@@ -0,0 +1,86 @@
++import { defineMiddleware, HttpException } from '@guren/core'
++
++const LIMIT = 5
++const WINDOW_MS = 60 * 1000 // 1 minute
++
++interface Attempt {
++  timestamp: number
++}
++
++export const attempts = new Map<string, Attempt[]>()
++
++function getClientIp(honoRequest: any): string {
++  // Per spec: do not trust forwarded-for headers
++  // Try to get the actual connection IP from the request info
++  // Hono request object may have connectionRequestInfo with remoteAddress in Bun
++  const info = honoRequest.connectionRequestInfo
++  if (info?.remoteAddress) {
++    const addr = info.remoteAddress
++    // Extract the IP without port if present
++    if (addr.includes(':')) {
++      return addr.split(':')[0]
++    }
++    return addr
++  }
++
++  // Fallback: use a shared identifier that throttles all unknown requests together
++  // This ensures we "fail closed" rather than letting unknown clients through unthrottled
++  return 'unknown-client'
++}
++
++function cleanOldAttempts(clientIp: string): void {
++  const now = Date.now()
++  const clientAttempts = attempts.get(clientIp)
++
++  if (!clientAttempts) return
++
++  const validAttempts = clientAttempts.filter((a) => now - a.timestamp < WINDOW_MS)
++  if (validAttempts.length === 0) {
++    attempts.delete(clientIp)
++  } else {
++    attempts.set(clientIp, validAttempts)
++  }
++}
++
++function recordAttempt(clientIp: string): void {
++  cleanOldAttempts(clientIp)
++  const clientAttempts = attempts.get(clientIp) ?? []
++  clientAttempts.push({ timestamp: Date.now() })
++  attempts.set(clientIp, clientAttempts)
++}
++
++function getAttemptCount(clientIp: string): number {
++  cleanOldAttempts(clientIp)
++  return attempts.get(clientIp)?.length ?? 0
++}
++
++function getRetryAfterSeconds(clientIp: string): number {
++  const clientAttempts = attempts.get(clientIp)
++  if (!clientAttempts || clientAttempts.length === 0) return 0
++
++  const oldestAttempt = clientAttempts[0].timestamp
++  const now = Date.now()
++  const elapsedMs = now - oldestAttempt
++  const remainingMs = WINDOW_MS - elapsedMs
++
++  return Math.ceil(remainingMs / 1000)
++}
++
++export default defineMiddleware(async (c, next) => {
++  const clientIp = getClientIp(c.req)
++  const attemptCount = getAttemptCount(clientIp)
++
++  if (attemptCount >= LIMIT) {
++    const retryAfter = getRetryAfterSeconds(clientIp)
++    return c.json(
++      { message: 'Too many login attempts. Please try again later.' },
++      {
++        status: 429,
++        headers: { 'Retry-After': retryAfter.toString() },
++      },
++    )
++  }
++
++  recordAttempt(clientIp)
++  return next()
++})
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..c2dcd99 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -3,12 +3,13 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import ThrottleLoginAttempts from '../app/Http/Middleware/ThrottleLoginAttempts.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
++    guest.post('/login', { middlewares: [ThrottleLoginAttempts] }, [LoginController, 'store']).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+diff --git a/tests/controllers/LoginController.test.ts b/tests/controllers/LoginController.test.ts
+new file mode 100644
+index 0000000..ba27084
+--- /dev/null
++++ b/tests/controllers/LoginController.test.ts
+@@ -0,0 +1,155 @@
++import { describe, test, expect, beforeAll, beforeEach } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../../src/app.js'
++import { User } from '../../app/Models/User.js'
++import { resetDatabase } from '../../config/database.js'
++import { attempts } from '../../app/Http/Middleware/ThrottleLoginAttempts.js'
++
++describe('LoginController', () => {
++  let http: TestApp
++  let testUser: User
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    attempts.clear()
++    testUser = await User.create({
++      name: 'Test User',
++      email: 'test@example.com',
++      password: 'password123',
++    })
++  })
++
++  test('show renders login page', async () => {
++    const res = await http.get('/login')
++    expect(res.status).toEqual(200)
++  })
++
++  test('store with valid credentials logs in', async () => {
++    const csrf = await http.withCsrf()
++    await csrf
++      .post('/login', {
++        email: 'test@example.com',
++        password: 'password123',
++        remember: false,
++      })
++      .assertRedirect('/dashboard')
++  })
++
++  test('store with invalid credentials returns error', async () => {
++    const csrf = await http.withCsrf()
++    const res = await csrf.post('/login', {
++      email: 'test@example.com',
++      password: 'wrongpassword',
++      remember: false,
++    })
++
++    expect(res.status).toEqual(422)
++  })
++
++  test('rate limiting allows 5 attempts within window', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let i = 0; i < 5; i++) {
++      const res = await csrf.post('/login', {
++        email: 'test@example.com',
++        password: 'wrongpassword',
++        remember: false,
++      })
++
++      // Should not be throttled yet (attempts 1-5)
++      expect(res.status).not.toEqual(429)
++    }
++  })
++
++  test('rate limiting blocks 6th attempt', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let i = 0; i < 5; i++) {
++      await csrf.post('/login', {
++        email: 'test@example.com',
++        password: 'wrongpassword',
++        remember: false,
++      })
++    }
++
++    const res = await csrf.post('/login', {
++      email: 'test@example.com',
++      password: 'wrongpassword',
++      remember: false,
++    })
++
++    expect(res.status).toEqual(429)
++  })
++
++  test('rate limiting includes Retry-After header', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let i = 0; i < 5; i++) {
++      await csrf.post('/login', {
++        email: 'test@example.com',
++        password: 'wrongpassword',
++        remember: false,
++      })
++    }
++
++    const res = await csrf.post('/login', {
++      email: 'test@example.com',
++      password: 'wrongpassword',
++      remember: false,
++    })
++
++    expect(res.status).toEqual(429)
++    expect(res.headers.get('Retry-After')).toBeTruthy()
++  })
++
++  test('rate limiting does not affect GET /login', async () => {
++    const csrf = await http.withCsrf()
++
++    for (let i = 0; i < 6; i++) {
++      await csrf.post('/login', {
++        email: 'test@example.com',
++        password: 'wrongpassword',
++        remember: false,
++      })
++    }
++
++    // GET /login should still work despite POST being throttled
++    const res = await http.get('/login')
++    expect(res.status).toEqual(200)
++  })
++
++  test('successful login still counts towards rate limit', async () => {
++    const csrf = await http.withCsrf()
++
++    // Make 4 failed attempts
++    for (let i = 0; i < 4; i++) {
++      await csrf.post('/login', {
++        email: 'test@example.com',
++        password: 'wrongpassword',
++        remember: false,
++      })
++    }
++
++    // 5th attempt with correct password - should succeed
++    const res5 = await csrf.post('/login', {
++      email: 'test@example.com',
++      password: 'password123',
++      remember: false,
++    })
++
++    expect([302, 303]).toContain(res5.status)
++
++    // 6th attempt should be throttled
++    const res6 = await csrf.post('/login', {
++      email: 'test@example.com',
++      password: 'password123',
++      remember: false,
++    })
++
++    expect(res6.status).toEqual(429)
++  })
++})

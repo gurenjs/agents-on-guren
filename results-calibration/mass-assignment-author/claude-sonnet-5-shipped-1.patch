@@ -1,0 +1,155 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 5296ec4..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -90,7 +90,8 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
+-    await Post.forceUpdate({ id: post.id }, await this.request.json())
++    const data = await this.validateBody(PostPayloadSchema)
++    await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..a00cb7d 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,125 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function createUser(email: string) {
++    return User.create({ name: 'Test User', email, password: 'password123' })
++  }
++
++  it('does not let the request body change the post author', async () => {
++    const author = await createUser('author@example.com')
++    const other = await createUser('other@example.com')
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author!.id,
++    })
++
++    const csrf = await http.actingAs(author!).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${post!.id}`, {
++        title: 'Renamed',
++        excerpt: 'Still mine?',
++        body: 'Updated body',
++        authorId: other!.id,
++      })
++      .assertRedirect(`/posts/${post!.id}`)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.authorId).toBe(author!.id)
++    expect(reloaded.title).toBe('Renamed')
++  })
++
++  it('rejects an empty title with a 422 and leaves the post unchanged', async () => {
++    const author = await createUser('author2@example.com')
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author!.id,
++    })
++
++    const csrf = await http.actingAs(author!).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${post!.id}`, { title: '', excerpt: 'Still mine?', body: 'Updated body' })
++      .assertUnprocessable()
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.title).toBe('Original title')
++  })
++
++  it('does not write fields outside title/excerpt/body', async () => {
++    const author = await createUser('author3@example.com')
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author!.id,
++    })
++    const originalCreatedAt = post!.createdAt
++
++    const csrf = await http.actingAs(author!).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${post!.id}`, {
++        title: 'Renamed again',
++        excerpt: 'Excerpt',
++        body: 'Body',
++        createdAt: new Date('2000-01-01').toISOString(),
++      })
++      .assertRedirect(`/posts/${post!.id}`)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.createdAt).toEqual(originalCreatedAt)
++  })
++
++  it('lets the author make an ordinary edit', async () => {
++    const author = await createUser('author4@example.com')
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author!.id,
++    })
++
++    const csrf = await http.actingAs(author!).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${post!.id}`, { title: 'Updated', excerpt: 'Updated excerpt', body: 'Updated body' })
++      .assertRedirect(`/posts/${post!.id}`)
++
++    const reloaded = await Post.findOrFail(post!.id)
++    expect(reloaded.title).toBe('Updated')
++  })
++
++  it('refuses an edit from a non-author with 403', async () => {
++    const author = await createUser('author5@example.com')
++    const other = await createUser('other5@example.com')
++    const post = await Post.forceCreate({
++      title: 'Original title',
++      excerpt: 'Original excerpt',
++      body: 'Original body',
++      authorId: author!.id,
++    })
++
++    const csrf = await http.actingAs(other!).withCsrf()
++    await csrf
++      .json()
++      .put(`/posts/${post!.id}`, { title: 'Hijacked', excerpt: 'Excerpt', body: 'Body' })
++      .assertForbidden()
++  })
++})

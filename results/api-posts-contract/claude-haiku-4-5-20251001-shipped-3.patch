@@ -1,0 +1,176 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..b20d526 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,11 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'api.posts.index': {
++    method: 'GET'
++    path: '/api/posts'
++    response: { data: Array<Data.Post>; meta: {} }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +308,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 0f25da3..7f7b339 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'api.posts.index': { method: 'GET', path: '/api/posts' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  api: {
++    posts: {
++      index: (query?: RouteQuery) => route('api.posts.index', query)
++    }
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index f837f50..7051a1b 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,7 +3,7 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, PostPayloadSchema, PostSearchSchema, ListPostsQuerySchema, ApiListPostsQuerySchema } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -50,6 +50,27 @@ export default class PostController extends Controller {
+     return this.json({ data: PostResource.collection(posts) })
+   }
+ 
++  async indexApi(): Promise<Response> {
++    const { page, author } = this.validateQuery(ApiListPostsQuerySchema)
++
++    let query = Post.newQuery().with('author').orderBy('id', 'desc')
++    if (author) {
++      query = query.where('authorId', author)
++    }
++
++    const result = await query.paginate({ page, perPage: 10 })
++
++    return this.json({
++      data: PostResource.collection(result.data),
++      meta: {
++        currentPage: result.meta.currentPage,
++        lastPage: result.meta.totalPages,
++        perPage: result.meta.perPage,
++        total: result.meta.total,
++      },
++    })
++  }
++
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..d3b86b6 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -8,6 +8,11 @@ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+ 
++export const ApiListPostsQuerySchema = z.object({
++  page: z.coerce.number().int().min(1).default(1),
++  author: z.coerce.number().int().positive().optional(),
++})
++
+ export const PostSearchSchema = z.object({
+   keywords: z
+     .array(z.string().trim().min(1, 'Keywords must not be blank.'))
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..e58bfcf 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,7 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
+-import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import { PostPayloadSchema, PostSearchSchema, ApiListPostsQuerySchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+@@ -17,6 +17,15 @@ export function registerWebRoutes(baseRouter: Router): void {
+   // Health check endpoint for load balancers and uptime monitors
+   router.get('/health', (c) => c.json({ status: 'ok' }))
+ 
++  // Public JSON API endpoints
++  router.group('/api', (api) => {
++    api.get('/posts', {
++      name: 'api.posts.index',
++      query: ApiListPostsQuerySchema,
++      resource: { data: [PostResource], meta: {} },
++    }, [PostController, 'indexApi'])
++  })
++
+   registerAuthRoutes(router)
+ 
+   router.group('/posts', (posts) => {
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..ca38cc4 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -20,3 +20,37 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('api.posts.index', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('returns 200 with valid parameters', async () => {
++    await http.get('/api/posts').assertOk()
++  })
++
++  it('accepts page parameter', async () => {
++    await http.get('/api/posts?page=1').assertOk()
++  })
++
++  it('rejects invalid page parameter', async () => {
++    await http.get('/api/posts?page=0').assertStatus(422)
++    await http.get('/api/posts?page=abc').assertStatus(422)
++  })
++
++  it('accepts author parameter', async () => {
++    await http.get('/api/posts?author=1').assertOk()
++  })
++
++  it('rejects invalid author parameter', async () => {
++    await http.get('/api/posts?author=0').assertStatus(422)
++    await http.get('/api/posts?author=abc').assertStatus(422)
++  })
++
++  it('returns JSON with data and meta properties', async () => {
++    await http.get('/api/posts').assertJsonStructure(['data', 'meta'])
++  })
++})

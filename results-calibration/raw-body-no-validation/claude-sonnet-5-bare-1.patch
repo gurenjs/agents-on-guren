@@ -1,0 +1,131 @@
+diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
+index d8e2504..35ec938 100644
+--- a/app/Http/Controllers/ProfileController.ts
++++ b/app/Http/Controllers/ProfileController.ts
+@@ -1,9 +1,8 @@
+ import { Controller, ValidationException } from '@guren/core'
++import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
+ import { User, type UserRecord } from '../../Models/User.js'
+ import { pages } from '@/.guren/pages.gen'
+ 
+-type ProfileInput = { name: string; email: string; password?: string }
+-
+ export default class ProfileController extends Controller {
+   async edit(): Promise<Response> {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -25,8 +24,7 @@ export default class ProfileController extends Controller {
+       return this.redirect('/login')
+     }
+ 
+-    const { password, ...input } = await this.request.json<ProfileInput>()
+-    const { name, email } = input
++    const { name, email, password } = await this.validateBody(ProfileUpdateSchema)
+     const emailChanged = email !== user.email
+ 
+     if (emailChanged) {
+@@ -37,8 +35,9 @@ export default class ProfileController extends Controller {
+       }
+     }
+ 
+-    await User.forceUpdate({ id: user.id }, {
+-      ...input,
++    await User.update({ id: user.id }, {
++      name,
++      email,
+       ...(password ? { password } : {}),
+     })
+ 
+diff --git a/tests/ProfileController.test.ts b/tests/ProfileController.test.ts
+new file mode 100644
+index 0000000..b420190
+--- /dev/null
++++ b/tests/ProfileController.test.ts
+@@ -0,0 +1,88 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { User } from '../app/Models/User.js'
++
++describe('ProfileController.update', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function makeUser() {
++    return User.create({
++      name: 'Original Name',
++      email: 'original@example.com',
++      password: 'original-password',
++    })
++  }
++
++  it('rejects a malformed email and leaves the account untouched', async () => {
++    const user = await makeUser()
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf.put('/profile', { name: 'Original Name', email: 'not-an-email' }).assertUnprocessable()
++
++    const stored = await User.find(user.id)
++    expect(stored?.email).toBe('original@example.com')
++  })
++
++  it('rejects an empty name and leaves the account untouched', async () => {
++    const user = await makeUser()
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf.put('/profile', { name: '', email: 'original@example.com' }).assertUnprocessable()
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Original Name')
++  })
++
++  it('rejects a short password and leaves the account untouched', async () => {
++    const user = await makeUser()
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .put('/profile', { name: 'Original Name', email: 'original@example.com', password: 'short' })
++      .assertUnprocessable()
++  })
++
++  it('ignores fields outside the profile form, such as id and passwordHash', async () => {
++    const user = await makeUser()
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf
++      .put('/profile', {
++        name: 'Updated Name',
++        email: 'updated@example.com',
++        id: user.id + 1000,
++        passwordHash: 'hacked-hash',
++      })
++      .assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.id).toBe(user.id)
++    expect(stored?.name).toBe('Updated Name')
++    expect(stored?.email).toBe('updated@example.com')
++    expect(stored?.passwordHash).not.toBe('hacked-hash')
++
++    const hijacked = await User.find(user.id + 1000)
++    expect(hijacked).toBeNull()
++  })
++
++  it('applies a valid update', async () => {
++    const user = await makeUser()
++    const csrf = await http.actingAs(user).withCsrf()
++
++    await csrf.put('/profile', { name: 'Updated Name', email: 'updated@example.com' }).assertOk()
++
++    const stored = await User.find(user.id)
++    expect(stored?.name).toBe('Updated Name')
++    expect(stored?.email).toBe('updated@example.com')
++  })
++})

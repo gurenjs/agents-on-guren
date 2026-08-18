@@ -1,0 +1,169 @@
+diff --git a/app/Http/Middleware/ThrottleLogin.ts b/app/Http/Middleware/ThrottleLogin.ts
+new file mode 100644
+index 0000000..60796df
+--- /dev/null
++++ b/app/Http/Middleware/ThrottleLogin.ts
+@@ -0,0 +1,45 @@
++import { createRateLimitMiddleware, MemoryRateLimitStore } from '@guren/core'
++
++/** Login submissions a single client may make per {@link LOGIN_WINDOW_MS}. */
++export const LOGIN_MAX_ATTEMPTS = 5
++
++/** Length of the window the attempts are counted in. */
++export const LOGIN_WINDOW_MS = 60_000
++
++export interface ThrottleLoginOptions {
++  /**
++   * Clock returning epoch milliseconds, injectable so tests can step past the
++   * window instead of sleeping through it. Drives both the counters and the
++   * `Retry-After` the middleware reports.
++   */
++  now?: () => number
++}
++
++/**
++ * Rate limits login submissions to {@link LOGIN_MAX_ATTEMPTS} per client per
++ * minute — credential stuffing otherwise gets as many guesses per account as
++ * it cares to make. Every submission counts, right password included, so a
++ * successful sign-in does not hand an attacker a fresh budget.
++ *
++ * The client is the connection's own IP (`server.requestIP()`), never a
++ * forwarded-for header: nothing proxies this app, so those headers are pure
++ * client input and trusting them would let one attacker spread its guesses
++ * over as many fake identities as it likes. When the address cannot be read at
++ * all the limiter falls back to a single shared bucket for the route, which
++ * throttles unidentified clients together rather than exempting them.
++ *
++ * Counters live in this process's memory: one process, and nothing here is
++ * worth surviving a restart.
++ */
++export function throttleLogin({ now }: ThrottleLoginOptions = {}) {
++  return createRateLimitMiddleware({
++    limit: LOGIN_MAX_ATTEMPTS,
++    windowMs: LOGIN_WINDOW_MS,
++    // A bucket of its own, so the login budget is never spent by — or spent
++    // on — any other limiter that later shares the framework default store.
++    store: new MemoryRateLimitStore(LOGIN_WINDOW_MS, now),
++    trustProxy: false,
++    message: 'Too many login attempts. Please try again later.',
++    now,
++  })
++}
+diff --git a/routes/auth.ts b/routes/auth.ts
+index c559cad..6831883 100644
+--- a/routes/auth.ts
++++ b/routes/auth.ts
+@@ -4,15 +4,25 @@ import RegisterController from '../app/Http/Controllers/Auth/RegisterController.
+ import DashboardController from '../app/Http/Controllers/DashboardController.js'
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
+ 
+-// Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+-export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
++// Uses the 'auth', 'guest', and 'throttle.login' aliases routes/web.ts
++// registers on this router.
++export function registerAuthRoutes(router: Router<'auth' | 'guest' | 'throttle.login'>): void {
+   router.middleware('guest').group((guest) => {
+     guest.get('/login', [LoginController, 'show']).name('login')
+-    guest.post('/login', [LoginController, 'store']).name('login.store')
+     guest.get('/register', [RegisterController, 'show']).name('register')
+     guest.post('/register', [RegisterController, 'store']).name('register.store')
+   })
+ 
++  // Registered on its own so the throttle sits *ahead* of the guest guard:
++  // a client over its limit is refused whatever its session says, and the
++  // limit is spent by the submission alone — rendering the form above stays
++  // open, or a throttled client could not even read the page telling it to
++  // wait.
++  router
++    .middleware('throttle.login', 'guest')
++    .post('/login', [LoginController, 'store'])
++    .name('login.store')
++
+   router.middleware('auth').group((authed) => {
+     authed.post('/logout', [LoginController, 'destroy']).name('logout')
+     authed.get('/dashboard', [DashboardController, 'index']).name('dashboard')
+diff --git a/routes/web.ts b/routes/web.ts
+index 1075ceb..6aefa0e 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,6 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import { throttleLogin } from '../app/Http/Middleware/ThrottleLogin.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -11,6 +12,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+   const router = baseRouter
+     .aliasMiddleware('auth', requireAuthenticated({ redirectTo: '/login' }))
+     .aliasMiddleware('guest', requireGuest({ redirectTo: '/dashboard' }))
++    .aliasMiddleware('throttle.login', throttleLogin())
+ 
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+diff --git a/tests/LoginThrottle.test.ts b/tests/LoginThrottle.test.ts
+new file mode 100644
+index 0000000..99e2723
+--- /dev/null
++++ b/tests/LoginThrottle.test.ts
+@@ -0,0 +1,59 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { createApp } from '@guren/core'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_MS, throttleLogin } from '../app/Http/Middleware/ThrottleLogin.js'
++
++const CREDENTIALS = { email: 'nobody@example.com', password: 'wrong-password' }
++
++// TestApp reaches the app through fetch() rather than a socket, so no client
++// address is available and every request lands in the limiter's shared
++// fail-closed bucket — which is the behaviour being asserted here: the count
++// is per client, and an unidentifiable client is still counted.
++describe('POST /login throttling', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await (await TestApp.fromApp(app)).withCsrf('/login')
++  })
++
++  it('refuses the sixth submission in a minute with 429 and Retry-After', async () => {
++    for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt++) {
++      const allowed = await http.post('/login', CREDENTIALS)
++      expect(allowed.status).not.toBe(429)
++    }
++
++    const throttled = await http.post('/login', CREDENTIALS)
++    expect(throttled.status).toBe(429)
++    expect(throttled.headers.get('retry-after')).toBeTruthy()
++  })
++
++  // Runs with the budget above already spent, so this is a throttled client.
++  it('leaves the rest of the app reachable', async () => {
++    await http.get('/login').assertOk()
++    await http.get('/health').assertOk()
++    expect((await http.post('/register', CREDENTIALS)).status).not.toBe(429)
++  })
++})
++
++describe('the login throttle window', () => {
++  it('lets a client submit again once the window has passed', async () => {
++    let clock = LOGIN_WINDOW_MS
++    // Its own app, so the counters are this test's alone and the injected
++    // clock can jump the window instead of the test sleeping through it.
++    const isolated = createApp({
++      routes: (router) => {
++        router.post('/login', () => ({ ok: true }), throttleLogin({ now: () => clock }))
++      },
++    })
++    const http = await TestApp.fromApp(isolated)
++
++    for (let attempt = 1; attempt <= LOGIN_MAX_ATTEMPTS; attempt++) {
++      await http.post('/login').assertOk()
++    }
++    expect((await http.post('/login')).status).toBe(429)
++
++    clock += LOGIN_WINDOW_MS
++    await http.post('/login').assertOk()
++  })
++})

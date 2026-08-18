@@ -1,0 +1,80 @@
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 19bd88c..f837f50 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -99,6 +99,8 @@ export default class PostController extends Controller {
+   async destroy(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
++    await this.authorize('delete', [Post, post])
++
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/tests/PostController.test.ts b/tests/PostController.test.ts
+index 519f090..9c93674 100644
+--- a/tests/PostController.test.ts
++++ b/tests/PostController.test.ts
+@@ -1,6 +1,9 @@
+-import { beforeAll, describe, it } from 'bun:test'
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
+ import { TestApp } from '@guren/testing'
+ import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
+ 
+ // posts.search is an HTTP QUERY route (RFC 10008). Its controller validates
+ // the body with validateBody() before building any query — the schema bound
+@@ -20,3 +23,51 @@ describe('posts.search', () => {
+     await http.query('/posts/search', { keywords: [] }).assertStatus(422)
+   })
+ })
++
++describe('posts.destroy', () => {
++  let http: TestApp
++  let author: UserRecord
++  let stranger: UserRecord
++  let postId: number
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    author = (await User.create({ name: 'Author', email: 'author@example.com', password: 'secret123' })) as UserRecord
++    stranger = (await User.create({ name: 'Stranger', email: 'stranger@example.com', password: 'secret123' })) as UserRecord
++
++    const post = await Post.forceCreate({
++      title: 'Authored post',
++      excerpt: 'An excerpt',
++      body: 'The body',
++      authorId: author.id,
++    })
++    postId = post!.id
++  })
++
++  it('lets the author delete their own post', async () => {
++    const csrf = await http.actingAs(author).withCsrf()
++    await csrf.delete(`/posts/${postId}`).assertRedirect('/posts')
++
++    expect(await Post.find(postId)).toBeNull()
++  })
++
++  it('forbids a signed-in non-author from deleting the post', async () => {
++    const csrf = await http.actingAs(stranger).withCsrf()
++    await csrf.delete(`/posts/${postId}`).assertForbidden()
++
++    expect(await Post.find(postId)).not.toBeNull()
++  })
++
++  it('does not let a guest delete the post', async () => {
++    const csrf = await http.withCsrf()
++    const response = await csrf.delete(`/posts/${postId}`)
++
++    expect(response.status).not.toBe(200)
++    expect(await Post.find(postId)).not.toBeNull()
++  })
++})
