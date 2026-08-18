@@ -11,7 +11,7 @@ across three models and two conditions:
 - **shipped** — the same app after `bunx guren agent:init` (what Guren
   installs for agents: CLAUDE.md, rules, skills, hooks, an API-signature digest)
 
-Report: [English](report/agents-on-guren-en.md) · [日本語](report/agents-on-guren-ja.md) · numbers: [results/RESULTS.md](results/RESULTS.md)
+Report: [English on guren.dev](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) ([source](report/agents-on-guren-en.md)) · [日本語](report/agents-on-guren-ja.md) · numbers: [results/RESULTS.md](results/RESULTS.md)
 
 ## Headline (360 cells, 2026-08-18)
 

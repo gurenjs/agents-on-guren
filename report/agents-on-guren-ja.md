@@ -127,3 +127,7 @@ Railsが「今後調べる」と書いていた問いに、Gurenの上での答�
 タスク(課題文・シード・隠しテスト・参照解)、ハーネス、360セル分のパッチ・判定はリポジトリで、イベントストリーム全量はリリースの添付ファイルとして公開しています。
 
 https://github.com/gurenjs/agents-on-guren
+
+英語版のレポートはguren.devに掲載しています。
+
+https://guren.dev/blog/agents-on-guren-the-first-benchmark-report

@@ -173,7 +173,8 @@ solution. Hidden tests never enter the agent's context.
   for Zenn); repository published as `gurenjs/agents-on-guren` (event streams
   as the `v2026.08.18` release asset) with the app at
   `gurenjs/agents-on-guren-app`; gurenjs PR #449 cites the numbers on the
-  homepage. Pre-publication review by four independent reviewers (files,
+  homepage. English report published at
+  https://guren.dev/blog/agents-on-guren-the-first-benchmark-report (2026-08-18). Pre-publication review by four independent reviewers (files,
   commit metadata, results, streams) found no secrets; their findings
   (home paths in logs, unfiled framework issues, wording) were applied —
   the framework findings are gurenjs #444, #446, #450, #451.
