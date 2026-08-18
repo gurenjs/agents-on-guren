@@ -24,7 +24,7 @@ https://guren.dev
 
 本文に何度も出てくるので、先に3つのコマンドを紹介しておきます。どれも`bunx guren ...`で実行するCLIで、人間が使うこともできますが、主にAIエージェントに読ませる想定で作っています。
 
-**`guren context`**は、プロジェクトの地図をMarkdownで出力します。モデル・ルート・ページ・コントローラの一覧に加えて、末尾にフレームワークAPIの署名ダイジェスト(検証済みの早見表)が付きます。
+`guren context`は、プロジェクトの地図をMarkdownで出力します。モデル・ルート・ページ・コントローラの一覧に加えて、末尾にフレームワークAPIの署名ダイジェスト(検証済みの早見表)が付きます。
 
 ```
 # Project Context
@@ -49,7 +49,7 @@ Verified quick reference — trust this and `.claude/rules/*.md` over grepping `
   `all()` · `create(data)` · `update(where, data)` · `delete(where)` · `paginate(options?)` ·
 ```
 
-**`guren check`**は、ルートとコントローラとページの配線、生成ファイルの有無、ルートファイルが実際にマウントされているか、といった整合性を検査します。たとえば後述するバグ入りのアプリで実行すると、こう指摘してくれます。
+`guren check`は、ルートとコントローラとページの配線、生成ファイルの有無、ルートファイルが実際にマウントされているか、といった整合性を検査します。たとえば後述するバグ入りのアプリで実行すると、こう指摘してくれます。
 
 ```
  WARN  [warn] routes/web.ts route path: get('/archive/:date*') reads as a wildcard,
@@ -60,7 +60,7 @@ Verified quick reference — trust this and `.claude/rules/*.md` over grepping `
 Results: 9 passed, 5 warnings, 0 failures
 ```
 
-**`guren audit`**は、更新系ルートにバリデーションや認可があるか、生SQLや秘密情報が混ざっていないか、といったセキュリティ面を検査します。
+`guren audit`は、更新系ルートにバリデーションや認可があるか、生SQLや秘密情報が混ざっていないか、といったセキュリティ面を検査します。
 
 ```
  ERROR  [fail] [A03] PUT /posts/:id: Route body schema is type-only for controller
@@ -69,7 +69,7 @@ Results: 9 passed, 5 warnings, 0 failures
 Results: 18 passed, 1 warnings, 1 failures, 0 ignored
 ```
 
-そして**`guren agent:init`**は、これらをエージェントに使わせるための設定一式(CLAUDE.md、ルール、スキル、フック)をプロジェクトに書き出します。セッション開始時に`guren context`の出力を自動で読ませるフックもここに含まれます。今回のベンチマークで比較したのは、この設定一式の有無です。
+そして`guren agent:init`は、これらをエージェントに使わせるための設定一式(CLAUDE.md、ルール、スキル、フック)をプロジェクトに書き出します。セッション開始時に`guren context`の出力を自動で読ませるフックもここに含まれます。今回のベンチマークで比較したのは、この設定一式の有無です。
 
 ## 2. 何を測ったのか
 
