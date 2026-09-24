@@ -11,8 +11,8 @@ benchmark on a Guren web app). Your task id is given in your prompt.
 5. The application: create your authoring worktree (below) and read the code you need there. Framework API reference: `bunx guren context` inside the worktree prints the API digest; `node_modules/@guren/*/dist/index.d.ts` has the types.
 
 ## Hard constraints
-- App repo: `$APP_REPO` (default `~/Development/agents-on-guren-app`), baseline commit `56f4e64`. **Never edit its working tree.** Author only inside
-  `git -C $APP_REPO worktree add --detach /tmp/aog-worktrees/author-<id> 56f4e64`
+- App repo: `$APP_REPO` (default `~/Development/agents-on-guren-app`). Baseline: Stage 2 (round 2) tasks start from `0fd1654` (branch `stage2`, create-guren-app 1.17.2) and must set `"baseline": "0fd165407851a43d7fed2c564d60be62c41fc1c2"` in `task.json`; round-1 tasks stay on `56f4e64` and omit the field. **Never edit its working tree.** Author only inside
+  `git -C $APP_REPO worktree add --detach /tmp/aog-worktrees/author-<id> <baseline>`
   and set it up with `bun install && cp .env.example .env && bunx guren key:generate --write && bun run codegen && bun run db:migrate`.
 - Do NOT modify anything under `harness/` or `tasks/_shared/`. If you need a helper, put it in `tasks/<id>/hidden/<name>.ts` (non-test `.ts` files there are copied in too).
 - Do NOT commit in the benchmark repo (`<repo>`); the orchestrator commits. Committing inside your *authoring worktree* is fine (needed to diff the reference against the seed).
