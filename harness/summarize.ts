@@ -8,6 +8,14 @@
  * median turns, median wall seconds; then per task the pass counts per cell.
  * Cost is `total_cost_usd` from the Claude Code result event — the same
  * API-equivalent figure the earlier agent-eval rounds (gurenjs/framework-comparison) reported.
+ *
+ * Stop-hook blocks: `hook_response` events with hook_event "Stop" and exit
+ * code 2 in the stream (the shipped hook runs `guren gate` and blocks with
+ * exit 2). Those events exist only when run.sh passed --include-hook-events
+ * (meta.include_hook_events); for older streams the count falls back to the
+ * "Stop hook feedback"/"Stop hook blocking error" text Claude Code injects
+ * on a block. No stream → blank.
+ * Cap hits: result subtype error_max_turns.
  */
 import { readdirSync, readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -32,6 +40,27 @@ interface Cell {
   terminalReason: string
   category: string
   difficulty: string
+  maxTurns: number | null
+  capHit: boolean
+  stopHookRuns: number | null
+  stopHookBlocks: number | null
+}
+
+function stopHookCounts(streamPath: string, hookEventsRecorded: boolean): { runs: number | null; blocks: number | null } {
+  if (!existsSync(streamPath)) return { runs: null, blocks: null }
+  let runs = 0, blocks = 0, feedback = 0, sawNonSessionHook = false
+  for (const line of readFileSync(streamPath, 'utf8').split('\n')) {
+    if (!line.includes('hook')) continue
+    let ev: any
+    try { ev = JSON.parse(line) } catch { continue }
+    if (ev.type === 'system' && ev.subtype === 'hook_response') {
+      if (ev.hook_event !== 'SessionStart') sawNonSessionHook = true
+      if (ev.hook_event === 'Stop') { runs++; if (String(ev.exit_code) === '2') blocks++ }
+    } else if (ev.type === 'user' && /Stop hook (feedback|blocking error)/.test(JSON.stringify(ev.message?.content ?? ''))) {
+      feedback++
+    }
+  }
+  return hookEventsRecorded || sawNonSessionHook ? { runs, blocks } : { runs: null, blocks: feedback }
 }
 
 function readJson<T>(p: string): T | null {
@@ -48,12 +77,16 @@ for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d
     const r = readJson<any>(join(RESULTS, task, `${base}.result.json`))
     const m = readJson<any>(join(RESULTS, task, `${base}.meta.json`))
     if (!v) continue
+    const hooks = stopHookCounts(join(RESULTS, task, `${base}.stream.jsonl`), m?.include_hook_events === true)
     cells.push({
       task, model: v.model, condition: v.condition, trial: Number(v.trial),
       status: v.status, typecheck: v.typecheck, visible: v.visible_tests, hidden: v.hidden_tests, hiddenSummary: v.hidden_summary,
       costUsd: r?.total_cost_usd ?? null, turns: r?.num_turns ?? null, wallS: m?.wall_seconds ?? null,
       isError: Boolean(r?.is_error), terminalReason: r?.terminal_reason ?? r?.subtype ?? '',
       category: meta.category ?? '?', difficulty: meta.difficulty ?? '?',
+      maxTurns: m?.max_turns ?? null,
+      capHit: r?.subtype === 'error_max_turns' || r?.terminal_reason === 'max_turns',
+      stopHookRuns: hooks.runs, stopHookBlocks: hooks.blocks,
     })
   }
 }
@@ -74,17 +107,19 @@ const groupBy = <T,>(xs: T[], key: (x: T) => string) => {
 }
 
 let md = `# Agents on Guren — results (${cells.length} cells)\n\n`
-md += `## Pass rate by model × condition\n\n| model | condition | cells | pass | pass rate | median cost (USD) | median turns | median wall (s) |\n|---|---|---|---|---|---|---|---|\n`
+const sumKnown = (xs: (number | null)[]) => { const k = xs.filter((x): x is number => x !== null); return k.length ? String(k.reduce((a, b) => a + b, 0)) : '–' }
+md += `## Pass rate by model × condition\n\n| model | condition | cells | pass | pass rate | median cost (USD) | median turns | median wall (s) | stop-hook blocks | cells blocked | turn-cap hits |\n|---|---|---|---|---|---|---|---|---|---|---|\n`
 for (const [k, g] of [...groupBy(cells, (c) => `${c.model}|${c.condition}`).entries()].sort()) {
   const [model, cond] = k.split('|')
   const pass = g.filter((c) => c.status === 'PASS').length
-  md += `| ${shortModel(model)} | ${cond} | ${g.length} | ${pass} | ${fmt((100 * pass) / g.length, 0)}% | ${fmt(median(g.map((c) => c.costUsd ?? NaN)))} | ${fmt(median(g.map((c) => c.turns ?? NaN)), 0)} | ${fmt(median(g.map((c) => c.wallS ?? NaN)), 0)} |\n`
+  md += `| ${shortModel(model)} | ${cond} | ${g.length} | ${pass} | ${fmt((100 * pass) / g.length, 0)}% | ${fmt(median(g.map((c) => c.costUsd ?? NaN)))} | ${fmt(median(g.map((c) => c.turns ?? NaN)), 0)} | ${fmt(median(g.map((c) => c.wallS ?? NaN)), 0)} | ${sumKnown(g.map((c) => c.stopHookBlocks))} | ${g.filter((c) => (c.stopHookBlocks ?? 0) > 0).length} | ${g.filter((c) => c.capHit).length} |\n`
 }
 
-md += `\n## Harness delta (shipped − bare pass rate) by model\n\n| model | bare | shipped | delta |\n|---|---|---|---|\n`
+const hasPlan = cells.some((c) => c.condition === 'shipped+plan')
+md += `\n## Harness delta (shipped − bare pass rate) by model\n\n| model | bare | shipped | delta |${hasPlan ? ' shipped+plan |' : ''}\n|---|---|---|---|${hasPlan ? '---|' : ''}\n`
 for (const [model, g] of [...groupBy(cells, (c) => c.model).entries()].sort()) {
   const rate = (cond: string) => { const s = g.filter((c) => c.condition === cond); return s.length ? (100 * s.filter((c) => c.status === 'PASS').length) / s.length : NaN }
-  md += `| ${shortModel(model)} | ${fmt(rate('bare'), 0)}% | ${fmt(rate('shipped'), 0)}% | ${fmt(rate('shipped') - rate('bare'), 0)} pp |\n`
+  md += `| ${shortModel(model)} | ${fmt(rate('bare'), 0)}% | ${fmt(rate('shipped'), 0)}% | ${fmt(rate('shipped') - rate('bare'), 0)} pp |${hasPlan ? ` ${fmt(rate('shipped+plan'), 0)}% |` : ''}\n`
 }
 
 md += `\n## Per task (pass / cells)\n\n`
