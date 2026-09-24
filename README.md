@@ -66,7 +66,13 @@ bun harness/summarize.ts
 ```
 
 `APP_REPO` and `BASELINE` (default `56f4e64`) can be overridden in the
-environment; see `harness/lib.sh`.
+environment; a task whose `task.json` names its own `baseline` always starts
+from that commit. See `harness/lib.sh`.
+
+Round 2 (Stage 2 tasks) adds a `shipped+plan` condition: `shipped` plus the
+task's approved plan (`tasks/<id>/plan/`) committed into the start state and
+one line appended to the prompt. Its streams carry hook events
+(`--include-hook-events`), from which `summarize.ts` counts Stop-hook blocks.
 
 ## License
 

@@ -4,19 +4,21 @@ Every task lives in `tasks/<id>/` and consists of:
 
 | File | Required | Purpose |
 |------|----------|---------|
-| `task.json` | yes | `{ id, category: bug|sec|feat, difficulty: E|M|H, seeded: bool, api_under_test: [...], harness_signal: "..." }` |
+| `task.json` | yes | `{ id, category: bug|sec|feat, difficulty: E|M|H, seeded: bool, api_under_test: [...], harness_signal: "..." }`, plus optional `baseline` (app commit the task starts from; round 1's `56f4e64` when absent, Stage 2 tasks name the `stage2` baseline). `difficulty: "H"` raises the turn cap from 120 to 200 |
 | `statement.md` | yes | What the agent reads (after the fixed harness preamble). Written as a *user-facing* bug report / security report / product request. **Never** names the framework API, file, or command that solves it — that is what the benchmark measures. |
 | `seed.patch` | if `seeded` | `git diff` against the app **baseline** that introduces the defect. Applied and committed before the agent starts. Must leave typecheck + visible tests green. |
 | `reference.patch` | yes | Our solution, as a diff against the **start state** (baseline + seed). Exists to prove the task is solvable and to validate the hidden tests. Never shown to agents. |
 | `hidden/*.test.ts` | yes | Post-hoc acceptance tests, run by the harness after the session in `tests/hidden/`. Never enter the agent's worktree. |
+| `plan/` | no | Stage 2 plan side experiment: the files to drop into the app root for the `shipped+plan` condition only (`docs/plans/<slug>/plan.json` and the approvals file beside it, approved against the start state). Committed after `agent:init`; `bare` and `shipped` never see it |
 | `hidden/*.ts` (non-test) | no | Extra helpers for this task's tests. `tasks/_shared/_helpers.ts` is copied in automatically (freshApp / makeUser / makePost / asUser). |
 
 ## Rules
 
 1. **Never modify the app repository's working tree directly.** Author in a
    throwaway worktree:
-   `git -C ~/Development/agents-on-guren-app worktree add --detach /tmp/aog-worktrees/author-<id> 56f4e64`
-   and remove it when done (`git worktree remove --force`).
+   `git -C ~/Development/agents-on-guren-app worktree add --detach /tmp/aog-worktrees/author-<id> <baseline>`
+   (`56f4e64` for round-1 tasks, the task's `baseline` otherwise) and remove
+   it when done (`git worktree remove --force`).
 2. **Seed = `git diff` from baseline** taken inside that worktree after
    editing. **Reference = `git diff` from the seeded commit** (commit the seed
    in the authoring worktree first, then edit, then diff). For feature tasks

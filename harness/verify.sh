@@ -22,6 +22,11 @@ verdict() { # verdict <status> [typecheck] [visible] [hidden] [hidden_count]
 }
 
 make_worktree "$TASK" "$WT" || { verdict "SEED-FAILED"; exit 1; }
+# The plan is task content like the seed: the agent's patch is a diff against
+# a start state that contains it (agent:init is not reapplied, as in round 1).
+if [ "$COND" = "shipped+plan" ]; then
+  apply_plan "$TASK" "$WT" >/dev/null || { verdict "PLAN-APPLY-FAILED"; drop_worktree "$WT"; exit 1; }
+fi
 if [ -s "$OUT.patch" ]; then
   git -C "$WT" apply --whitespace=nowarn "$OUT.patch" || { verdict "PATCH-APPLY-FAILED"; drop_worktree "$WT"; exit 1; }
 fi

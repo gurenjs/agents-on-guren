@@ -33,7 +33,7 @@ function addedLines(patch: string): string[] {
 }
 const count = (lines: string[], res: string[]) => res.reduce((n, re) => n + lines.filter((l) => new RegExp(re).test(l)).length, 0)
 
-interface Row { task: string; cell: string; api: number; hand: number; klass: string; generic: boolean }
+interface Row { task: string; cell: string; condition: string; api: number; hand: number; klass: string; generic: boolean }
 const rows: Row[] = []
 for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)) {
   const meta = existsSync(join(ROOT, 'tasks', task, 'task.json')) ? JSON.parse(readFileSync(join(ROOT, 'tasks', task, 'task.json'), 'utf8')) : {}
@@ -48,14 +48,14 @@ for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d
     const lines = addedLines(patch).filter((l) => !/^\s*\/\//.test(l))
     const api = count(lines, apiRes), hand = count(lines, handRes)
     const klass = api > 0 && hand === 0 ? 'framework-api' : api === 0 && hand > 0 ? 'handwritten' : api > 0 ? 'mixed' : 'unclassified'
-    rows.push({ task, cell: base, api, hand, klass, generic })
+    rows.push({ task, cell: base, condition: v.condition, api, hand, klass, generic })
   }
 }
 
 let md = `# Framework-API utilization (passing cells only, ${rows.length})\n\n| task | cell | api hits | hand hits | class | markers |\n|---|---|---|---|---|---|\n`
 for (const r of rows) md += `| ${r.task} | ${r.cell} | ${r.api} | ${r.hand} | ${r.klass} | ${r.generic ? 'generic' : 'task'} |\n`
 const byCond = new Map<string, Row[]>()
-for (const r of rows) { const cond = r.cell.includes('-shipped-') ? 'shipped' : 'bare'; byCond.set(cond, [...(byCond.get(cond) ?? []), r]) }
+for (const r of rows) byCond.set(r.condition, [...(byCond.get(r.condition) ?? []), r])
 md += `\n## By condition\n\n| condition | passing | framework-api | mixed | handwritten | unclassified |\n|---|---|---|---|---|---|\n`
 for (const [cond, g] of byCond) md += `| ${cond} | ${g.length} | ${g.filter((r) => r.klass === 'framework-api').length} | ${g.filter((r) => r.klass === 'mixed').length} | ${g.filter((r) => r.klass === 'handwritten').length} | ${g.filter((r) => r.klass === 'unclassified').length} |\n`
 console.log(md)
