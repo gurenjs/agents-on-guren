@@ -12,7 +12,7 @@
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
-TASKS=""; MODELS="claude-sonnet-5,claude-opus-5,claude-haiku-4-5-20251001"; CONDS="bare,shipped"; TRIALS=3; ONLY_VERIFY=0
+TASKS=""; MODELS="claude-sonnet-5,claude-opus-5-5,claude-haiku-4-5-20251001"; CONDS="bare,shipped"; TRIALS=3; ONLY_VERIFY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --tasks) TASKS="$2"; shift 2;;
