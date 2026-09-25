@@ -1,0 +1,937 @@
+{
+  "planVersion": 1,
+  "title": "Scheduled publishing",
+  "summary": "Authors give a post an optional publish date and time. Until it passes, the post exists only for its author: everyone else and guests do not see it in the list, in search, or on its page. Once it passes the post is public with no further action. A console command lists what is scheduled.",
+  "locale": "en",
+  "scope": {
+    "goals": [
+      "Set, change or clear a post's publish date from the create and edit forms",
+      "Hide a scheduled post from everyone but its author in the list, in search and on its page",
+      "Show authors their scheduled posts in the list with the date",
+      "Let ops print the scheduled posts with bun run console posts:scheduled"
+    ],
+    "nonGoals": [
+      "Notifying anyone when a post goes public",
+      "A job or timer that flips a flag at publish time; visibility is decided when the post is read",
+      "Unpublishing a post that is already public by any means other than giving it a future date"
+    ]
+  },
+  "assumptions": [
+    "posts.published_at is a nullable text column holding an ISO 8601 UTC timestamp, like created_at. Null or a time at or before now means public; a later time means scheduled.",
+    "The form field is publishAt: an ISO 8601 date-time with Z or an offset, normalized to UTC (toISOString) before it is stored, so the stored strings compare in time order. Absent or null means publish now (published_at null).",
+    "Updating a post with publishAt absent or null clears the schedule; the edit form always sends the field.",
+    "Visibility lives on the Post model as named query scopes: published (published_at null or not after now) and scheduled (published_at after now). index, show and search all read through one helper that ANDs (published OR written by the viewer) onto their own conditions, so the rule is written once.",
+    "A scheduled post's page answers 404 to everyone but its author, the same as a post that does not exist, so its existence does not leak.",
+    "bun run console posts:scheduled prints one line per scheduled post, <id>\\t<title>\\t<published_at>, soonest first (ties by id), through the command's plain line output, and nothing else on stdout; with nothing scheduled it prints nothing and exits 0.",
+    "An invalid publishAt fails exactly as an invalid title does: 422 with errors on publishAt, nothing saved."
+  ],
+  "models": [
+    {
+      "id": "model.post",
+      "change": {
+        "kind": "alter"
+      },
+      "name": "Post",
+      "table": "posts",
+      "columns": [
+        {
+          "id": "column.post.id",
+          "name": "id",
+          "change": {
+            "kind": "existing"
+          },
+          "type": "integer",
+          "primaryKey": true,
+          "nullable": false,
+          "unique": false,
+          "index": false
+        },
+        {
+          "id": "column.post.publishedAt",
+          "name": "publishedAt",
+          "columnName": "published_at",
+          "change": {
+            "kind": "add"
+          },
+          "type": "string",
+          "nullable": true,
+          "unique": false,
+          "index": false,
+          "dataMigration": {
+            "kind": "none",
+            "reason": "Existing posts keep published_at null, which means public, so nothing they show today changes."
+          }
+        }
+      ],
+      "relationships": [],
+      "fillable": [
+        "title",
+        "excerpt",
+        "body",
+        "publishedAt"
+      ]
+    }
+  ],
+  "validators": [
+    {
+      "id": "validator.post",
+      "change": {
+        "kind": "alter"
+      },
+      "name": "PostPayloadSchema",
+      "fields": [
+        {
+          "name": "title",
+          "type": "string",
+          "required": true,
+          "rules": [
+            "trimmed",
+            "min 1",
+            "max 255"
+          ]
+        },
+        {
+          "name": "excerpt",
+          "type": "string",
+          "required": true,
+          "rules": [
+            "trimmed",
+            "min 1",
+            "max 500"
+          ]
+        },
+        {
+          "name": "body",
+          "type": "string",
+          "required": true,
+          "rules": [
+            "trimmed",
+            "min 1"
+          ]
+        },
+        {
+          "name": "publishAt",
+          "type": "string",
+          "required": false,
+          "rules": [
+            "an ISO 8601 date-time with Z or an offset",
+            "absent or null means publish now"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "validator.postId",
+      "change": {
+        "kind": "existing"
+      },
+      "name": "PostIdParamSchema",
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true,
+          "rules": [
+            "positive integer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "validator.postList",
+      "change": {
+        "kind": "existing"
+      },
+      "name": "ListPostsQuerySchema",
+      "fields": [
+        {
+          "name": "page",
+          "type": "integer",
+          "required": false,
+          "rules": [
+            "min 1"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "validator.postSearch",
+      "change": {
+        "kind": "existing"
+      },
+      "name": "PostSearchSchema",
+      "fields": [
+        {
+          "name": "keywords",
+          "type": "json",
+          "required": true,
+          "rules": [
+            "1 to 10 non-blank strings"
+          ]
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "rules": [
+            "min 1",
+            "max 50"
+          ]
+        }
+      ]
+    }
+  ],
+  "controllers": [
+    {
+      "id": "controller.posts",
+      "change": {
+        "kind": "alter"
+      },
+      "className": "PostController",
+      "actions": [
+        {
+          "id": "action.posts.index",
+          "change": {
+            "kind": "alter"
+          },
+          "name": "index",
+          "query": "validator.postList",
+          "authorization": {
+            "middleware": []
+          },
+          "response": {
+            "kind": "inertia",
+            "view": "view.posts.index"
+          },
+          "rules": [
+            "Lists the posts the viewer may see: public posts, plus the signed-in viewer's own scheduled posts. Pagination counts the same set."
+          ]
+        },
+        {
+          "id": "action.posts.show",
+          "change": {
+            "kind": "alter"
+          },
+          "name": "show",
+          "params": "validator.postId",
+          "authorization": {
+            "middleware": []
+          },
+          "response": {
+            "kind": "inertia",
+            "view": "view.posts.show"
+          },
+          "rules": [
+            "Finds the post among those the viewer may see; a scheduled post of someone else is a 404."
+          ]
+        },
+        {
+          "id": "action.posts.create",
+          "change": {
+            "kind": "existing"
+          },
+          "name": "create",
+          "authorization": {
+            "middleware": [
+              "auth"
+            ],
+            "policy": {
+              "id": "policy.post",
+              "ability": "create"
+            }
+          },
+          "response": {
+            "kind": "inertia",
+            "view": "view.posts.new"
+          },
+          "rules": []
+        },
+        {
+          "id": "action.posts.store",
+          "change": {
+            "kind": "alter"
+          },
+          "name": "store",
+          "body": "validator.post",
+          "authorization": {
+            "middleware": [
+              "auth"
+            ],
+            "policy": {
+              "id": "policy.post",
+              "ability": "create"
+            }
+          },
+          "response": {
+            "kind": "redirect",
+            "to": "/posts/:id"
+          },
+          "rules": [
+            "Stores publishAt as published_at, normalized to UTC; absent or null stores null."
+          ]
+        },
+        {
+          "id": "action.posts.edit",
+          "change": {
+            "kind": "existing"
+          },
+          "name": "edit",
+          "params": "validator.postId",
+          "authorization": {
+            "middleware": [
+              "auth"
+            ],
+            "policy": {
+              "id": "policy.post",
+              "ability": "update"
+            }
+          },
+          "response": {
+            "kind": "inertia",
+            "view": "view.posts.edit"
+          },
+          "rules": []
+        },
+        {
+          "id": "action.posts.update",
+          "change": {
+            "kind": "alter"
+          },
+          "name": "update",
+          "params": "validator.postId",
+          "body": "validator.post",
+          "authorization": {
+            "middleware": [
+              "auth"
+            ],
+            "policy": {
+              "id": "policy.post",
+              "ability": "update"
+            }
+          },
+          "response": {
+            "kind": "redirect",
+            "to": "/posts/:id"
+          },
+          "rules": [
+            "Sets, changes or clears published_at from publishAt the same way store does."
+          ]
+        },
+        {
+          "id": "action.posts.search",
+          "change": {
+            "kind": "alter"
+          },
+          "name": "search",
+          "body": "validator.postSearch",
+          "authorization": {
+            "middleware": []
+          },
+          "response": {
+            "kind": "json",
+            "description": "{ data: PostResourceData[] }, only posts the viewer may see; the visibility condition is ANDed onto the keyword group."
+          },
+          "rules": [
+            "Matches only posts the viewer may see, with the same helper index and show use."
+          ]
+        }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "id": "route.posts.index",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "GET",
+      "path": "/posts",
+      "name": "posts.index",
+      "action": "action.posts.index",
+      "middleware": [],
+      "bind": []
+    },
+    {
+      "id": "route.posts.show",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "GET",
+      "path": "/posts/:id",
+      "name": "posts.show",
+      "action": "action.posts.show",
+      "middleware": [],
+      "bind": []
+    },
+    {
+      "id": "route.posts.create",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "GET",
+      "path": "/posts/create",
+      "name": "posts.create",
+      "action": "action.posts.create",
+      "middleware": [
+        "auth"
+      ],
+      "bind": []
+    },
+    {
+      "id": "route.posts.edit",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "GET",
+      "path": "/posts/:id/edit",
+      "name": "posts.edit",
+      "action": "action.posts.edit",
+      "middleware": [
+        "auth"
+      ],
+      "bind": []
+    },
+    {
+      "id": "route.posts.store",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "POST",
+      "path": "/posts",
+      "name": "posts.store",
+      "action": "action.posts.store",
+      "middleware": [
+        "auth"
+      ],
+      "bind": []
+    },
+    {
+      "id": "route.posts.update",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "PUT",
+      "path": "/posts/:id",
+      "name": "posts.update",
+      "action": "action.posts.update",
+      "middleware": [
+        "auth"
+      ],
+      "bind": []
+    },
+    {
+      "id": "route.posts.search",
+      "change": {
+        "kind": "existing"
+      },
+      "method": "QUERY",
+      "path": "/posts/search",
+      "name": "posts.search",
+      "action": "action.posts.search",
+      "middleware": [],
+      "bind": []
+    }
+  ],
+  "views": [
+    {
+      "id": "view.posts.index",
+      "change": {
+        "kind": "alter"
+      },
+      "page": "posts/Index",
+      "purpose": "The posts list; the author's own scheduled posts carry a 'Scheduled for <date>' label.",
+      "props": [
+        {
+          "name": "data",
+          "type": "PostResourceData[]",
+          "resource": "resource.post"
+        },
+        {
+          "name": "pagination",
+          "type": "PaginatedPageProps pagination"
+        }
+      ],
+      "actions": [],
+      "states": {}
+    },
+    {
+      "id": "view.posts.show",
+      "change": {
+        "kind": "alter"
+      },
+      "page": "posts/Show",
+      "purpose": "The post page; for a scheduled post (only its author gets here) it says when the post goes public.",
+      "props": [
+        {
+          "name": "post",
+          "type": "PostResourceData",
+          "resource": "resource.post"
+        }
+      ],
+      "actions": [],
+      "states": {}
+    },
+    {
+      "id": "view.posts.new",
+      "change": {
+        "kind": "alter"
+      },
+      "page": "posts/New",
+      "purpose": "The create form, with an optional publish date and time; left empty, the post is public on save.",
+      "props": [],
+      "form": {
+        "validator": "validator.post",
+        "submitsTo": "route.posts.store",
+        "fields": [
+          {
+            "field": "title",
+            "label": "Title",
+            "input": "text"
+          },
+          {
+            "field": "excerpt",
+            "label": "Excerpt",
+            "input": "text"
+          },
+          {
+            "field": "body",
+            "label": "Body",
+            "input": "textarea"
+          },
+          {
+            "field": "publishAt",
+            "label": "Publish at",
+            "input": "datetime"
+          }
+        ]
+      },
+      "actions": [],
+      "states": {}
+    },
+    {
+      "id": "view.posts.edit",
+      "change": {
+        "kind": "alter"
+      },
+      "page": "posts/Edit",
+      "purpose": "The edit form, with the publish date and time prefilled from the post; clearing it publishes the post.",
+      "props": [
+        {
+          "name": "post",
+          "type": "PostResourceData",
+          "resource": "resource.post"
+        }
+      ],
+      "form": {
+        "validator": "validator.post",
+        "submitsTo": "route.posts.update",
+        "fields": [
+          {
+            "field": "title",
+            "label": "Title",
+            "input": "text"
+          },
+          {
+            "field": "excerpt",
+            "label": "Excerpt",
+            "input": "text"
+          },
+          {
+            "field": "body",
+            "label": "Body",
+            "input": "textarea"
+          },
+          {
+            "field": "publishAt",
+            "label": "Publish at",
+            "input": "datetime"
+          }
+        ]
+      },
+      "actions": [],
+      "states": {}
+    }
+  ],
+  "resources": [
+    {
+      "id": "resource.post",
+      "change": {
+        "kind": "alter"
+      },
+      "name": "PostResource",
+      "model": "model.post",
+      "fields": [
+        {
+          "name": "publishedAt",
+          "type": "string | null"
+        }
+      ]
+    }
+  ],
+  "policies": [
+    {
+      "id": "policy.post",
+      "change": {
+        "kind": "existing"
+      },
+      "name": "PostPolicy",
+      "model": "model.post",
+      "abilities": [
+        {
+          "name": "create",
+          "rule": "Any signed-in user."
+        },
+        {
+          "name": "update",
+          "rule": "The signed-in user wrote the post."
+        }
+      ]
+    }
+  ],
+  "commands": [
+    {
+      "id": "command.postsScheduled",
+      "command": "guren make:command ScheduledPosts --command posts:scheduled",
+      "reason": "Ops lists the scheduled posts with bun run console posts:scheduled; the generator writes the command class and registers it with the console kernel."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task.scheduled-publish",
+      "entity": "Post",
+      "summary": "Give posts an optional publish date, hide scheduled posts from everyone but their author, and list them from the console.",
+      "covers": [
+        "model.post",
+        "validator.post",
+        "controller.posts",
+        "view.posts.index",
+        "view.posts.show",
+        "view.posts.new",
+        "view.posts.edit",
+        "resource.post"
+      ],
+      "acceptance": [
+        {
+          "id": "AC-scheduled-publish-1",
+          "description": "Creating a post with a future publishAt stores it in published_at and redirects to the post.",
+          "kind": "success",
+          "actor": "user",
+          "route": "route.posts.store",
+          "given": [],
+          "input": [
+            {
+              "name": "title",
+              "json": "\"Later\""
+            },
+            {
+              "name": "excerpt",
+              "json": "\"An excerpt\""
+            },
+            {
+              "name": "body",
+              "json": "\"A body\""
+            },
+            {
+              "name": "publishAt",
+              "json": "\"2099-01-01T09:00:00.000Z\""
+            }
+          ],
+          "expect": {
+            "status": 303,
+            "database": [
+              {
+                "table": "posts",
+                "has": [
+                  {
+                    "name": "title",
+                    "json": "\"Later\""
+                  },
+                  {
+                    "name": "published_at",
+                    "json": "\"2099-01-01T09:00:00.000Z\""
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-2",
+          "description": "An unparsable publishAt fails like an invalid title and saves nothing.",
+          "kind": "validation",
+          "actor": "user",
+          "route": "route.posts.store",
+          "given": [],
+          "input": [
+            {
+              "name": "title",
+              "json": "\"Later\""
+            },
+            {
+              "name": "excerpt",
+              "json": "\"An excerpt\""
+            },
+            {
+              "name": "body",
+              "json": "\"A body\""
+            },
+            {
+              "name": "publishAt",
+              "json": "\"next tuesday\""
+            }
+          ],
+          "expect": {
+            "status": 422,
+            "errors": [
+              "publishAt"
+            ],
+            "database": [
+              {
+                "table": "posts",
+                "missing": [
+                  {
+                    "name": "title",
+                    "json": "\"Later\""
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-3",
+          "description": "A guest creating a post is sent to the login page.",
+          "kind": "unauthenticated",
+          "actor": "guest",
+          "route": "route.posts.store",
+          "given": [],
+          "expect": {
+            "status": 302,
+            "redirect": "/login"
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-4",
+          "description": "A guest opening a scheduled post gets 404.",
+          "kind": "not-found",
+          "actor": "guest",
+          "route": "route.posts.show",
+          "given": [
+            "a post scheduled for tomorrow"
+          ],
+          "expect": {
+            "status": 404
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-5",
+          "description": "Another signed-in user opening a scheduled post gets 404.",
+          "kind": "not-found",
+          "actor": "user",
+          "route": "route.posts.show",
+          "given": [
+            "a post another user scheduled for tomorrow"
+          ],
+          "expect": {
+            "status": 404
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-6",
+          "description": "The author opening their scheduled post gets the page, with publishedAt in the post props.",
+          "kind": "success",
+          "actor": "author",
+          "route": "route.posts.show",
+          "given": [
+            "the author's post scheduled for tomorrow"
+          ],
+          "expect": {
+            "status": 200,
+            "inertia": "view.posts.show"
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-7",
+          "description": "The posts list leaves a scheduled post out for guests and other users, and lists it with publishedAt for its author.",
+          "kind": "success",
+          "actor": "author",
+          "route": "route.posts.index",
+          "given": [
+            "the author's post scheduled for tomorrow",
+            "a public post"
+          ],
+          "expect": {
+            "status": 200,
+            "inertia": "view.posts.index"
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-8",
+          "description": "Search leaves a scheduled post out for a guest while matching the public one.",
+          "kind": "success",
+          "actor": "guest",
+          "route": "route.posts.search",
+          "given": [
+            "a post scheduled for tomorrow and a public post, both matching the keyword"
+          ],
+          "input": [
+            {
+              "name": "keywords",
+              "json": "[\"match\"]"
+            }
+          ],
+          "expect": {
+            "status": 200
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-9",
+          "description": "A post whose published_at has passed is public: its page, the list and search show it to a guest.",
+          "kind": "state",
+          "actor": "guest",
+          "route": "route.posts.show",
+          "given": [
+            "a post whose published_at is an hour ago"
+          ],
+          "expect": {
+            "status": 200,
+            "inertia": "view.posts.show"
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-10",
+          "description": "The author reschedules a post from the edit form; published_at holds the new time.",
+          "kind": "state",
+          "actor": "author",
+          "route": "route.posts.update",
+          "given": [
+            "the author's public post"
+          ],
+          "input": [
+            {
+              "name": "title",
+              "json": "\"Later\""
+            },
+            {
+              "name": "excerpt",
+              "json": "\"An excerpt\""
+            },
+            {
+              "name": "body",
+              "json": "\"A body\""
+            },
+            {
+              "name": "publishAt",
+              "json": "\"2099-01-01T09:00:00.000Z\""
+            }
+          ],
+          "expect": {
+            "status": 303,
+            "redirect": "/posts/:id",
+            "database": [
+              {
+                "table": "posts",
+                "has": [
+                  {
+                    "name": "published_at",
+                    "json": "\"2099-01-01T09:00:00.000Z\""
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-11",
+          "description": "An unparsable publishAt on update fails like an invalid title and changes nothing.",
+          "kind": "validation",
+          "actor": "author",
+          "route": "route.posts.update",
+          "given": [
+            "the author's public post"
+          ],
+          "input": [
+            {
+              "name": "title",
+              "json": "\"Later\""
+            },
+            {
+              "name": "excerpt",
+              "json": "\"An excerpt\""
+            },
+            {
+              "name": "body",
+              "json": "\"A body\""
+            },
+            {
+              "name": "publishAt",
+              "json": "\"next tuesday\""
+            }
+          ],
+          "expect": {
+            "status": 422,
+            "errors": [
+              "publishAt"
+            ]
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-12",
+          "description": "A signed-in user opens the create form, which carries the Publish at field.",
+          "kind": "success",
+          "actor": "user",
+          "route": "route.posts.create",
+          "given": [],
+          "expect": {
+            "status": 200,
+            "inertia": "view.posts.new"
+          }
+        },
+        {
+          "id": "AC-scheduled-publish-13",
+          "description": "The author opens the edit form of their scheduled post; the post it is handed carries publishedAt.",
+          "kind": "success",
+          "actor": "author",
+          "route": "route.posts.edit",
+          "given": [
+            "the author's post scheduled for tomorrow"
+          ],
+          "expect": {
+            "status": 200,
+            "inertia": "view.posts.edit"
+          }
+        }
+      ]
+    }
+  ],
+  "hints": [],
+  "baseline": {
+    "rev": "0fd165407851a43d7fed2c564d60be62c41fc1c2",
+    "contextHash": {
+      "model.post": "3a3af1904962711dbabd7d6b3853b9cdbb818e734bc4cc52b7e57825dbf1e627",
+      "controller.posts": "1ee11800bdd98319976e8d18b05ca818a58562bb9a2806eda33bd07b9f99adeb",
+      "resource.post": "09ae60d9c272e8e622dc4606f917987467e8268d1bd8618874d014349a028672",
+      "policy.post": "19dbcaf56ad8bf99e7100264dbf86a637d47b9d7c18b6aacd74000eac898884c",
+      "view.posts.index": "7e54fa0b216c1d98bc95229353a3814bbf48cf8f9dffbbfeb97bb99e1dd4df5e",
+      "view.posts.show": "f5398b7275c20e6369abc66b6de58cc1421818c4c5572fb856e25c1ad0eba128",
+      "view.posts.new": "8343e84c6883a2c2e210e5cc9b5f4d9b0333760d94a1aa0dd8e97d9dc5f688dd",
+      "view.posts.edit": "b3075f315aa7add82ec6d52be040115bd1139a248019a1dfeb3f7fbe8c812929",
+      "column.post.id": "8064ac8c3e6a5affa85fd812513ea430c106fd0daae8e5fc05cec734bb252d81",
+      "column.post.publishedAt": "83cd7c990e2eeda3d28a118683d8ef67998ed334d73385b495a418f58c427848",
+      "action.posts.index": "21d1716a84ac5a9620272799788525b4f8beb67045b788cc13038c80a0e198ae",
+      "action.posts.show": "83fcc6ccc8fe7c3ea2639217087730312a886d055b9e6d8a01124652e3adebe1",
+      "action.posts.create": "f0b7ab1d056b2c2c1b5c50ea3eb54c3eb952cc1225529f128957d307390855d3",
+      "action.posts.store": "f904e5cdecc6c1d0aba97024862be70e242247554288b4f9e438a2edaa164349",
+      "action.posts.edit": "be7f9f438df25135ee11eb6ed3adfcb8cea5d9716a0677b86ddac3f4cb37c806",
+      "action.posts.update": "4b866ece67adb421937bcd4350373a82e6e9fc42de5b2a5726ac47656da7bc28",
+      "action.posts.search": "72ba1871b210d5369b12410d0667003514fe9ef90834299017269d9fab2e3087",
+      "route.posts.index": "61e7755223d81eafccd7e6e85744fc3cd160b9166d8433ded185cb6a78813e30",
+      "route.posts.show": "487b29eb374984ddafc0901601cc6c64d5e962fb449997a2aa5a58e926fecd39",
+      "route.posts.create": "1e8a28abf7d766883d62ac2dcc9df5e857a2aa4014f9ac60b1285db90e22ce0d",
+      "route.posts.edit": "97e075a23651c736ee38f68a31ee5f8927be34076df71fd71587fa5ea3f07330",
+      "route.posts.store": "a41ead6d5db20225b46a691991dd686faf04f2488ba78692b39a09973981ed31",
+      "route.posts.update": "5759b0aab9653c04139c2a62eaa4b29dfe171294c29e913352544a6ff278ce2e",
+      "route.posts.search": "143487e938db7aba1ede320898f72f4c492c2cd3782419adb7a4079849d4fffb"
+    }
+  }
+}
