@@ -16,6 +16,22 @@
  * "Stop hook feedback"/"Stop hook blocking error" text Claude Code injects
  * on a block. No stream → blank.
  * Cap hits: result subtype error_max_turns.
+ *
+ * Plan loop (RFC 0030), for every cell with a stream; no stream → blank:
+ * - planNextCalls / planVerifyCalls / gitCommits: Bash `tool_use` blocks (deduped by id,
+ *   subagents' included) whose command contains `plan:next` / `plan:verify` / a git commit
+ *   (`git commit`, also `git -c k=v commit` and `git -C dir commit`). One per command however
+ *   often it repeats the word; attempts, not successes. Substring match, so a `grep plan:next`
+ *   counts too. Text elsewhere in the stream (the injected loop docs) is never read.
+ * - verifiedSteps / failedSteps / blockedSteps / incompleteSteps: distinct step ids with that
+ *   outcome, from the `tool_result` of a `plan:verify` command (errors included). Text output
+ *   is read by the line `formatPlanStepRecord()` prints (@guren/cli 2.27.0):
+ *   `<step id>: <verified|failed|blocked|incomplete> (<n> ms)`, at the start of a line; the
+ *   "verified before" skip lines and the status block after it do not match. `--json` output
+ *   is read from `steps[].record.outcome`. Not counted: a result Claude Code truncated or
+ *   persisted past those lines, and the Stop hook's own verification (hook output, not a result).
+ *   A step failed then verified counts in both columns.
+ * - permissionDenials: `permission_denials.length` in result.json; absent → blank.
  */
 import { readdirSync, readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -44,6 +60,56 @@ interface Cell {
   capHit: boolean
   stopHookRuns: number | null
   stopHookBlocks: number | null
+  planNextCalls: number | null
+  planVerifyCalls: number | null
+  gitCommits: number | null
+  verifiedSteps: number | null
+  failedSteps: number | null
+  blockedSteps: number | null
+  incompleteSteps: number | null
+  permissionDenials: number | null
+}
+
+const PLAN_OUTCOMES = ['verified', 'failed', 'blocked', 'incomplete'] as const
+type PlanOutcome = (typeof PLAN_OUTCOMES)[number]
+const STEP_LINE = /^(\S+): (verified|failed|blocked|incomplete) \(\d+ ms\)$/gm
+const GIT_COMMIT = /\bgit(\s+-[cC]\s+\S+)*\s+commit\b/
+
+interface PlanLoop { planNextCalls: number; planVerifyCalls: number; gitCommits: number; steps: Record<PlanOutcome, Set<string>> }
+
+function verifyOutcomes(text: string): [string, PlanOutcome][] {
+  const start = text.indexOf('{')
+  try {
+    const report = start >= 0 ? JSON.parse(text.slice(start)) : null
+    if (Array.isArray(report?.steps)) return report.steps.flatMap((s: any) => (PLAN_OUTCOMES.includes(s?.record?.outcome) ? [[String(s.stepId), s.record.outcome]] : []))
+  } catch {}
+  return [...text.matchAll(STEP_LINE)].map((m) => [m[1], m[2] as PlanOutcome])
+}
+
+function planLoopCounts(streamPath: string): PlanLoop | null {
+  if (!existsSync(streamPath)) return null
+  const out: PlanLoop = { planNextCalls: 0, planVerifyCalls: 0, gitCommits: 0, steps: { verified: new Set(), failed: new Set(), blocked: new Set(), incomplete: new Set() } }
+  const commands = new Map<string, string>()
+  for (const line of readFileSync(streamPath, 'utf8').split('\n')) {
+    if (!line.includes('tool_use') && !line.includes('tool_result')) continue
+    let ev: any
+    try { ev = JSON.parse(line) } catch { continue }
+    const content = ev.message?.content
+    if (!Array.isArray(content)) continue
+    for (const b of content) {
+      if (ev.type === 'assistant' && b?.type === 'tool_use' && b.name === 'Bash' && typeof b.input?.command === 'string' && !commands.has(b.id)) {
+        const cmd: string = b.input.command
+        commands.set(b.id, cmd)
+        if (cmd.includes('plan:next')) out.planNextCalls++
+        if (cmd.includes('plan:verify')) out.planVerifyCalls++
+        if (GIT_COMMIT.test(cmd)) out.gitCommits++
+      } else if (ev.type === 'user' && b?.type === 'tool_result' && commands.get(b.tool_use_id)?.includes('plan:verify')) {
+        const text = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((x: any) => (typeof x?.text === 'string' ? x.text : '')).join('\n') : ''
+        for (const [step, outcome] of verifyOutcomes(text)) out.steps[outcome].add(step)
+      }
+    }
+  }
+  return out
 }
 
 function stopHookCounts(streamPath: string, hookEventsRecorded: boolean): { runs: number | null; blocks: number | null } {
@@ -78,6 +144,7 @@ for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d
     const m = readJson<any>(join(RESULTS, task, `${base}.meta.json`))
     if (!v) continue
     const hooks = stopHookCounts(join(RESULTS, task, `${base}.stream.jsonl`), m?.include_hook_events === true)
+    const plan = planLoopCounts(join(RESULTS, task, `${base}.stream.jsonl`))
     cells.push({
       task, model: v.model, condition: v.condition, trial: Number(v.trial),
       status: v.status, typecheck: v.typecheck, visible: v.visible_tests, hidden: v.hidden_tests, hiddenSummary: v.hidden_summary,
@@ -87,6 +154,10 @@ for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d
       maxTurns: m?.max_turns ?? null,
       capHit: r?.subtype === 'error_max_turns' || r?.terminal_reason === 'max_turns',
       stopHookRuns: hooks.runs, stopHookBlocks: hooks.blocks,
+      planNextCalls: plan?.planNextCalls ?? null, planVerifyCalls: plan?.planVerifyCalls ?? null, gitCommits: plan?.gitCommits ?? null,
+      verifiedSteps: plan?.steps.verified.size ?? null, failedSteps: plan?.steps.failed.size ?? null,
+      blockedSteps: plan?.steps.blocked.size ?? null, incompleteSteps: plan?.steps.incomplete.size ?? null,
+      permissionDenials: Array.isArray(r?.permission_denials) ? r.permission_denials.length : null,
     })
   }
 }
@@ -108,11 +179,11 @@ const groupBy = <T,>(xs: T[], key: (x: T) => string) => {
 
 let md = `# Agents on Guren — results (${cells.length} cells)\n\n`
 const sumKnown = (xs: (number | null)[]) => { const k = xs.filter((x): x is number => x !== null); return k.length ? String(k.reduce((a, b) => a + b, 0)) : '–' }
-md += `## Pass rate by model × condition\n\n| model | condition | cells | pass | pass rate | median cost (USD) | median turns | median wall (s) | stop-hook blocks | cells blocked | turn-cap hits |\n|---|---|---|---|---|---|---|---|---|---|---|\n`
+md += `## Pass rate by model × condition\n\n| model | condition | cells | pass | pass rate | median cost (USD) | median turns | median wall (s) | stop-hook blocks | cells blocked | turn-cap hits | median denials |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n`
 for (const [k, g] of [...groupBy(cells, (c) => `${c.model}|${c.condition}`).entries()].sort()) {
   const [model, cond] = k.split('|')
   const pass = g.filter((c) => c.status === 'PASS').length
-  md += `| ${shortModel(model)} | ${cond} | ${g.length} | ${pass} | ${fmt((100 * pass) / g.length, 0)}% | ${fmt(median(g.map((c) => c.costUsd ?? NaN)))} | ${fmt(median(g.map((c) => c.turns ?? NaN)), 0)} | ${fmt(median(g.map((c) => c.wallS ?? NaN)), 0)} | ${sumKnown(g.map((c) => c.stopHookBlocks))} | ${g.filter((c) => (c.stopHookBlocks ?? 0) > 0).length} | ${g.filter((c) => c.capHit).length} |\n`
+  md += `| ${shortModel(model)} | ${cond} | ${g.length} | ${pass} | ${fmt((100 * pass) / g.length, 0)}% | ${fmt(median(g.map((c) => c.costUsd ?? NaN)))} | ${fmt(median(g.map((c) => c.turns ?? NaN)), 0)} | ${fmt(median(g.map((c) => c.wallS ?? NaN)), 0)} | ${sumKnown(g.map((c) => c.stopHookBlocks))} | ${g.filter((c) => (c.stopHookBlocks ?? 0) > 0).length} | ${g.filter((c) => c.capHit).length} | ${fmt(median(g.map((c) => c.permissionDenials ?? NaN)), 0)} |\n`
 }
 
 const hasPlan = cells.some((c) => c.condition === 'shipped+plan')
@@ -120,6 +191,15 @@ md += `\n## Harness delta (shipped − bare pass rate) by model\n\n| model | bar
 for (const [model, g] of [...groupBy(cells, (c) => c.model).entries()].sort()) {
   const rate = (cond: string) => { const s = g.filter((c) => c.condition === cond); return s.length ? (100 * s.filter((c) => c.status === 'PASS').length) / s.length : NaN }
   md += `| ${shortModel(model)} | ${fmt(rate('bare'), 0)}% | ${fmt(rate('shipped'), 0)}% | ${fmt(rate('shipped') - rate('bare'), 0)} pp |${hasPlan ? ` ${fmt(rate('shipped+plan'), 0)}% |` : ''}\n`
+}
+
+if (hasPlan) {
+  md += `\n## Plan loop (shipped+plan cells)\n\nMedians per cell; verified steps = distinct step ids \`plan:verify\` reported verified.\n\n| task | model | cells | ran plan:next | median plan:next calls | median git commits | median verified steps |\n|---|---|---|---|---|---|---|\n`
+  for (const [k, g] of [...groupBy(cells.filter((c) => c.condition === 'shipped+plan'), (c) => `${c.task}|${c.model}`).entries()].sort()) {
+    const [task, model] = k.split('|')
+    const med = (f: (c: Cell) => number | null) => fmt(median(g.map((c) => f(c) ?? NaN)), 1)
+    md += `| ${task} | ${shortModel(model)} | ${g.length} | ${g.filter((c) => (c.planNextCalls ?? 0) > 0).length} | ${med((c) => c.planNextCalls)} | ${med((c) => c.gitCommits)} | ${med((c) => c.verifiedSteps)} |\n`
+  }
 }
 
 md += `\n## Per task (pass / cells)\n\n`
