@@ -20,7 +20,7 @@ https://youtu.be/V9SxpJpHuus
 
 GurenはRailsの規約を借りていて、しかもどのモデルも知らないほど新しいフレームワークです。そのため「規約はトークン効率か」も、Stage 2相当のチケットも、Guren上で実測できます。この記事は8月に公開した第1弾の続きで、2部構成です。
 
-https://guren.dev/blog/agents-on-guren-the-first-benchmark-report
+https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 
 - Part A: 同じ仕様・同じモデルで、同じ機能をGurenと素のHonoに実装させた比較(21セル)
 - Part B: Gurenのブログアプリに対する9本のプロダクトチケット。4モデル、`guren agent:init`のハーネスあり・なし、承認済み計画を渡す小さな副実験付き(225セル)
@@ -90,7 +90,7 @@ https://code.claude.com/docs/en/memory
 
 減った分の一部は払い戻されています。エージェントはCLAUDE.mdが指すORMのruleを`cat`で読み、Claude Codeもファイルを読んだあとにruleを差し込みます。ruleが届いたタイミングは、ストリームに現れないため、説明のつかないキャッシュ書き込みから推定しています。範囲は重なっている($0.53〜0.68対$0.60〜0.82)ので、N=3でわかるのは向きまでです。その向きは会計が予測する$0.12の減少と合っています。
 
-テンプレートの修正はPR #1056として開いたままです。これが出るまでは、今日スキャフォールドしたアプリは1.26倍ではなく1.43倍の側にいます。
+テンプレートの修正(PR #1056)はその後マージされ、次の`@guren/cli`のリリースで出ます。それより前にスキャフォールドしたアプリは、1.26倍ではなく1.43倍の側にいます。
 
 https://github.com/gurenjs/guren/pull/1056
 
@@ -206,7 +206,7 @@ RFC 0024(server/coreの統合)は据え置きます。0024の根拠は`@guren/co
 
 今回の計測では、Guren自身について21件の発見がありました。大半はチケットを書く途中で見つかったものです。主なものを分類して挙げます。
 
-- ハーネス: rulesの`globs:`キー(前述の#1056)。ダイジェストにAPIトークン・bearer認証・レート制限の関数がない。`guren context`がモジュールと`guren.arch.ts`に触れない
+- ハーネス: rulesの`globs:`キー(前述の#1056)。ダイジェストにAPIトークン・bearer認証・レート制限の関数がない。`guren context`がモジュールと`guren.arch.ts`に触れない。スキャフォールドされた`settings.json`のフックが相対パスなので、エージェントが`cd`したあとの編集後フックが「Module not found」で失敗する(今回12回、すべて`cd`の直後)
 - CLIの検査: `guren audit`に、Policyのあるモデルの変更系アクションで認可が抜けていることを見る規則がなかった(#1054で警告するようになりました。マージ済み、リリース待ち)。`check --arch`がディレクトリimport(`make:module`自身が書く`'../modules/newsletter'`の形)を素通りさせる。`introspect`の子プロセスが、親が落ちても残り続ける
 - ORMとAPIの罠: `where('publishedAt', 'is null')`が文字列`'is null'`との比較になる(エージェント自身のテストとgateは通り、隠しテストが捕まえた)。`DatabaseApiTokenStore`がSQLiteのtext型タイムスタンプ列に`Date`を書いて500になる。`data.gen.ts`が同じ識別子を二重に宣言することがある。`belongsToMany`に`attach`/`sync`がない。未認証のエージェントツール呼び出しが302になり、ツールのdispatchがそれを成功として扱う。`@guren/plugin-mcp`はトークンのテーブルがないと全リクエストが500になるのに、それを生成するものがない。attachmentsにMIMEの許可リストとコレクション単位のサイズ上限がない。codegenが`z.file()`を`unknown`と型付けする。テストクライアントにcookie jarと`arrayBuffer()`がない
 - 計画: 計画のスキーマにconsoleコマンドとquery scopeの要素がない。前述のStopフックの穴
@@ -237,4 +237,4 @@ https://github.com/gurenjs/agents-on-guren
 
 英語版のレポートはguren.devに掲載しています。
 
-https://guren.dev/blog/TODO-round-2-slug
+https://guren.dev/blog/agents-on-guren-round-2
