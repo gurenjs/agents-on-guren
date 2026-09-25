@@ -28,6 +28,29 @@ Runner: headless Claude Code, `--max-turns 120`, isolated (no MCP, no user
 settings/plugins, no web tools). 20 tasks × 3 models × 2 conditions × 3 trials.
 Cash cost $0 (Claude Max); API-equivalent $600.
 
+## Round 2 (Stage 2, 2026-09-25)
+
+Nine product tickets that each span three or more subsystems, graded by 84
+hidden behaviour tests (pass = hidden tests + typecheck) with a separate
+idiom column, run on four models with and without the harness, plus approved
+implementation plans on three tickets. 225 cells, Claude Code 2.1.281, an
+isolated runner.
+
+| model | pass bare → shipped | turns (median) | cost USD (median) |
+|---|---|---|---|
+| Sonnet 5 | 93% → 96% | 37 → 29 | 0.57 → 0.63 |
+| Opus 5.5 | 100% → 100% | 65 → 43 | 1.58 → 1.31 |
+| Haiku 4.5 | 41% → 56% | 96 → 81 | 1.00 → 0.90 |
+| Fable 5.1 | 100% → 100% | 77 → 59 | 4.01 → 3.51 |
+
+- Corpus and its rules: [CORPUS-STAGE2.md](CORPUS-STAGE2.md); tasks under
+  `tasks/<id>/` with `"baseline"` set to the app's `stage2` branch (0fd1654).
+- Tables: [results/RESULTS-STAGE2.md](results/RESULTS-STAGE2.md)
+  (`harness/summarize-stage2.py`); calibration cells are kept apart in
+  `results-calibration-stage2/`.
+- How the round was run, step by step: [RUNBOOK.md](RUNBOOK.md).
+- Event streams will be attached to the release.
+
 ## Layout
 
 | Path | What |
