@@ -126,7 +126,7 @@ run_hidden_tests() {
 # for bare/shipped. shipped+plan appends exactly one line pointing at the plan;
 # the statement itself never changes, or the cell measures the prompt rather
 # than the plan.
-PLAN_PROMPT_LINE="An approved implementation plan for this ticket exists under docs/plans/."
+PLAN_PROMPT_LINE="An approved implementation plan for this ticket exists under docs/plans/. Implement the plan."
 build_prompt() {
   local task="$1" cond="${2:-}" tdir; tdir="$(task_dir "$task")"
   cat "$BENCH_ROOT/harness/PREAMBLE.md"
