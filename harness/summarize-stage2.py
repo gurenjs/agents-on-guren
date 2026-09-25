@@ -68,25 +68,26 @@ for task in TASKS:
 
 md = [f"# Agents on Guren, Stage 2 results ({len(cells)} cells)\n"]
 md.append("## Pass rate, turns, cost by model × condition (medians)\n")
-md.append("| model | condition | cells | pass | rate | med turns | med cost (USD) | med wall (s) | stop-hook blocks | cap hits | med denials |")
-md.append("|---|---|---|---|---|---|---|---|---|---|---|")
+md.append("| model | condition | cells | pass | rate | med turns | med cost (USD) | mean cost (USD) | med wall (s) | stop-hook blocks | cap hits | med denials |")
+md.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
 for mid, mname in MODELS:
     for cond in CONDS:
         g = [c for c in cells if c['model'] == mid and c['cond'] == cond]
         if not g: continue
         p = sum(c['passed'] for c in g)
-        md.append(f"| {mname} | {cond} | {len(g)} | {p} | {100*p/len(g):.0f}% | {med([c['turns'] for c in g])} | {med([c['cost'] for c in g], 2)} | {med([c['wall'] for c in g])} | {sum(c['stop_blocks'] or 0 for c in g)} | {sum(c['cap_hit'] for c in g)} | {med([c['denials'] for c in g])} |")
+        md.append(f"| {mname} | {cond} | {len(g)} | {p} | {100*p/len(g):.0f}% | {med([c['turns'] for c in g])} | {med([c['cost'] for c in g], 2)} | {statistics.mean([c['cost'] or 0 for c in g]):.2f} | {med([c['wall'] for c in g])} | {sum(c['stop_blocks'] or 0 for c in g)} | {sum(c['cap_hit'] for c in g)} | {med([c['denials'] for c in g])} |")
 
 md.append("\n## Harness delta by model (shipped − bare)\n")
-md.append("| model | pass bare | pass shipped | Δ pass | Δ med turns | Δ med cost |")
-md.append("|---|---|---|---|---|---|")
+md.append("| model | pass bare | pass shipped | Δ pass | Δ med turns | Δ med cost | Δ mean cost |")
+md.append("|---|---|---|---|---|---|---|")
 for mid, mname in MODELS:
     b = [c for c in cells if c['model'] == mid and c['cond'] == 'bare']; s = [c for c in cells if c['model'] == mid and c['cond'] == 'shipped']
     if not b or not s: continue
     pb, ps = 100*sum(c['passed'] for c in b)/len(b), 100*sum(c['passed'] for c in s)/len(s)
     tb, ts = statistics.median([c['turns'] for c in b]), statistics.median([c['turns'] for c in s])
     cb, cs = statistics.median([c['cost'] for c in b]), statistics.median([c['cost'] for c in s])
-    md.append(f"| {mname} | {pb:.0f}% | {ps:.0f}% | {ps-pb:+.0f} pp | {100*(ts-tb)/tb:+.0f}% | {100*(cs-cb)/cb:+.0f}% |")
+    mb, ms = statistics.mean([c['cost'] for c in b]), statistics.mean([c['cost'] for c in s])
+    md.append(f"| {mname} | {pb:.0f}% | {ps:.0f}% | {ps-pb:+.0f} pp | {100*(ts-tb)/tb:+.0f}% | {100*(cs-cb)/cb:+.0f}% | {100*(ms-mb)/mb:+.0f}% |")
 
 md.append("\n## Pass count per task (passed / cells)\n")
 cols = [(mid, cond) for mid, _ in MODELS for cond in CONDS if any(c['model'] == mid and c['cond'] == cond for c in cells)]
