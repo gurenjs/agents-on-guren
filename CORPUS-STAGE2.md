@@ -310,3 +310,37 @@ The Part A task ported onto the blog baseline, so A and B share one ticket.
 - **Cut line:** if calibration shows a statement cannot be made unambiguous
   or a hidden test cannot be made behaviour-level, drop in this order: S9,
   S8, S6. Never drop on pass rate.
+
+## As built (2026-09-25)
+
+- All nine tasks were authored by Opus 5.5 subagents from the briefs above,
+  each admitted only after `harness/validate-task.sh` passed and after the
+  author broke its own reference at least three ways to show the hidden tests
+  can fail. 85 hidden tests in total; plans on S1, S2 and S4 (authoring cost
+  recorded in each `task.json` `plan_authoring`).
+- **Calibration** (Sonnet 5, N=1, bare / shipped / shipped+plan, 21 cells,
+  $16 API-equivalent): 20 pass, 1 fail. The fail (newsletter-module, bare)
+  was a real defect the hidden tests caught: `update({ confirmedAt })` blocked
+  by `fillable`. No statement or hidden test was changed on the outcome. Stage
+  2 cells ran 19–73 turns and $0.29–1.48 on Sonnet, so the pass-rate ceiling
+  Stage 1 hit is likely to return for Sonnet; the differentiating columns are
+  turns, cost, idiom and the plan-loop adherence.
+- **Harness changes made during calibration**, all applied uniformly to
+  every condition before the production run:
+  1. The `shipped+plan` prompt line ends with "Implement the plan." (the
+     plan-implement skill's trigger). With the earlier line the agents read
+     `docs/plans/` but never ran `plan:next`.
+  2. `Bash(git:*)` is allowed, and the patch is diffed against the recorded
+     start commit rather than `HEAD`, so a plan cell can commit per step
+     without losing work from the scored diff.
+  3. The preamble gained "Runner notes" (write files with the Write/Edit
+     tools, no heredocs, no `cd` chains, `env NAME=value cmd`), and `env` and
+     `python3` are allowed: 17 calibration cells logged 77 denials (50
+     heredocs, 14 `cd` chains, 5 `NAME=value` prefixes), and the one failing
+     cell had been unable to run its own end-to-end check because of them.
+- Even with git allowed, the plan cells called `plan:next` once, read the
+  plan, and implemented the rest in one go (no per-step commits). That is the
+  treatment as measured; the report states adherence per cell rather than
+  assuming the loop ran.
+- The corpus is frozen at this point; the production matrix runs on the
+  harness commit that carries these three changes.
