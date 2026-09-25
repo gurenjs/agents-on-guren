@@ -105,8 +105,9 @@ Opus 2–4 min, Haiku 5–7, Fable 6–7.
 
 ```bash
 python3 harness/summarize-stage2.py --out results/RESULTS-STAGE2.md   # model × condition, delta, per task, idiom, plan loop
-bun harness/api-utilization.ts > results/API-UTILIZATION.md
-bun harness/summarize.ts --csv results/summary.csv --json results/summary.json > results/SUMMARY.md
+# The round-1 scripts read every results/<task>/ and would mix rounds into the
+# round-1 files; write their output for a new round under a separate name.
+bun harness/api-utilization.ts > results/API-UTILIZATION-<stage>.md
 tar --zstd -cf ~/Development/agents-on-guren-streams-$(date +%F).tar.zst results/*/*.stream.jsonl results-calibration-*/*/*.stream.jsonl
 git add results results-calibration-* && git commit        # streams are gitignored; attach the tarball to the release
 ```
