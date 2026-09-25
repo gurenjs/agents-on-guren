@@ -129,14 +129,14 @@ git add results results-calibration-* && git commit        # streams are gitigno
 
 ## 4. Analysis and the report
 
-1. Part A archaeology (`classify-archaeology.ts`), then the two-way split the
-   plan's §6 asks for (package-name confusion vs API learning) is what decides
-   the RFC 0024 question.
-2. Draft EN + JA with a subagent from the plan document's outline, the round-1
-   reports for voice, `.claude/rules/prose.md` for both languages; run the
+1. Part A archaeology (`classify-archaeology.ts`), then the two-way split
+   (package-name confusion vs API learning) is what decides the RFC 0024
+   question.
+2. Draft EN + JA with a subagent from an outline written for the round, the
+   previous reports for voice, `.claude/rules/prose.md` for both languages; run the
    gurenjs prose audit with the locale passed explicitly.
-3. Review: one independent numbers-and-claims review (round 2 used Codex);
-   verify each finding against the logs before applying; recompute ratios
+3. Review: one independent numbers-and-claims review of both drafts; verify
+   each finding against the logs before applying; recompute ratios
    from unrounded medians; give the mean beside the median wherever they
    disagree; state the actual pass gate (`verify.sh`: hidden + typecheck).
 4. Before publishing: push both repos, upload the streams tarball to the
@@ -145,7 +145,6 @@ git add results results-calibration-* && git commit        # streams are gitigno
 
 ## 5. Framework findings
 
-Every finding a round produces goes into the running log of the plan document
-with a number, then into a gurenjs ticket once verified against the source
-(never from an agent's report alone). Round 2 produced 22; the list is in the
-plan document and the report.
+Number every finding a round produces as it turns up, and file it as a
+gurenjs ticket once verified against the source (never from an agent's report
+alone). Round 2 produced 22; the report lists them.
