@@ -25,11 +25,11 @@ The July runner loaded the operator's own MCP servers, plugins and skills. This 
 | Guren, shipped harness (cli 2.27) | Sonnet 5 | 41 (37–52) | $0.60 ($0.60–0.82) | 1.44× |
 | Guren, no harness | Sonnet 5 | 53 (47–59) | $0.71 ($0.59–0.79) | 1.68× |
 | Guren, summer app (716117a) | Sonnet 5 | 37 (35–46) | $0.56 ($0.50–0.62) | 1.33× |
-| Guren, shipped, rules scoped with `paths:` | Sonnet 5 | 31 (30–50) | $0.53 ($0.53–0.68) | 1.27× |
+| Guren, shipped, rule frontmatter fixed | Sonnet 5 | 31 (30–50) | $0.53 ($0.53–0.68) | 1.27× |
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
 
-Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it.
+Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it. The "rule frontmatter fixed" row is the shipped harness with one mistake corrected: its rule files used `globs:`, a key Claude Code does not read, instead of `paths:` (fixed in [#1056](https://github.com/gurenjs/guren/pull/1056), not yet released).
 
 On this task Guren costs more than plain Hono: 1.44 times on Sonnet and 1.5 times on Opus 5.5. The turn counts are close (41 against 38 on Sonnet, 40 each on Opus). For Sonnet, the token accounting below puts the difference in context carried per turn; the Opus cells were not accounted, so their mechanism is unmeasured. Against the bare app the harness saves 23% of turns and 15% of cost at the median, but only 3% of cost at the mean (the same direction as in the summer rounds, with overlapping ranges).
 
@@ -51,14 +51,6 @@ This accounting is an attribution model, not a direct measurement. Every tool ac
 This classifier detected no name confusion in any shipped cell. That is a lower bound: a search hidden among other output of the same command goes undetected. In each bare cell it is the same episode: the agent looks for `paginate()`'s options in `@guren/core/dist`, finds a bare re-export, and ends up in `@guren/server`'s `Paginator.d.ts` after four or five actions. The shipped harness states that signature at session start, so the search never happens.
 
 Eighty percent of the shipped gap is API learning, almost all of it guidance paid for up front. The shipped agent reads almost nothing from `node_modules`; it pays for 25.5k tokens of guidance cached at the start and re-read on each of 16–24 calls, $0.18–0.22 per cell.
-
-### `globs:` is not a key Claude Code reads
-
-That 25.5k is larger than it should be. The harness ships six rule files scoped with a `globs:` frontmatter key. Claude Code's [memory docs](https://code.claude.com/docs/en/memory) name `paths` as the only field a rule is read for. A rule without `paths` loads at launch, like CLAUDE.md. So every scaffolded Guren app has been loading 42 KB of rules at the start of every session.
-
-This contradicts an earlier diagnosis. In August (round 5 in the comparison repo's lab notes) we explained a lost harness win by rules that "attach on edit", after most API research is done. The round-5 app used the same `globs:` key, so its rules were probably loaded at launch too, unless Claude Code treated the key differently in August. The digest that round shipped in `guren context` stands on its own measurement; the explanation around it does not.
-
-A fifth arm scoped the same six rules with `paths:`. The first call's context fell from 53k to 37k tokens, and the medians moved to 31 turns and $0.53, 1.27 times Hono. Some of the saving is offset by rules read later: the agents `cat` the ORM rule CLAUDE.md points to, and Claude Code attaches rule text after file reads (inferred from cache writes, since the stream does not show attached rules). The accounting estimates the smaller startup guidance at $0.12 per cell; the net mean saving is $0.092. The ranges overlap ($0.53–0.68 against $0.60–0.82). The observed direction is consistent with the proposed mechanism, but three trials per arm do not establish an effect. The template fix ([#1056](https://github.com/gurenjs/guren/pull/1056)) has since merged and ships with the next `@guren/cli` release. Apps scaffolded before that release keep the `globs:` rules, so they load every rule at launch. What was measured is one feature, one app and Sonnet, three trials per arm, with overlapping ranges.
 
 ## Part B: nine product tickets
 
@@ -146,11 +138,11 @@ Part of the reason is the loop's design. The Stop hook judges only the step `pla
 
 ## What this means for the framework
 
-RFC 0024 stays where it is. Its case rested on name confusion between `@guren/core` and `@guren/server`, which Part A's classifier did not detect with the harness and found as one recurring search without it. The remaining cost is API learning paid at session start, so the levers are the digest and rule scoping. In this sample the `paths:` arm narrowed the gap by about 40% ($0.244 to $0.152 on means) without renaming a package.
+RFC 0024 stays where it is. Its case rested on name confusion between `@guren/core` and `@guren/server`, which Part A's classifier did not detect with the harness and found as one recurring search without it. The remaining cost is API learning paid at session start, so the levers are the digest and how much guidance loads when a session starts.
 
 The round turned up 22 findings about Guren itself, most of them while the tickets were being written. The main ones:
 
-- Harness: the rules' `globs:` key (#1056 above); the digest had nothing on API tokens, bearer auth or rate limits; `guren context` never mentions modules or `guren.arch.ts`; the hook commands in the scaffolded `settings.json` are relative paths, so after an agent runs `cd` the after-edit hook fails with "Module not found" (12 times in this run, every one right after a `cd`).
+- Harness: the rule files used `globs:` where Claude Code reads `paths:`, so all six loaded at every session start (#1056); the digest had nothing on API tokens, bearer auth or rate limits; `guren context` never mentions modules or `guren.arch.ts`; the hook commands in the scaffolded `settings.json` are relative paths, so after an agent runs `cd` the after-edit hook fails with "Module not found" (12 times in this run, every one right after a `cd`).
 - CLI checks: `guren audit` had no rule for a mutating action that skips a model's policy (it now warns, #1054, merged and not yet released); `check --arch` let a directory import (`'../modules/newsletter'`, the form `make:module` writes) through; `introspect` child processes outlive a crashed parent.
 - ORM and API traps: `where('publishedAt', 'is null')` compares against the string `'is null'` (the agent's tests and the gate passed it, a hidden test did not); `DatabaseApiTokenStore` writes a `Date` into SQLite text timestamps and answers 500; `data.gen.ts` can declare an identifier twice; `belongsToMany` has no `attach`/`sync`; an unauthenticated agent-tool call gets a 302 that tool dispatch maps to success; `@guren/plugin-mcp` answers 500 until a token table exists, and nothing scaffolds one; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
 - Plans: no plan element for a console command or a query scope, and the Stop hook gap above.
