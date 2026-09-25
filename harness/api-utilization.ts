@@ -28,8 +28,17 @@ const GENERIC_HAND = [
   'sql`', 'db\\.select\\(', 'db\\.insert\\(', 'db\\.update\\(', 'db\\.delete\\(', 'throw new Error\\(',
 ]
 
-function addedLines(patch: string): string[] {
-  return patch.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).map((l) => l.slice(1))
+// Stage 2 tickets ask the agent to write tests, so for a task that declares a
+// `baseline` (Stage 2) added lines under tests/ are not evidence of either
+// class; round-1 tasks keep the whole patch, so their published numbers hold.
+function addedLines(patch: string, skipTests = false): string[] {
+  const out: string[] = []
+  let skip = false
+  for (const l of patch.split('\n')) {
+    if (l.startsWith('diff --git ')) { skip = skipTests && /^diff --git a\/tests\//.test(l); continue }
+    if (!skip && l.startsWith('+') && !l.startsWith('+++')) out.push(l.slice(1))
+  }
+  return out
 }
 const count = (lines: string[], res: string[]) => res.reduce((n, re) => n + lines.filter((l) => new RegExp(re).test(l)).length, 0)
 
@@ -45,7 +54,7 @@ for (const task of readdirSync(RESULTS, { withFileTypes: true }).filter((d) => d
     if (v.status !== 'PASS') continue
     const base = f.replace(/\.verdict\.json$/, '')
     const patch = readFileSync(join(RESULTS, task, `${base}.patch`), 'utf8')
-    const lines = addedLines(patch).filter((l) => !/^\s*\/\//.test(l))
+    const lines = addedLines(patch, typeof meta.baseline === 'string').filter((l) => !/^\s*\/\//.test(l))
     const api = count(lines, apiRes), hand = count(lines, handRes)
     const klass = api > 0 && hand === 0 ? 'framework-api' : api === 0 && hand > 0 ? 'handwritten' : api > 0 ? 'mixed' : 'unclassified'
     rows.push({ task, cell: base, condition: v.condition, api, hand, klass, generic })
