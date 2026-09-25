@@ -1,4 +1,4 @@
-# Agents on Guren, round 2: the same feature on Hono, and nine product tickets
+# Agents on Guren, round 2: what 246 runs say about "convention as token efficiency"
 
 *guren.dev, 2026-09-25.*
 

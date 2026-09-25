@@ -1,5 +1,5 @@
 ---
-title: "Agents on Guren 第2弾: 同じ機能をHonoと比べ、9本のプロダクトチケットを解かせた"
+title: "DHH の「規約はトークン効率」を自作フレームワークで測ってみた"
 emoji: "🔥"
 type: "tech"
 topics: ["guren", "bun", "claudecode", "ai", "typescript"]
