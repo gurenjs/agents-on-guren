@@ -1,0 +1,833 @@
+diff --git a/.guren/agents.gen.ts b/.guren/agents.gen.ts
+new file mode 100644
+index 0000000..30c78b6
+--- /dev/null
++++ b/.guren/agents.gen.ts
+@@ -0,0 +1,132 @@
++// Generated — DO NOT EDIT
++// Run `guren codegen` to regenerate.
++
++import type { Data } from './data.gen'
++
++/**
++ * Agent tools derived from the routes that declare `.agent()` metadata
++ * (RFC 0016). Every field here comes from a contract the route already
++ * carries — nothing is restated by hand, so a tool cannot advertise a schema
++ * the endpoint does not validate.
++ *
++ * `inputSchema` merges the route's `params`, `query` and `body` schemas into
++ * one JSON Schema 2020-12 object, with path parameters supplemented as
++ * required strings; it describes what a caller *sends*, so a coercing schema
++ * appears as the type it accepts. `inputSources` records which of those
++ * contracts each merged property came from, and `inputBodyNested` marks a
++ * route whose non-object body was nested under a `body` key to give the tool
++ * an object root; together they are what lets a client rebuild the HTTP
++ * request from a flat tool call. `outputSchema` is present only for routes
++ * that bind an `output` schema — the one shape validated at runtime. Routes
++ * that instead declare a `resource` hint carry its payload type in the
++ * description and in {@link AgentToolOutputTypes}.
++ *
++ * `annotations` are MCP `ToolAnnotations`, resolved to explicit values. They
++ * are hints for client UX, never enforcement: authorization lives in policies
++ * and scopes, and `authorization.ability` here reports the policy ability the
++ * route's middleware chain checks, when that is statically derivable.
++ */
++export const agentTools = {
++  'posts_search': {
++    toolName: "posts_search",
++    routeName: "posts.search",
++    method: "QUERY",
++    path: "/posts/search",
++    description: "Search published posts by keywords matched against title and excerpt. Returns matching posts, newest first.\n\nReturns: { data: Array<{\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}> }",
++    inputSchema: {
++      "type": "object",
++      "properties": {
++        "keywords": {
++          "type": "array",
++          "items": {
++            "type": "string",
++            "minLength": 1
++          },
++          "minItems": 1,
++          "maxItems": 10
++        },
++        "limit": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 50
++        }
++      },
++      "required": [
++        "keywords"
++      ]
++    },
++    inputSources: {
++      "keywords": "body",
++      "limit": "body"
++    },
++    inputBodyNested: false,
++    annotations: {
++      "readOnlyHint": true,
++      "destructiveHint": false,
++      "idempotentHint": true
++    },
++    expose: {
++      "mcp": true,
++      "webMcp": true
++    },
++  },
++  'posts_store': {
++    toolName: "posts_store",
++    routeName: "posts.store",
++    method: "POST",
++    path: "/posts",
++    description: "Create a blog post authored by the signed-in user. Input: title, excerpt and body.\n\nReturns: { data: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n} }",
++    inputSchema: {
++      "type": "object",
++      "properties": {
++        "title": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 255
++        },
++        "excerpt": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 500
++        },
++        "body": {
++          "type": "string",
++          "minLength": 1
++        }
++      },
++      "required": [
++        "title",
++        "excerpt",
++        "body"
++      ]
++    },
++    inputSources: {
++      "title": "body",
++      "excerpt": "body",
++      "body": "body"
++    },
++    inputBodyNested: false,
++    annotations: {
++      "readOnlyHint": false,
++      "destructiveHint": true,
++      "idempotentHint": false
++    },
++    expose: {
++      "mcp": true,
++      "webMcp": true
++    },
++  },
++} as const
++
++export type AgentToolName = keyof typeof agentTools
++
++/**
++ * The payload shape each tool's route declares through a `resource` response
++ * hint — declared, not validated: the server never checks its response
++ * against this. Tools that bind an `output` schema are absent; their
++ * `outputSchema` is the enforced contract and needs no type-level twin.
++ */
++export interface AgentToolOutputTypes {
++  'posts_search': { data: Array<Data.Post> }
++  'posts_store': { data: Data.Post }
++}
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..a88913e 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -64,6 +64,7 @@ export interface ApiRoutes {
+     method: 'POST'
+     path: '/posts'
+     body: { title: string; excerpt: string; body: string }
++    response: { data: Data.Post }
+   }
+   'posts.update': {
+     method: 'PUT'
+diff --git a/app/Auth/ApiTokenStore.ts b/app/Auth/ApiTokenStore.ts
+new file mode 100644
+index 0000000..3d5cbc7
+--- /dev/null
++++ b/app/Auth/ApiTokenStore.ts
+@@ -0,0 +1,6 @@
++import { DatabaseApiTokenStore } from '@guren/core'
++import { apiTokens } from '../../db/schema.js'
++
++// One store instance shared by AuthProvider (the bearer guard) and anything
++// that issues tokens out of a request, so both verify against the same table.
++export const apiTokenStore = new DatabaseApiTokenStore(apiTokens)
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..3ccc292 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -72,9 +72,20 @@ export default class PostController extends Controller {
+     // it comes from the session, and a request must never be able to set it.
+     const post = await Post.forceCreate({ ...data, authorId: author.id })
+ 
++    // The `posts_store` agent tool dispatches with Accept: application/json and
++    // no X-Inertia header; it needs the record, not a redirect it cannot follow.
++    if (this.wantsJson()) {
++      return this.json({ data: new PostResource(post).toJSON() }, { status: 201 })
++    }
++
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+ 
++  private wantsJson(): boolean {
++    const accept = this.request.header('accept') ?? ''
++    return accept.includes('application/json') && !this.request.header('x-inertia')
++  }
++
+   async edit(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findOrFail(id)
+diff --git a/app/Providers/AuthProvider.ts b/app/Providers/AuthProvider.ts
+index 4a7788b..eb103c8 100644
+--- a/app/Providers/AuthProvider.ts
++++ b/app/Providers/AuthProvider.ts
+@@ -1,6 +1,7 @@
+ import { ServiceProvider, shareInertiaProps, AUTH_CONTEXT_KEY } from '@guren/core'
+ import type { AuthContext, AuthManager } from '@guren/core'
+ import { User } from '../Models/User.js'
++import { apiTokenStore } from '../Auth/ApiTokenStore.js'
+ 
+ export default class AuthProvider extends ServiceProvider {
+   register(): void {
+@@ -11,6 +12,9 @@ export default class AuthProvider extends ServiceProvider {
+       rememberTokenColumn: 'rememberToken',
+       credentialsPasswordField: 'password',
+     })
++    // Bearer tokens (the /mcp endpoint's credential) resolve to the same user
++    // records as the session, so policies see the same author either way.
++    auth.useTokens(apiTokenStore, { provider: 'users' })
+   }
+ 
+   // Nothing shares the signed-in user with the frontend by default, so every
+diff --git a/bun.lock b/bun.lock
+index 8ac2665..853d62a 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -9,6 +9,7 @@
+         "@guren/core": "^1.21.0",
+         "@guren/inertia-client": "^1.2.2",
+         "@guren/orm": "^2.12.0",
++        "@guren/plugin-mcp": "^0.6.1",
+         "@inertiajs/react": "^3.6.1",
+         "drizzle-orm": "1.0.0-rc.4",
+         "react": "^19.0.0",
+@@ -108,6 +109,8 @@
+ 
+     "@guren/orm": ["@guren/orm@2.12.0", "", { "dependencies": { "drizzle-orm": "1.0.0-rc.4" }, "peerDependencies": { "@aws-sdk/client-rds-data": "^3.0.0", "mysql2": "^3.11.3", "postgres": "^3.4.3" }, "optionalPeers": ["@aws-sdk/client-rds-data", "mysql2", "postgres"] }, "sha512-oqK3tP7g1/KPdpe0cRO4murTH775gtuYDk7+ulq1CpDFjhesLpqR+dZUNdYPMwzCgQSH5RKf7x2hqp0vOKexag=="],
+ 
++    "@guren/plugin-mcp": ["@guren/plugin-mcp@0.6.1", "", { "dependencies": { "@guren/core": "^1.20.1", "@modelcontextprotocol/server": "^2.0.0" } }, "sha512-q7XWwOhUON0gl6aJEHdDGh+1QUIbuTWMrafDDESGBKogcaWpOcXTvdqxWRUQ+65uqDaOsBJLOkRff6AMOHWwag=="],
++
+     "@guren/server": ["@guren/server@2.26.0", "", { "dependencies": { "@guren/orm": "^2.12.0", "chalk": "^5.3.0", "consola": "^3.4.2", "figlet": "^1.7.0", "hono": "^4.13.7", "ioredis": "^5.11.1", "nodemailer": "^9.1.1" }, "peerDependencies": { "@aws-sdk/client-s3": "^3.0.0", "@aws-sdk/client-sqs": "^3.0.0", "@aws-sdk/s3-request-presigner": "^3.0.0", "@guren/inertia-client": "^1.0.0", "vite": ">=7.0.0" }, "optionalPeers": ["@aws-sdk/client-s3", "@aws-sdk/client-sqs", "@aws-sdk/s3-request-presigner", "@guren/inertia-client"] }, "sha512-S0UC5neehto3aItMhGVBqDp+kWbxSdb1C3HrUG2JODm3+VRIY4l7WHcjToi7zpB3rD24nk0VnlVSbTZEoWLzhg=="],
+ 
+     "@guren/testing": ["@guren/testing@1.14.0", "", { "peerDependencies": { "@guren/core": ">=1.8.0", "@guren/plugin-ai": ">=0.1.0", "@guren/server": ">=2.26.0", "@inertiajs/react": "^3.6.1", "@testing-library/react": "^14.0.0 || ^15.0.0 || ^16.0.0", "ai": "^7.0.106", "hono": "^4.13.7", "react": "^18.0.0 || ^19.0.0", "vitest": "^3.2.6 || ^4.1.11 || ^5.0.0" }, "optionalPeers": ["@guren/core", "@guren/plugin-ai", "@inertiajs/react", "@testing-library/react", "ai", "react", "vitest"] }, "sha512-T5NR9ZV/PtdJFEd8r2RVau34mLxSwOUci7kvr0wWkBYZ8tHGoWI0eQ9zc7mLYhmWaYxYmKHlq4ER4l7eWAC1Gw=="],
+diff --git a/db/migrations/20260925065150_api_tokens/migration.sql b/db/migrations/20260925065150_api_tokens/migration.sql
+new file mode 100644
+index 0000000..93dbd22
+--- /dev/null
++++ b/db/migrations/20260925065150_api_tokens/migration.sql
+@@ -0,0 +1,11 @@
++CREATE TABLE `api_tokens` (
++	`id` text PRIMARY KEY,
++	`user_id` integer NOT NULL,
++	`name` text NOT NULL,
++	`hashed_token` text NOT NULL UNIQUE,
++	`abilities` text NOT NULL,
++	`last_used_at` integer,
++	`expires_at` integer,
++	`created_at` integer NOT NULL,
++	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
++);
+diff --git a/db/migrations/20260925065150_api_tokens/snapshot.json b/db/migrations/20260925065150_api_tokens/snapshot.json
+new file mode 100644
+index 0000000..8f223c3
+--- /dev/null
++++ b/db/migrations/20260925065150_api_tokens/snapshot.json
+@@ -0,0 +1,308 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "352daa42-98c0-4580-84ca-0b408bedd913",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "api_tokens",
++      "entityType": "tables"
++    },
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "user_id",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "hashed_token",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "abilities",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "last_used_at",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "expires_at",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "user_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_api_tokens_user_id_users_id_fk",
++      "entityType": "fks",
++      "table": "api_tokens"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "api_tokens_pk",
++      "table": "api_tokens",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "hashed_token"
++      ],
++      "nameExplicit": false,
++      "name": "api_tokens_hashed_token_unique",
++      "entityType": "uniques",
++      "table": "api_tokens"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..a799534 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -20,3 +20,18 @@ export const posts = sqliteTable('posts', {
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
++
++// Bearer credentials for the /mcp endpoint. Property names must match the
++// framework's ApiToken fields, which DatabaseApiTokenStore reads and writes.
++export const apiTokens = sqliteTable('api_tokens', {
++  id: text('id').primaryKey(),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id),
++  name: text('name').notNull(),
++  hashedToken: text('hashed_token').notNull().unique(),
++  abilities: text('abilities', { mode: 'json' }).$type<string[]>().notNull(),
++  lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }),
++  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
++  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
++})
+diff --git a/package.json b/package.json
+index cd951fa..31b83dd 100644
+--- a/package.json
++++ b/package.json
+@@ -25,6 +25,7 @@
+     "@guren/core": "^1.21.0",
+     "@guren/inertia-client": "^1.2.2",
+     "@guren/orm": "^2.12.0",
++    "@guren/plugin-mcp": "^0.6.1",
+     "@inertiajs/react": "^3.6.1",
+     "drizzle-orm": "1.0.0-rc.4",
+     "react": "^19.0.0",
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..0eea745 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -24,7 +24,19 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.middleware('auth').group((authed) => {
+       authed.get('/create', [PostController, 'create']).name('posts.create')
+       authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
+-      authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
++      // Also the `posts_store` MCP tool: same schema, same policy check, the
++      // author is always the calling user. `resource` describes the JSON the
++      // action answers a tool with (the browser still gets a redirect).
++      authed
++        .post('/', {
++          name: 'posts.store',
++          body: PostPayloadSchema,
++          resource: { data: PostResource },
++        }, [PostController, 'store'])
++        .agent({
++          toolName: 'posts_store',
++          description: 'Create a blog post authored by the signed-in user. Input: title, excerpt and body.',
++        })
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
+     })
+@@ -43,5 +55,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+       // type codegen already extracts from the Resource.
+       resource: { data: [PostResource] },
+     }, [PostController, 'search'])
++      // Also the `posts_search` MCP tool; QUERY derives readOnlyHint: true.
++      .agent({
++        toolName: 'posts_search',
++        description: 'Search published posts by keywords matched against title and excerpt. Returns matching posts, newest first.',
++      })
+   })
+ }
+diff --git a/src/app.ts b/src/app.ts
+index 3789858..5e3fcbb 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -5,7 +5,8 @@
+ // on invalid input, refinements/transforms can run twice (fast path, then
+ // fallback), so keep .refine()/.transform() free of side effects.
+ import 'zod/compile'
+-import { createApp } from '@guren/core'
++import { createApp, EventServiceProvider } from '@guren/core'
++import { mcpPlugin } from '@guren/plugin-mcp'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
+ import database from '../config/database.js'
+@@ -25,7 +26,10 @@ const app = createApp({
+   config: [database, http],
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [AuthProvider, AuthorizationProvider],
++  // EventServiceProvider precedes mcpPlugin(): the plugin emits its tool
++  // events through the event manager and warns at boot when none is bound.
++  // mcpPlugin() serves the routes carrying .agent() at /mcp, bearer-only.
++  providers: [EventServiceProvider, AuthProvider, AuthorizationProvider, mcpPlugin({ path: '/mcp' })],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/tests/McpTools.test.ts b/tests/McpTools.test.ts
+new file mode 100644
+index 0000000..9d962d7
+--- /dev/null
++++ b/tests/McpTools.test.ts
+@@ -0,0 +1,168 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
++import { createApiToken } from '@guren/core'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++
++interface JsonRpcResult {
++  result?: {
++    tools?: Array<{ name: string; annotations?: { readOnlyHint?: boolean } }>
++    content?: Array<{ type: string; text?: string }>
++    structuredContent?: unknown
++    isError?: boolean
++  }
++  error?: { code: number; message: string }
++}
++
++interface SearchBody {
++  data: Array<Record<string, unknown>>
++}
++
++// The plugin answers plain JSON or an SSE stream depending on the Accept
++// header; the JSON-RPC payload is the last `data:` line either way.
++function parseRpc(text: string): JsonRpcResult {
++  const dataLines = text.split('\n').filter((line) => line.startsWith('data:'))
++  const payload = dataLines.length > 0 ? dataLines[dataLines.length - 1]!.slice(5).trim() : text
++  return JSON.parse(payload) as JsonRpcResult
++}
++
++describe('MCP agent tools at /mcp', () => {
++  let http: TestApp
++  let author: UserRecord
++  let bearer: string
++  let nextId = 1
++
++  async function rpc(method: string, params: Record<string, unknown>, token?: string) {
++    let client = http.json().withHeader('Accept', 'application/json, text/event-stream')
++    if (token) client = client.withHeader('Authorization', `Bearer ${token}`)
++    const response = await client.post('/mcp', { jsonrpc: '2.0', id: nextId++, method, params })
++    return { status: response.status, body: parseRpc(await response.text()) }
++  }
++
++  function toolResultJson<T>(body: JsonRpcResult): T {
++    const result = body.result
++    if (!result) throw new Error(`no result in ${JSON.stringify(body)}`)
++    if (result.structuredContent !== undefined) return result.structuredContent as T
++    const text = result.content?.find((part) => part.type === 'text')?.text
++    if (!text) throw new Error(`no text content in ${JSON.stringify(body)}`)
++    return JSON.parse(text) as T
++  }
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++    author = await User.create({ name: 'Ada', email: 'ada@example.com', password: 'correct-horse-battery' })
++    const store = app.auth.getApiTokenStore()
++    if (!store) throw new Error('AuthProvider did not configure an API token store')
++    const issued = await createApiToken(store, { name: 'assistant', userId: author.id, abilities: ['tools:*'] })
++    bearer = issued.plainTextToken
++  })
++
++  it('refuses a call without a bearer credential', async () => {
++    const { status } = await rpc('tools/list', {})
++    expect(status).toBe(401)
++  })
++
++  it('lists exactly posts_search (read-only) and posts_store (not read-only)', async () => {
++    const { status, body } = await rpc('tools/list', {}, bearer)
++    expect(status).toBe(200)
++    const tools = (body.result?.tools ?? []).filter((tool) => !tool.name.startsWith('guren_'))
++    const summary = tools
++      .map((tool) => ({ name: tool.name, readOnly: tool.annotations?.readOnlyHint === true }))
++      .sort((a, b) => a.name.localeCompare(b.name))
++    expect(summary).toEqual([
++      { name: 'posts_search', readOnly: true },
++      { name: 'posts_store', readOnly: false },
++    ])
++  })
++
++  it('the derived tool catalog agrees with the endpoint', async () => {
++    const tools = await http.agent().tools()
++    const summary = tools
++      .map((tool) => ({ name: tool.toolName, readOnly: tool.annotations.readOnlyHint }))
++      .sort((a, b) => a.name.localeCompare(b.name))
++    expect(summary).toEqual([
++      { name: 'posts_search', readOnly: true },
++      { name: 'posts_store', readOnly: false },
++    ])
++  })
++
++  it('posts_search answers the same JSON as QUERY /posts/search', async () => {
++    await Post.forceCreate({ title: 'Bun 2.0 released', excerpt: 'Fast', body: '...', authorId: author.id })
++    await Post.forceCreate({ title: 'Unrelated', excerpt: 'Nothing here', body: '...', authorId: author.id })
++    const input = { keywords: ['bun'], limit: 5 }
++
++    const expected = await (await http.query('/posts/search', input)).json<SearchBody>()
++    expect(expected.data).toHaveLength(1)
++
++    const { body } = await rpc('tools/call', { name: 'posts_search', arguments: input }, bearer)
++    expect(body.result?.isError ?? false).toBe(false)
++    expect(toolResultJson<SearchBody>(body)).toEqual(expected)
++  })
++
++  it('posts_store creates the post for the credential user and ignores authorId', async () => {
++    const other = await User.create({ name: 'Bob', email: 'bob@example.com', password: 'correct-horse-battery' })
++    const { body } = await rpc('tools/call', {
++      name: 'posts_store',
++      arguments: { title: 'Drafted by assistant', excerpt: 'Summary', body: 'Body text', authorId: other.id },
++    }, bearer)
++
++    expect(body.error).toBeUndefined()
++    expect(body.result?.isError ?? false).toBe(false)
++    const created = await Post.all()
++    expect(created).toHaveLength(1)
++    expect(created[0]!.title).toBe('Drafted by assistant')
++    expect(created[0]!.authorId).toBe(author.id)
++  })
++
++  it('posts_store rejects input the web form rejects with a 422 and creates nothing', async () => {
++    const { body } = await rpc('tools/call', {
++      name: 'posts_store',
++      arguments: { title: '', excerpt: 'Summary', body: 'Body text' },
++    }, bearer)
++
++    expect(body.result?.isError).toBe(true)
++    const text = body.result?.content?.map((part) => part.text ?? '').join('\n') ?? ''
++    expect(text).toContain('Title is required.')
++    expect(await Post.all()).toHaveLength(0)
++
++    // An MCP error result carries no HTTP status; the endpoint's preflight
++    // companion tool and the in-process bridge both expose the 422.
++    const { body: preflight } = await rpc('tools/call', {
++      name: 'guren_preflight',
++      arguments: { tool: 'posts_store', input: { title: '', excerpt: 'Summary', body: 'Body text' } },
++    }, bearer)
++    expect(toolResultJson<{ allowed: boolean; status: number }>(preflight)).toMatchObject({ allowed: false, status: 422 })
++
++    const bridged = (await http.withCsrf('/posts')).agent()
++    await bridged
++      .call('posts_store', { title: '', excerpt: 'Summary', body: 'Body text' }, { as: author })
++      .assertStatus(422)
++    expect(await Post.all()).toHaveLength(0)
++  })
++
++  it('posts_store refuses a caller who is not signed in', async () => {
++    const result = await http.agent().call('posts_store', { title: 'Guest', excerpt: 'x', body: 'y' })
++    expect([302, 303, 401, 403]).toContain(result.status)
++    expect(await Post.all()).toHaveLength(0)
++  })
++
++  it('posts_search is callable without being signed in', async () => {
++    await Post.forceCreate({ title: 'Bun tips', excerpt: 'Fast', body: '...', authorId: author.id })
++    const result = await http.agent().call('posts_search', { keywords: ['bun'] }).assertOk()
++    expect(result.json<SearchBody>().data).toHaveLength(1)
++  })
++
++  it('the web form still redirects after creating a post', async () => {
++    const session = await http.actingAs(author).withCsrf('/posts')
++    await session
++      .post('/posts', { title: 'From the form', excerpt: 'Summary', body: 'Body text' })
++      .assertRedirect()
++    expect(await Post.all()).toHaveLength(1)
++  })
++})

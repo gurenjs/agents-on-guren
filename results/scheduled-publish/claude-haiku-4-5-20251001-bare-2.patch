@@ -1,0 +1,504 @@
+diff --git a/app/Console/Commands/PostsScheduledCommand.ts b/app/Console/Commands/PostsScheduledCommand.ts
+new file mode 100644
+index 0000000..777a490
+--- /dev/null
++++ b/app/Console/Commands/PostsScheduledCommand.ts
+@@ -0,0 +1,22 @@
++import { Command } from '@guren/core'
++import { Post } from '../../Models/Post.js'
++
++export default class PostsScheduledCommand extends Command {
++  static override signature = 'posts:scheduled'
++  static override description = 'List all scheduled posts'
++
++  async handle(): Promise<number> {
++    const now = new Date().toISOString()
++    const posts = await Post.newQuery()
++      .whereNotNull('publishedAt')
++      .where('publishedAt', '>', now)
++      .orderBy('publishedAt', 'asc')
++      .get()
++
++    for (const post of posts) {
++      console.log(`${post.id}\t${post.title}\t${post.publishedAt}`)
++    }
++
++    return 0
++  }
++}
+diff --git a/app/Http/Controllers/HomeController.ts b/app/Http/Controllers/HomeController.ts
+index fc8ac0b..397137c 100644
+--- a/app/Http/Controllers/HomeController.ts
++++ b/app/Http/Controllers/HomeController.ts
+@@ -1,17 +1,32 @@
+ import { Controller } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import type { UserRecord } from '../../Models/User.js'
+ import { PostResource } from '../Resources/PostResource.js'
+ 
+ const LATEST_POST_COUNT = 3
+ 
+ export default class HomeController extends Controller {
+   async index(): Promise<Response> {
+-    const latest = await Post.newQuery()
++    const user = await this.auth.user<UserRecord | null>()
++
++    const query = Post.newQuery()
+       .with('author')
+       .orderBy('id', 'desc')
+-      .limit(LATEST_POST_COUNT)
+-      .get()
++
++    if (!user) {
++      query.where((q) => {
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++      })
++    } else {
++      query.where((q) => {
++        q.where((inner) => {
++          inner.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++        }).orWhere('authorId', user.id)
++      })
++    }
++
++    const latest = await query.limit(LATEST_POST_COUNT).get()
+ 
+     return this.inertia(
+       pages.Home,
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..888beee 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -3,17 +3,35 @@ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+-import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, ListPostsQuerySchema, type PostPayload } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
++function isScheduled(post: { publishedAt?: string | null }): boolean {
++  if (!post.publishedAt) return false
++  return new Date(post.publishedAt) > new Date()
++}
++
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+-    const result = await Post.newQuery()
+-      .with('author')
+-      .orderBy('id', 'desc')
+-      .paginate({ page, perPage: 10 })
++    const user = await this.auth.user<UserRecord | null>()
++
++    const query = Post.newQuery().with('author').orderBy('id', 'desc')
++
++    if (!user) {
++      query.where((q) => {
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++      })
++    } else {
++      query.where((q) => {
++        q.where((inner) => {
++          inner.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++        }).orWhere('authorId', user.id)
++      })
++    }
++
++    const result = await query.paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+@@ -31,8 +49,9 @@ export default class PostController extends Controller {
+   // starter treats as a feature.
+   async search(): Promise<Response> {
+     const { keywords, limit } = this.validated('posts.search').body
++    const user = await this.auth.user<UserRecord | null>()
+ 
+-    const posts = await Post.newQuery()
++    const query = Post.newQuery()
+       .with('author')
+       // All keyword OR pairs sit inside one callback, keeping this an
+       // any-keyword match while AND filters added later (a published flag,
+@@ -43,6 +62,20 @@ export default class PostController extends Controller {
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+       })
++
++    if (!user) {
++      query.where((q) => {
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++      })
++    } else {
++      query.where((q) => {
++        q.where((inner) => {
++          inner.whereNull('publishedAt').orWhere('publishedAt', '<=', new Date().toISOString())
++        }).orWhere('authorId', user.id)
++      })
++    }
++
++    const posts = await query
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+@@ -53,6 +86,11 @@ export default class PostController extends Controller {
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
++    const user = await this.auth.user<UserRecord | null>()
++
++    if (isScheduled(post) && (!user || Number(user.id) !== post.authorId)) {
++      return new Response(null, { status: 404 })
++    }
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+@@ -68,9 +106,14 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const { body: data } = this.validated('posts.store')
++    const { publishAt, ...rest } = data as PostPayload
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({
++      ...rest,
++      authorId: author.id,
++      publishedAt: publishAt || null,
++    })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +134,11 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const { body: data } = this.validated('posts.update')
+-    await Post.update({ id: post.id }, data)
++    const { publishAt, ...rest } = data as PostPayload
++    await Post.update({ id: post.id }, {
++      ...rest,
++      publishedAt: publishAt !== undefined ? publishAt : undefined,
++    })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index 679024d..f6b376b 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -13,6 +13,7 @@ export interface PostResourceData extends Record<string, unknown> {
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
++  publishedAt?: string
+   author?: PostAuthorSummary
+ }
+ 
+@@ -27,6 +28,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
+       body: post.body,
+       authorId: post.authorId,
+       createdAt: new Date(post.createdAt).toISOString(),
++      publishedAt: post.publishedAt ? post.publishedAt : undefined,
+       author: this.whenLoaded('author', () => ({
+         id: (post as PostWithAuthor).author?.id,
+         name: (post as PostWithAuthor).author?.name,
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..1332d09 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,7 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
++  publishAt: z.string().datetime().nullable().optional(),
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index ca838be..06ada83 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -8,7 +8,7 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts, {
+   // `authorId` is set from the signed-in user, never from request input.
+-  fillable: ['title', 'excerpt', 'body'],
++  fillable: ['title', 'excerpt', 'body', 'publishedAt'],
+ }) {
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+diff --git a/app/Policies/PostPolicy.ts b/app/Policies/PostPolicy.ts
+index 0ceaa1e..3e7d350 100644
+--- a/app/Policies/PostPolicy.ts
++++ b/app/Policies/PostPolicy.ts
+@@ -2,6 +2,12 @@ import { Policy, type AuthUser } from '@guren/core'
+ 
+ interface PostLike {
+   authorId: number
++  publishedAt?: string | null
++}
++
++function isScheduled(post: PostLike): boolean {
++  if (!post.publishedAt) return false
++  return new Date(post.publishedAt) > new Date()
+ }
+ 
+ /**
+@@ -14,8 +20,9 @@ export class PostPolicy extends Policy {
+     return true
+   }
+ 
+-  view(_user: AuthUser | null, _post: PostLike): boolean {
+-    return true
++  view(user: AuthUser | null, post: PostLike): boolean {
++    if (!isScheduled(post)) return true
++    return user !== null && Number(user.id) === post.authorId
+   }
+ 
+   create(user: AuthUser | null): boolean {
+diff --git a/db/migrations/20260925034806_hesitant_saracen/migration.sql b/db/migrations/20260925034806_hesitant_saracen/migration.sql
+new file mode 100644
+index 0000000..c01c12b
+--- /dev/null
++++ b/db/migrations/20260925034806_hesitant_saracen/migration.sql
+@@ -0,0 +1 @@
++ALTER TABLE `posts` ADD `published_at` text;
+\ No newline at end of file
+diff --git a/db/migrations/20260925034806_hesitant_saracen/snapshot.json b/db/migrations/20260925034806_hesitant_saracen/snapshot.json
+new file mode 100644
+index 0000000..824901d
+--- /dev/null
++++ b/db/migrations/20260925034806_hesitant_saracen/snapshot.json
+@@ -0,0 +1,201 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "e6cf87b5-d09c-4b8c-baf9-fc88727a2d5c",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "published_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..a9fc7a1 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -19,4 +19,5 @@ export const posts = sqliteTable('posts', {
+     .notNull()
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
++  publishedAt: text('published_at'),
+ })
+diff --git a/src/console.ts b/src/console.ts
+index 83594f0..9ccd5d5 100644
+--- a/src/console.ts
++++ b/src/console.ts
+@@ -1,9 +1,12 @@
+ import { ConsoleKernel } from '@guren/core'
+ import app from './app.js'
++import PostsScheduledCommand from '../app/Console/Commands/PostsScheduledCommand.js'
+ 
+ export const kernel = new ConsoleKernel({ container: app.container })
+ 
+ // `bunx guren make:command` adds the import and the array entry for you; the
+ // empty array literal is what it edits, so keep it even while unused.
+ // `bunx guren check` warns about any command class this file never registers.
+-kernel.registerMany([])
++kernel.registerMany([
++  PostsScheduledCommand,
++])

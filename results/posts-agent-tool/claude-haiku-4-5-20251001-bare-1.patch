@@ -1,0 +1,234 @@
+diff --git a/app/Http/Controllers/McpController.ts b/app/Http/Controllers/McpController.ts
+new file mode 100644
+index 0000000..91c1e03
+--- /dev/null
++++ b/app/Http/Controllers/McpController.ts
+@@ -0,0 +1,131 @@
++import { Controller } from '@guren/core'
++import { buildToolRequest, mapToolResponse } from '@guren/server/agent'
++import { deriveAgentTools, type DerivedAgentTool } from '@guren/server'
++import type { UserRecord } from '../../Models/User.js'
++
++interface JsonRpcRequest {
++  jsonrpc: '2.0'
++  id: string | number | null
++  method: string
++  params?: Record<string, unknown>
++}
++
++interface JsonRpcResponse {
++  jsonrpc: '2.0'
++  id: string | number | null
++  result?: unknown
++  error?: {
++    code: number
++    message: string
++    data?: unknown
++  }
++}
++
++export default class McpController extends Controller {
++  async handle(): Promise<Response> {
++    const authHeader = this.request.header('authorization')
++
++    if (!authHeader) {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Unauthorized' } }, { status: 401 })
++    }
++
++    let user: UserRecord | null = null
++    try {
++      const guard = this.auth.guard('token')
++      user = await guard.user<UserRecord>()
++    } catch {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid token' } }, { status: 401 })
++    }
++
++    if (!user) {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Unauthorized' } }, { status: 401 })
++    }
++
++    let body: JsonRpcRequest
++    try {
++      body = (await this.request.json()) as JsonRpcRequest
++    } catch {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, { status: 400 })
++    }
++
++    const { jsonrpc, id, method, params } = body
++
++    try {
++      if (method === 'tools/list') {
++        const result = await this.listTools()
++        return this.json({ jsonrpc, id, result } as JsonRpcResponse)
++      } else if (method === 'tools/call') {
++        const result = await this.callTool(params as any)
++        return this.json({ jsonrpc, id, result } as JsonRpcResponse)
++      } else {
++        return this.json({ jsonrpc, id, error: { code: -32601, message: 'Method not found' } } as JsonRpcResponse, { status: 400 })
++      }
++    } catch (error) {
++      console.error('MCP error:', error)
++      return this.json({
++        jsonrpc,
++        id,
++        error: { code: -32603, message: 'Internal error', data: (error as any)?.message },
++      } as JsonRpcResponse, { status: 500 })
++    }
++  }
++
++  private async listTools(): Promise<{ tools: Array<{ name: string; description: string; inputSchema: any; annotations: any }> }> {
++    const container = this.ctx.get('container') as any
++    const app = container.make('app') as any
++    const definitions = app.router.definitions()
++
++    const { tools } = deriveAgentTools(definitions)
++
++    return {
++      tools: tools.map((tool) => ({
++        name: tool.toolName,
++        description: tool.description || '',
++        inputSchema: tool.inputSchema,
++        annotations: {
++          readOnly: tool.annotations.readOnlyHint,
++          isDestructive: tool.annotations.destructiveHint,
++          isIdempotent: tool.annotations.idempotentHint,
++        },
++      })),
++    }
++  }
++
++  private async callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<any> {
++    const container = this.ctx.get('container') as any
++    const app = container.make('app') as any
++    const definitions = app.router.definitions()
++
++    const { tools } = deriveAgentTools(definitions)
++    const tool = tools.find((t) => t.toolName === params.name)
++
++    if (!tool) {
++      return {
++        content: [{ type: 'text', text: `Tool not found: ${params.name}` }],
++        isError: true,
++      }
++    }
++
++    const authHeader = this.request.header('authorization') || ''
++    const builtRequest = buildToolRequest(tool, params.arguments || {}, {
++      authorization: authHeader,
++      surface: 'mcp',
++    })
++
++    if ('missing' in builtRequest || 'invalidPath' in builtRequest) {
++      return {
++        content: [{ type: 'text', text: `Invalid tool call: ${JSON.stringify(builtRequest)}` }],
++        isError: true,
++      }
++    }
++
++    const response = await app.fetch(builtRequest.request)
++    const outcome = await mapToolResponse(tool, response)
++
++    return {
++      content: outcome.content,
++      isError: outcome.isError || false,
++      structuredContent: outcome.structuredContent,
++    }
++  }
++}
+diff --git a/app/Providers/AuthProvider.ts b/app/Providers/AuthProvider.ts
+index 4a7788b..e7cf1e3 100644
+--- a/app/Providers/AuthProvider.ts
++++ b/app/Providers/AuthProvider.ts
+@@ -1,6 +1,7 @@
+-import { ServiceProvider, shareInertiaProps, AUTH_CONTEXT_KEY } from '@guren/core'
++import { ServiceProvider, shareInertiaProps, AUTH_CONTEXT_KEY, DatabaseApiTokenStore } from '@guren/core'
+ import type { AuthContext, AuthManager } from '@guren/core'
+ import { User } from '../Models/User.js'
++import { apiTokens } from '../../db/schema.js'
+ 
+ export default class AuthProvider extends ServiceProvider {
+   register(): void {
+@@ -11,6 +12,10 @@ export default class AuthProvider extends ServiceProvider {
+       rememberTokenColumn: 'rememberToken',
+       credentialsPasswordField: 'password',
+     })
++    auth.useTokens(new DatabaseApiTokenStore(apiTokens), {
++      provider: 'users',
++      guardName: 'token',
++    })
+   }
+ 
+   // Nothing shares the signed-in user with the frontend by default, so every
+diff --git a/db/migrations/20260925000000_api_tokens/migration.sql b/db/migrations/20260925000000_api_tokens/migration.sql
+new file mode 100644
+index 0000000..02d195b
+--- /dev/null
++++ b/db/migrations/20260925000000_api_tokens/migration.sql
+@@ -0,0 +1,10 @@
++CREATE TABLE `api_tokens` (
++	`id` text PRIMARY KEY,
++	`user_id` integer NOT NULL,
++	`hashed_token` text NOT NULL UNIQUE,
++	`abilities` text NOT NULL,
++	`expires_at` text,
++	`last_used_at` text,
++	`created_at` text NOT NULL,
++	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
++);
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..ebd98cf 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -20,3 +20,15 @@ export const posts = sqliteTable('posts', {
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
++
++export const apiTokens = sqliteTable('api_tokens', {
++  id: text('id').primaryKey(),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id),
++  hashedToken: text('hashed_token').notNull().unique(),
++  abilities: text('abilities', { mode: 'json' }).notNull().$type<string[]>(),
++  expiresAt: text('expires_at'),
++  lastUsedAt: text('last_used_at'),
++  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
++})
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..5540a7e 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,6 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import McpController from '../app/Http/Controllers/McpController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -17,6 +18,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+   // Health check endpoint for load balancers and uptime monitors
+   router.get('/health', (c) => c.json({ status: 'ok' }))
+ 
++  // MCP endpoint for agent tools
++  router.post('/mcp', [McpController, 'handle']).name('mcp')
++
+   registerAuthRoutes(router)
+ 
+   router.group('/posts', (posts) => {
+@@ -25,6 +29,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+       authed.get('/create', [PostController, 'create']).name('posts.create')
+       authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
+       authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
++        .agent({ toolName: 'posts_store' })
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
+     })
+@@ -43,5 +48,6 @@ export function registerWebRoutes(baseRouter: Router): void {
+       // type codegen already extracts from the Resource.
+       resource: { data: [PostResource] },
+     }, [PostController, 'search'])
++      .agent({ toolName: 'posts_search' })
+   })
+ }

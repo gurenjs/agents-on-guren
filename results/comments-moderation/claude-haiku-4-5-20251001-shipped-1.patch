@@ -1,0 +1,1138 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..0899dc4 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,19 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'comments.destroy': {
++    method: 'DELETE'
++    path: '/comments/:id'
++  }
++  'comments.report': {
++    method: 'POST'
++    path: '/comments/:id/report'
++  }
++  'comments.store': {
++    method: 'POST'
++    path: '/posts/:id/comments'
++    body: { body: string }
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -303,6 +316,9 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'comments.destroy': { method: 'DELETE', path: '/comments/:id' },
++  'comments.report': { method: 'POST', path: '/comments/:id/report' },
++  'comments.store': { method: 'POST', path: '/posts/:id/comments' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..9bc3a0e 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -3,6 +3,7 @@
+ 
+ import type { PageContract, PagePropsRecord } from '@guren/inertia-client'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
++import type { CommentData } from '@/app/Http/Controllers/PostController'
+ import type { PostResourceData } from '@/app/Http/Resources/PostResource'
+ import type { PaginatedPageProps, ValidationErrors } from '@guren/core'
+ 
+@@ -53,6 +54,7 @@ export interface PagePropsMap {
+   'posts/Index': PaginatedPageProps<PostResourceData> & {}
+   'posts/Show': {
+   post: PostResourceData
++  comments?: CommentData[]
+ }
+   'profile/Edit': {
+   profile: { name: string; email: string }
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..5a9e9a9 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,9 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'comments.destroy': { method: 'DELETE', path: '/comments/:id' },
++  'comments.report': { method: 'POST', path: '/comments/:id/report' },
++  'comments.store': { method: 'POST', path: '/posts/:id/comments' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +70,11 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  comments: {
++    destroy: (params: RouteParams<'comments.destroy'>, query?: RouteQuery) => route('comments.destroy', params, query),
++    report: (params: RouteParams<'comments.report'>, query?: RouteQuery) => route('comments.report', params, query),
++    store: (params: RouteParams<'comments.store'>, query?: RouteQuery) => route('comments.store', params, query)
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+@@ -147,6 +155,7 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
++      'comments.store': { body: { body: string } }
+       'posts.search': { body: { keywords: string[]; limit: number } }
+       'posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.update': { body: { title: string; excerpt: string; body: string } }
+diff --git a/app/Http/Controllers/CommentController.ts b/app/Http/Controllers/CommentController.ts
+new file mode 100644
+index 0000000..4e329d5
+--- /dev/null
++++ b/app/Http/Controllers/CommentController.ts
+@@ -0,0 +1,51 @@
++import { Controller } from '@guren/core'
++import { Comment } from '../../Models/Comment.js'
++import { CommentReport } from '../../Models/CommentReport.js'
++import { Post } from '../../Models/Post.js'
++import type { UserRecord } from '../../Models/User.js'
++import { CommentIdParamSchema, PostIdParamSchema } from '../Validators/CommentValidator.js'
++
++export default class CommentController extends Controller {
++  async store(): Promise<Response> {
++    const { id: postId } = this.validateParams(PostIdParamSchema)
++    await Post.findOrFail(postId)
++
++    const user = await this.auth.userOrFail<UserRecord>()
++    const { body: data } = this.validated('comments.store')
++
++    await Comment.forceCreate({ ...data, postId, userId: user.id })
++
++    return this.redirect(`/posts/${postId}`)
++  }
++
++  async destroy(): Promise<Response> {
++    const { id: commentId } = this.validateParams(CommentIdParamSchema)
++    const comment = await Comment.findOrFail(commentId)
++
++    await this.authorize('delete', [Comment, comment])
++
++    const post = await Post.findOrFail(comment.postId)
++
++    await Comment.delete({ id: comment.id })
++
++    return this.redirect(`/posts/${post.id}`)
++  }
++
++  async report(): Promise<Response> {
++    const { id: commentId } = this.validateParams(CommentIdParamSchema)
++    await Comment.findOrFail(commentId)
++
++    const user = await this.auth.userOrFail<UserRecord>()
++
++    const existing = await CommentReport.first({
++      commentId,
++      userId: user.id,
++    })
++
++    if (!existing) {
++      await CommentReport.forceCreate({ commentId, userId: user.id })
++    }
++
++    return new Response(null, { status: 204 })
++  }
++}
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..eec7809 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,12 +1,20 @@
+ import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import { CommentReport } from '../../Models/CommentReport.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
++export interface CommentData {
++  id: number
++  body: string
++  author: { id: number; name: string }
++  createdAt: string
++}
++
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+@@ -52,10 +60,38 @@ export default class PostController extends Controller {
+ 
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+-    const post = await Post.findWithOrFail(id, 'author')
++    const post = await Post.findWithOrFail(id, ['author', 'comments.author'])
++
++    const reportCounts = await CommentReport.newQuery()
++      .where('commentId', 'in', post.comments.map((c) => c.id))
++      .get()
++
++    const reportsByCommentId = new Map<number, number>()
++    for (const report of reportCounts) {
++      reportsByCommentId.set(
++        report.commentId,
++        (reportsByCommentId.get(report.commentId) ?? 0) + 1,
++      )
++    }
++
++    const visibleComments = post.comments
++      .filter((c) => (reportsByCommentId.get(c.id) ?? 0) < 3)
++      .map(
++        (c) =>
++          ({
++            id: c.id,
++            body: c.body,
++            author: {
++              id: (c as any).author.id,
++              name: (c as any).author.name,
++            },
++            createdAt: new Date(c.createdAt).toISOString(),
++          }) satisfies CommentData,
++      )
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
++      comments: visibleComments,
+     })
+   }
+ 
+diff --git a/app/Http/Validators/CommentValidator.ts b/app/Http/Validators/CommentValidator.ts
+new file mode 100644
+index 0000000..79f71a0
+--- /dev/null
++++ b/app/Http/Validators/CommentValidator.ts
+@@ -0,0 +1,15 @@
++import { z } from 'zod'
++
++export const CommentIdParamSchema = z.object({
++  id: z.coerce.number().int().positive(),
++})
++
++export const PostIdParamSchema = z.object({
++  id: z.coerce.number().int().positive(),
++})
++
++export const CommentPayloadSchema = z.object({
++  body: z.string().trim().min(1, 'Body is required.').max(2000, 'Body must be 2000 characters or fewer.'),
++})
++
++export type CommentPayload = z.infer<typeof CommentPayloadSchema>
+diff --git a/app/Models/Comment.ts b/app/Models/Comment.ts
+new file mode 100644
+index 0000000..149ee15
+--- /dev/null
++++ b/app/Models/Comment.ts
+@@ -0,0 +1,22 @@
++import { defineModel, type BelongsToRecord } from '@guren/core'
++import { comments } from '../../db/schema.js'
++import type { UserRecord } from './User.js'
++import type { PostRecord } from './Post.js'
++
++export type CommentRecord = typeof comments.$inferSelect
++export type CommentAuthorSummary = Pick<UserRecord, 'id' | 'name'>
++
++export class Comment extends defineModel(comments, {
++  fillable: ['body'],
++}) {
++  static override relationTypes: {
++    author: BelongsToRecord<CommentAuthorSummary>
++    post: BelongsToRecord<PostRecord>
++  } = {
++    author: null,
++    post: null,
++  }
++}
++
++Comment.belongsTo('author', () => import('./User.js').then((m) => m.User), 'userId', 'id')
++Comment.belongsTo('post', () => import('./Post.js').then((m) => m.Post), 'postId', 'id')
+diff --git a/app/Models/CommentReport.ts b/app/Models/CommentReport.ts
+new file mode 100644
+index 0000000..5a5c83e
+--- /dev/null
++++ b/app/Models/CommentReport.ts
+@@ -0,0 +1,21 @@
++import { defineModel, type BelongsToRecord } from '@guren/core'
++import { commentReports } from '../../db/schema.js'
++import type { CommentRecord } from './Comment.js'
++import type { UserRecord } from './User.js'
++
++export type CommentReportRecord = typeof commentReports.$inferSelect
++
++export class CommentReport extends defineModel(commentReports, {
++  fillable: ['commentId', 'userId'],
++}) {
++  static override relationTypes: {
++    comment: BelongsToRecord<CommentRecord>
++    user: BelongsToRecord<UserRecord>
++  } = {
++    comment: null,
++    user: null,
++  }
++}
++
++CommentReport.belongsTo('comment', () => import('./Comment.js').then((m) => m.Comment), 'commentId', 'id')
++CommentReport.belongsTo('user', () => import('./User.js').then((m) => m.User), 'userId', 'id')
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index ca838be..6d867ae 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -1,6 +1,7 @@
+-import { defineModel, type BelongsToRecord } from '@guren/core'
++import { defineModel, type BelongsToRecord, type HasManyRecord } from '@guren/core'
+ import { posts } from '../../db/schema.js'
+ import type { UserRecord } from './User.js'
++import type { CommentRecord } from './Comment.js'
+ 
+ export type PostRecord = typeof posts.$inferSelect
+ export type NewPostRecord = typeof posts.$inferInsert
+@@ -10,9 +11,14 @@ export class Post extends defineModel(posts, {
+   // `authorId` is set from the signed-in user, never from request input.
+   fillable: ['title', 'excerpt', 'body'],
+ }) {
+-  static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
++  static override relationTypes: {
++    author: BelongsToRecord<PostAuthorSummary>
++    comments: HasManyRecord<CommentRecord>
++  } = {
+     author: null,
++    comments: [],
+   }
+ }
+ 
+ Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
++Post.hasMany('comments', () => import('./Comment.js').then((m) => m.Comment), 'postId', 'id')
+diff --git a/app/Models/User.ts b/app/Models/User.ts
+index a8a742c..251e02a 100644
+--- a/app/Models/User.ts
++++ b/app/Models/User.ts
+@@ -1,6 +1,7 @@
+ import { AuthenticatableModel, defineModel, type HasManyRecord } from '@guren/core'
+ import { users } from '../../db/schema.js'
+ import type { PostRecord } from './Post.js'
++import type { CommentRecord } from './Comment.js'
+ 
+ export type UserRecord = typeof users.$inferSelect
+ 
+@@ -17,9 +18,14 @@ export class User extends defineModel(users, {
+   // Never serialized by Model.serialize() and stripped from auth.user()
+   hidden: ['passwordHash', 'rememberToken'],
+ }) {
+-  static override relationTypes: { posts: HasManyRecord<PostRecord> } = {
++  static override relationTypes: {
++    posts: HasManyRecord<PostRecord>
++    comments: HasManyRecord<CommentRecord>
++  } = {
+     posts: [],
++    comments: [],
+   }
+ }
+ 
+ User.hasMany('posts', () => import('./Post.js').then((module) => module.Post), 'authorId', 'id')
++User.hasMany('comments', () => import('./Comment.js').then((m) => m.Comment), 'userId', 'id')
+diff --git a/app/Policies/CommentPolicy.ts b/app/Policies/CommentPolicy.ts
+new file mode 100644
+index 0000000..7e830a9
+--- /dev/null
++++ b/app/Policies/CommentPolicy.ts
+@@ -0,0 +1,21 @@
++import { Policy, type AuthUser } from '@guren/core'
++import { Post } from '../Models/Post.js'
++
++interface CommentLike {
++  userId: number
++  postId: number
++}
++
++export class CommentPolicy extends Policy {
++  async delete(user: AuthUser | null, comment: unknown): Promise<boolean> {
++    const c = comment as CommentLike
++
++    if (user === null) return false
++    if (Number(user.id) === c.userId) return true
++
++    const post = await Post.find(c.postId)
++    if (post && Number(user.id) === post.authorId) return true
++
++    return false
++  }
++}
+diff --git a/app/Providers/AuthorizationProvider.ts b/app/Providers/AuthorizationProvider.ts
+index 4f2bba9..bbd53fd 100644
+--- a/app/Providers/AuthorizationProvider.ts
++++ b/app/Providers/AuthorizationProvider.ts
+@@ -1,6 +1,8 @@
+ import { ServiceProvider } from '@guren/core'
+ import { Post } from '../Models/Post.js'
+ import { PostPolicy } from '../Policies/PostPolicy.js'
++import { Comment } from '../Models/Comment.js'
++import { CommentPolicy } from '../Policies/CommentPolicy.js'
+ 
+ /**
+  * Maps models to their policies. `PostController` calls `this.authorize()` in
+@@ -14,5 +16,6 @@ export default class AuthorizationProvider extends ServiceProvider {
+   // runs in boot() — make('gate') throws before that.
+   boot(): void {
+     this.container.make('gate').policy(Post, PostPolicy)
++    this.container.make('gate').policy(Comment, CommentPolicy)
+   }
+ }
+diff --git a/db/migrations/20260925015015_create_comments_tables/migration.sql b/db/migrations/20260925015015_create_comments_tables/migration.sql
+new file mode 100644
+index 0000000..6320846
+--- /dev/null
++++ b/db/migrations/20260925015015_create_comments_tables/migration.sql
+@@ -0,0 +1,18 @@
++CREATE TABLE `comment_reports` (
++	`comment_id` integer NOT NULL,
++	`user_id` integer NOT NULL,
++	CONSTRAINT `fk_comment_reports_comment_id_comments_id_fk` FOREIGN KEY (`comment_id`) REFERENCES `comments`(`id`) ON DELETE CASCADE,
++	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
++);
++--> statement-breakpoint
++CREATE TABLE `comments` (
++	`id` integer PRIMARY KEY AUTOINCREMENT,
++	`post_id` integer NOT NULL,
++	`user_id` integer NOT NULL,
++	`body` text NOT NULL,
++	`created_at` text NOT NULL,
++	CONSTRAINT `fk_comments_post_id_posts_id_fk` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`) ON DELETE CASCADE,
++	CONSTRAINT `fk_comments_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
++);
++--> statement-breakpoint
++CREATE UNIQUE INDEX `comment_id_user_id_unique` ON `comment_reports` (`comment_id`,`user_id`);
+\ No newline at end of file
+diff --git a/db/migrations/20260925015015_create_comments_tables/snapshot.json b/db/migrations/20260925015015_create_comments_tables/snapshot.json
+new file mode 100644
+index 0000000..f7e8d30
+--- /dev/null
++++ b/db/migrations/20260925015015_create_comments_tables/snapshot.json
+@@ -0,0 +1,356 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "cf14ce11-d141-41b8-95da-a3c6ef2ca896",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "comment_reports",
++      "entityType": "tables"
++    },
++    {
++      "name": "comments",
++      "entityType": "tables"
++    },
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "comment_id",
++      "entityType": "columns",
++      "table": "comment_reports"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "user_id",
++      "entityType": "columns",
++      "table": "comment_reports"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "comments"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "post_id",
++      "entityType": "columns",
++      "table": "comments"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "user_id",
++      "entityType": "columns",
++      "table": "comments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "comments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "comments"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "comment_id"
++      ],
++      "tableTo": "comments",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "CASCADE",
++      "nameExplicit": false,
++      "name": "fk_comment_reports_comment_id_comments_id_fk",
++      "entityType": "fks",
++      "table": "comment_reports"
++    },
++    {
++      "columns": [
++        "user_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_comment_reports_user_id_users_id_fk",
++      "entityType": "fks",
++      "table": "comment_reports"
++    },
++    {
++      "columns": [
++        "post_id"
++      ],
++      "tableTo": "posts",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "CASCADE",
++      "nameExplicit": false,
++      "name": "fk_comments_post_id_posts_id_fk",
++      "entityType": "fks",
++      "table": "comments"
++    },
++    {
++      "columns": [
++        "user_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_comments_user_id_users_id_fk",
++      "entityType": "fks",
++      "table": "comments"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "comments_pk",
++      "table": "comments",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        {
++          "value": "comment_id",
++          "isExpression": false
++        },
++        {
++          "value": "user_id",
++          "isExpression": false
++        }
++      ],
++      "isUnique": true,
++      "where": null,
++      "origin": "manual",
++      "name": "comment_id_user_id_unique",
++      "entityType": "indexes",
++      "table": "comment_reports"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..86e9b06 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -1,4 +1,4 @@
+-import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
++import { sqliteTable, integer, text, uniqueIndex } from '@guren/orm/drizzle/sqlite'
+ 
+ export const users = sqliteTable('users', {
+   id: integer('id').primaryKey({ autoIncrement: true }),
+@@ -20,3 +20,30 @@ export const posts = sqliteTable('posts', {
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
++
++export const comments = sqliteTable('comments', {
++  id: integer('id').primaryKey({ autoIncrement: true }),
++  postId: integer('post_id')
++    .notNull()
++    .references(() => posts.id, { onDelete: 'cascade' }),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id),
++  body: text('body').notNull(),
++  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
++})
++
++export const commentReports = sqliteTable(
++  'comment_reports',
++  {
++    commentId: integer('comment_id')
++      .notNull()
++      .references(() => comments.id, { onDelete: 'cascade' }),
++    userId: integer('user_id')
++      .notNull()
++      .references(() => users.id),
++  },
++  (table) => ({
++    unq: uniqueIndex('comment_id_user_id_unique').on(table.commentId, table.userId),
++  }),
++)
+diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
+index 537c81e..056ec5f 100644
+--- a/resources/js/pages/posts/Show.tsx
++++ b/resources/js/pages/posts/Show.tsx
+@@ -1,17 +1,20 @@
+ import { Head, Link, usePage } from '@inertiajs/react'
+ import type { PostResourceData } from '@/app/Http/Resources/PostResource'
++import type { CommentData } from '@/app/Http/Controllers/PostController'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
+ interface Props {
+   post: PostResourceData
++  comments?: CommentData[]
+ }
+ 
+-export default function PostShow({ post }: Props) {
++export default function PostShow({ post, comments = [] }: Props) {
+   const { props } = usePage<{ auth?: { user?: { id?: number } } }>()
+   // Mirrors PostPolicy — the server rejects it either way, this only keeps
+   // controls the viewer cannot use off the page.
+   const canManage = props.auth?.user?.id === post.authorId
++  const userId = props.auth?.user?.id
+ 
+   return (
+     <Layout>
+@@ -52,6 +55,76 @@ export default function PostShow({ post }: Props) {
+             </>
+           ) : null}
+         </footer>
++
++        <section className="border-t border-g-line pt-6">
++          <h2 className="mb-4 text-xl font-bold text-g-heading">Comments</h2>
++
++          {comments.length === 0 ? (
++            <p className="text-g-text-2">No comments yet.</p>
++          ) : (
++            <div className="space-y-4">
++              {comments.map((comment) => (
++                <div key={comment.id} className="border border-g-line rounded-g-ctl p-4">
++                  <div className="mb-2 flex items-center justify-between">
++                    <div>
++                      <p className="font-bold text-g-heading">{comment.author.name}</p>
++                      <p className="text-sm text-g-text-2">{new Date(comment.createdAt).toLocaleDateString()}</p>
++                    </div>
++                    <div className="flex gap-2">
++                      {userId === comment.author.id || canManage ? (
++                        <Link
++                          href={route('comments.destroy', { id: comment.id })}
++                          method="delete"
++                          as="button"
++                          onBefore={() => window.confirm('Delete this comment?')}
++                          className="text-sm text-g-danger transition hover:underline"
++                        >
++                          Delete
++                        </Link>
++                      ) : null}
++                      {userId ? (
++                        <Link
++                          href={route('comments.report', { id: comment.id })}
++                          method="post"
++                          as="button"
++                          className="text-sm text-g-text-2 transition hover:underline"
++                        >
++                          Report
++                        </Link>
++                      ) : null}
++                    </div>
++                  </div>
++                  <p className="whitespace-pre-wrap text-g-text">{comment.body}</p>
++                </div>
++              ))}
++            </div>
++          )}
++
++          {userId ? (
++            <form method="post" action={route('comments.store', { id: post.id })} className="mt-6">
++              <textarea
++                name="body"
++                placeholder="Add a comment..."
++                className="w-full rounded-g-ctl border border-g-line bg-g-surface px-4 py-2 text-g-text placeholder:text-g-text-2 focus:border-g-accent focus:outline-none"
++                rows={4}
++                required
++              />
++              <button
++                type="submit"
++                className="mt-2 rounded-g-ctl bg-g-accent px-4 py-2 font-bold text-g-accent-text transition hover:bg-g-accent-hover"
++              >
++                Post Comment
++              </button>
++            </form>
++          ) : (
++            <p className="mt-6 text-g-text-2">
++              <Link href={route('login')} className="text-g-accent transition hover:underline">
++                Sign in
++              </Link>
++              {' '}to add a comment.
++            </p>
++          )}
++        </section>
+       </article>
+     </Layout>
+   )
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..672b196 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,7 +1,9 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import CommentController from '../app/Http/Controllers/CommentController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import { CommentPayloadSchema } from '../app/Http/Validators/CommentValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+@@ -27,6 +29,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+       authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
++      authed.post('/:id/comments', { name: 'comments.store', body: CommentPayloadSchema }, [CommentController, 'store'])
+     })
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+@@ -44,4 +47,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+       resource: { data: [PostResource] },
+     }, [PostController, 'search'])
+   })
++
++  router.middleware('auth').group((authed) => {
++    authed.delete('/comments/:id', [CommentController, 'destroy']).name('comments.destroy')
++    authed.post('/comments/:id/report', [CommentController, 'report']).name('comments.report')
++  })
+ }
+diff --git a/tests/CommentController.test.ts b/tests/CommentController.test.ts
+new file mode 100644
+index 0000000..ce9e6a1
+--- /dev/null
++++ b/tests/CommentController.test.ts
+@@ -0,0 +1,178 @@
++import { beforeAll, describe, it, beforeEach } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { User } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
++import { Comment } from '../app/Models/Comment.js'
++import { CommentReport } from '../app/Models/CommentReport.js'
++import { resetDatabase } from '../config/database.js'
++
++describe('comments', () => {
++  let http: TestApp
++  let user: any
++  let user2: any
++  let user3: any
++  let post: any
++  let emailCounter = 0
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  beforeEach(async () => {
++    await resetDatabase()
++
++    user = await User.create({
++      name: 'Alice',
++      email: `alice${emailCounter++}@example.com`,
++      password: 'password',
++    })
++
++    user2 = await User.create({
++      name: 'Bob',
++      email: `bob${emailCounter++}@example.com`,
++      password: 'password',
++    })
++
++    user3 = await User.create({
++      name: 'Charlie',
++      email: `charlie${emailCounter++}@example.com`,
++      password: 'password',
++    })
++
++    post = await Post.forceCreate({
++      title: 'Test Post',
++      excerpt: 'Test excerpt',
++      body: 'Test body',
++      authorId: user.id,
++    })
++  })
++
++  it('guest cannot create comment', async () => {
++    const csrf = await http.withCsrf()
++    await csrf.post(`/posts/${post.id}/comments`, { body: 'Hello' }).assertRedirect('/login')
++  })
++
++  it('signed-in user can create comment', async () => {
++    const csrf = await http.actingAs(user2).withCsrf()
++    await csrf.post(`/posts/${post.id}/comments`, { body: 'Hello' }).assertRedirect(`/posts/${post.id}`)
++  })
++
++  it('comment appears on post page', async () => {
++    const csrf = await http.actingAs(user2).withCsrf()
++    await csrf.post(`/posts/${post.id}/comments`, { body: 'Test comment' })
++
++    await http.get(`/posts/${post.id}`).assertStatus(200)
++  })
++
++  it('validates comment body length', async () => {
++    const csrf = await http.actingAs(user2).withCsrf()
++    await csrf.post(`/posts/${post.id}/comments`, { body: '' }).assertUnprocessable()
++    await csrf.post(`/posts/${post.id}/comments`, { body: 'a'.repeat(2001) }).assertUnprocessable()
++  })
++
++  it('comment author can delete comment', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Test comment',
++    })
++
++    const csrf = await http.actingAs(user2).withCsrf()
++    await csrf.delete(`/comments/${comment.id}`).assertRedirect(`/posts/${post.id}`)
++
++    const deleted = await Comment.find(comment.id)
++    if (deleted !== null) {
++      throw new Error('Comment should be deleted')
++    }
++  })
++
++  it('post author can delete comment', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Test comment',
++    })
++
++    const csrf = await http.actingAs(user).withCsrf()
++    await csrf.delete(`/comments/${comment.id}`).assertRedirect(`/posts/${post.id}`)
++
++    const deleted = await Comment.find(comment.id)
++    if (deleted !== null) {
++      throw new Error('Comment should be deleted')
++    }
++  })
++
++  it('other user cannot delete comment', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Test comment',
++    })
++
++    const csrf = await http.actingAs(user3).withCsrf()
++    await csrf.delete(`/comments/${comment.id}`).assertStatus(403)
++
++    const found = await Comment.find(comment.id)
++    if (found === null) {
++      throw new Error('Comment should not be deleted')
++    }
++  })
++
++  it('user can report comment', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Test comment',
++    })
++
++    const csrf = await http.actingAs(user3).withCsrf()
++    await csrf.post(`/comments/${comment.id}/report`).assertStatus(204)
++
++    const report = await CommentReport.first({ commentId: comment.id, userId: user3.id })
++    if (report === null) {
++      throw new Error('Report should be created')
++    }
++  })
++
++  it('repeated report by same user does not create duplicate', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Test comment',
++    })
++
++    const csrf = await http.actingAs(user3).withCsrf()
++    await csrf.post(`/comments/${comment.id}/report`).assertStatus(204)
++    await csrf.post(`/comments/${comment.id}/report`).assertStatus(204)
++
++    const count = await CommentReport.where({ commentId: comment.id, userId: user3.id }).count()
++    if (count !== 1) {
++      throw new Error('Report count should be 1')
++    }
++  })
++
++  it('hidden comment does not appear on post page', async () => {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user2.id,
++      body: 'Hidden comment',
++    })
++
++    // Create 3 reports
++    await CommentReport.forceCreate({ commentId: comment.id, userId: user.id })
++    await CommentReport.forceCreate({ commentId: comment.id, userId: user3.id })
++    const dave = await User.create({
++      name: 'Dave',
++      email: `dave${emailCounter++}@example.com`,
++      password: 'password',
++    })
++    await CommentReport.forceCreate({
++      commentId: comment.id,
++      userId: dave.id,
++    })
++
++    const res = await http.get(`/posts/${post.id}`)
++    await res.assertStatus(200)
++  })
++})

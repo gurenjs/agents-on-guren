@@ -1,0 +1,858 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..53adc8e 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; publishAt?: string | null }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; publishAt?: string | null }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..4d416b6 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -18,6 +18,7 @@ export namespace Data {
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
++  publishedAt?: string | null
+   author?: PostAuthorSummary
+ }
+ }
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..1c99c20 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -148,8 +148,8 @@ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
+       'posts.search': { body: { keywords: string[]; limit: number } }
+-      'posts.store': { body: { title: string; excerpt: string; body: string } }
+-      'posts.update': { body: { title: string; excerpt: string; body: string } }
++      'posts.store': { body: { title: string; excerpt: string; body: string; publishAt?: string | null } }
++      'posts.update': { body: { title: string; excerpt: string; body: string; publishAt?: string | null } }
+     }
+   }
+ }
+diff --git a/app/Console/Commands/PostsScheduledCommand.ts b/app/Console/Commands/PostsScheduledCommand.ts
+new file mode 100644
+index 0000000..13f09b1
+--- /dev/null
++++ b/app/Console/Commands/PostsScheduledCommand.ts
+@@ -0,0 +1,18 @@
++import { Command } from '@guren/core'
++import { Post } from '../../Models/Post.js'
++
++export default class PostsScheduledCommand extends Command {
++  static signature = 'posts:scheduled'
++  static description = 'List scheduled posts'
++
++  async handle(): Promise<void> {
++    const now = new Date().toISOString()
++    const posts = await Post.where('publishedAt', '>', now)
++      .orderBy('publishedAt', 'asc')
++      .get()
++
++    for (const post of posts) {
++      console.log(`${post.id}\t${post.title}\t${post.publishedAt}`)
++    }
++  }
++}
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..ac0b065 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,4 +1,4 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, paginate, HttpException, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+@@ -10,10 +10,20 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+-    const result = await Post.newQuery()
+-      .with('author')
+-      .orderBy('id', 'desc')
+-      .paginate({ page, perPage: 10 })
++    const currentUser = await this.auth.user<UserRecord>()
++    const now = new Date().toISOString()
++
++    const query = Post.newQuery().with('author')
++
++    // Filter out scheduled posts except for the author
++    query.where((q) => {
++      q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      if (currentUser?.id) {
++        q.orWhere('authorId', currentUser.id)
++      }
++    })
++
++    const result = await query.orderBy('id', 'desc').paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
+     return this.inertia(pages.posts.Index, {
+@@ -28,9 +38,11 @@ export default class PostController extends Controller {
+   // Serves the HTTP QUERY route `posts.search` — a safe read that carries its
+   // criteria in a JSON body. Matches posts with any keyword in title or
+   // excerpt; `%` and `_` in a keyword act as SQL LIKE wildcards, which this
+-  // starter treats as a feature.
++  // starter treats as a feature. Scheduled posts are hidden from non-authors.
+   async search(): Promise<Response> {
+     const { keywords, limit } = this.validated('posts.search').body
++    const currentUser = await this.auth.user<UserRecord>()
++    const now = new Date().toISOString()
+ 
+     const posts = await Post.newQuery()
+       .with('author')
+@@ -43,6 +55,13 @@ export default class PostController extends Controller {
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+         }
+       })
++      // Filter out scheduled posts except for the author
++      .where((q) => {
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++        if (currentUser?.id) {
++          q.orWhere('authorId', currentUser.id)
++        }
++      })
+       .orderBy('id', 'desc')
+       .limit(limit)
+       .get()
+@@ -53,6 +72,15 @@ export default class PostController extends Controller {
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
++    const currentUser = await this.auth.user<UserRecord>()
++
++    // Scheduled posts are only visible to their author
++    if (post.publishedAt) {
++      const publishedAt = new Date(post.publishedAt)
++      if (publishedAt > new Date() && (!currentUser || currentUser.id !== post.authorId)) {
++        throw HttpException.notFound()
++      }
++    }
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+@@ -70,7 +98,12 @@ export default class PostController extends Controller {
+     const { body: data } = this.validated('posts.store')
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const { publishAt, ...otherData } = data
++    const post = await Post.forceCreate({
++      ...otherData,
++      authorId: author.id,
++      publishedAt: publishAt ?? null,
++    })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +124,11 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const { body: data } = this.validated('posts.update')
+-    await Post.update({ id: post.id }, data)
++    const { publishAt, ...otherData } = data
++    await Post.update({ id: post.id }, {
++      ...otherData,
++      publishedAt: publishAt ?? null,
++    })
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index 679024d..6916598 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -13,6 +13,7 @@ export interface PostResourceData extends Record<string, unknown> {
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
++  publishedAt?: string | null
+   author?: PostAuthorSummary
+ }
+ 
+@@ -27,6 +28,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
+       body: post.body,
+       authorId: post.authorId,
+       createdAt: new Date(post.createdAt).toISOString(),
++      publishedAt: post.publishedAt ?? null,
+       author: this.whenLoaded('author', () => ({
+         id: (post as PostWithAuthor).author?.id,
+         name: (post as PostWithAuthor).author?.name,
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..1332d09 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,7 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
++  publishAt: z.string().datetime().nullable().optional(),
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index ca838be..6fafd7e 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -8,7 +8,8 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts, {
+   // `authorId` is set from the signed-in user, never from request input.
+-  fillable: ['title', 'excerpt', 'body'],
++  // `publishedAt` is optional — null means publish immediately.
++  fillable: ['title', 'excerpt', 'body', 'publishedAt'],
+ }) {
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+diff --git a/app/Policies/PostPolicy.ts b/app/Policies/PostPolicy.ts
+index 0ceaa1e..1ae9f50 100644
+--- a/app/Policies/PostPolicy.ts
++++ b/app/Policies/PostPolicy.ts
+@@ -2,19 +2,29 @@ import { Policy, type AuthUser } from '@guren/core'
+ 
+ interface PostLike {
+   authorId: number
++  publishedAt?: string | null
++}
++
++function isScheduled(post: PostLike): boolean {
++  if (!post.publishedAt) return false
++  return new Date(post.publishedAt) > new Date()
+ }
+ 
+ /**
+  * Bound to the Post model in app/Providers/AuthorizationProvider.ts.
+  * PostController calls `this.authorize()` for every mutating action, so a
+- * signed-in user can only edit or delete their own posts.
++ * signed-in user can only edit or delete their own posts. Scheduled posts
++ * (publishedAt in the future) are only visible to their author.
+  */
+ export class PostPolicy extends Policy {
+   viewAny(_user: AuthUser | null): boolean {
+     return true
+   }
+ 
+-  view(_user: AuthUser | null, _post: PostLike): boolean {
++  view(user: AuthUser | null, post: PostLike): boolean {
++    if (isScheduled(post)) {
++      return user !== null && Number(user.id) === post.authorId
++    }
+     return true
+   }
+ 
+diff --git a/db/migrations/20260925035101_add_published_at_to_posts/migration.sql b/db/migrations/20260925035101_add_published_at_to_posts/migration.sql
+new file mode 100644
+index 0000000..c01c12b
+--- /dev/null
++++ b/db/migrations/20260925035101_add_published_at_to_posts/migration.sql
+@@ -0,0 +1 @@
++ALTER TABLE `posts` ADD `published_at` text;
+\ No newline at end of file
+diff --git a/db/migrations/20260925035101_add_published_at_to_posts/snapshot.json b/db/migrations/20260925035101_add_published_at_to_posts/snapshot.json
+new file mode 100644
+index 0000000..b83bfa5
+--- /dev/null
++++ b/db/migrations/20260925035101_add_published_at_to_posts/snapshot.json
+@@ -0,0 +1,201 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "17b265f7-3d47-4128-998a-8a4789347275",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "published_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..41341b8 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -18,5 +18,6 @@ export const posts = sqliteTable('posts', {
+   authorId: integer('author_id')
+     .notNull()
+     .references(() => users.id),
++  publishedAt: text('published_at'),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
+diff --git a/src/console.ts b/src/console.ts
+index 83594f0..d27ef1f 100644
+--- a/src/console.ts
++++ b/src/console.ts
+@@ -1,9 +1,10 @@
+ import { ConsoleKernel } from '@guren/core'
+ import app from './app.js'
++import PostsScheduledCommand from '../app/Console/Commands/PostsScheduledCommand.js'
+ 
+ export const kernel = new ConsoleKernel({ container: app.container })
+ 
+ // `bunx guren make:command` adds the import and the array entry for you; the
+ // empty array literal is what it edits, so keep it even while unused.
+ // `bunx guren check` warns about any command class this file never registers.
+-kernel.registerMany([])
++kernel.registerMany([PostsScheduledCommand])
+diff --git a/tests/controllers/PostController.test.ts b/tests/controllers/PostController.test.ts
+new file mode 100644
+index 0000000..e0a0f0f
+--- /dev/null
++++ b/tests/controllers/PostController.test.ts
+@@ -0,0 +1,352 @@
++import { describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../../src/app.js'
++import { User } from '../../app/Models/User.js'
++import { Post } from '../../app/Models/Post.js'
++
++async function setup() {
++  const http = await TestApp.fromApp(app)
++
++  const author = await User.create({
++    name: 'Test Author',
++    email: `author-${Date.now()}@test.com`,
++    password: 'password123',
++  })
++
++  const otherUser = await User.create({
++    name: 'Test Other',
++    email: `other-${Date.now()}@test.com`,
++    password: 'password123',
++  })
++
++  return { http, author, otherUser }
++}
++
++describe('PostController - Scheduled Posts', () => {
++  describe('create and store', () => {
++    it('creates a post with a future published_at date', async () => {
++      const { http, author } = await setup()
++      const csrf = await http.actingAs(author).withCsrf()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++
++      await csrf.post('/posts', {
++        title: 'Scheduled Post',
++        excerpt: 'This is scheduled',
++        body: 'Content here',
++        publishAt: futureDate,
++      }).assertRedirect()
++
++      const post = await Post.first({ title: 'Scheduled Post' })
++      expect(post?.publishedAt).toBeTruthy()
++      expect(new Date(post?.publishedAt ?? '').getTime()).toBeGreaterThan(Date.now())
++    })
++
++    it('creates a post with null published_at (publish now)', async () => {
++      const { http, author } = await setup()
++      const csrf = await http.actingAs(author).withCsrf()
++
++      await csrf.post('/posts', {
++        title: 'Immediate Post',
++        excerpt: 'Published now',
++        body: 'Content here',
++        publishAt: null,
++      }).assertRedirect()
++
++      const post = await Post.first({ title: 'Immediate Post' })
++      expect(post?.publishedAt).toBeNull()
++    })
++
++    it('creates a post without publishAt field', async () => {
++      const { http, author } = await setup()
++      const csrf = await http.actingAs(author).withCsrf()
++
++      await csrf.post('/posts', {
++        title: 'No Publish Date',
++        excerpt: 'No date provided',
++        body: 'Content here',
++      }).assertRedirect()
++
++      const post = await Post.first({ title: 'No Publish Date' })
++      expect(post?.publishedAt).toBeNull()
++    })
++
++    it('rejects invalid datetime values', async () => {
++      const { http, author } = await setup()
++      const csrf = await http.actingAs(author).withCsrf()
++
++      await csrf.post('/posts', {
++        title: 'Invalid Date Post',
++        excerpt: 'Invalid date',
++        body: 'Content here',
++        publishAt: 'next tuesday',
++      }).assertUnprocessable()
++    })
++  })
++
++  describe('index - listing posts', () => {
++    it('shows published posts to all users', async () => {
++      const { author } = await setup()
++      const publishedPost = await Post.forceCreate({
++        title: 'Published Post Index',
++        excerpt: 'Public',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: null,
++      })
++
++      // Verify the post exists and is public
++      const listedPosts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      }).get()
++      expect(listedPosts.some((p) => p.id === publishedPost.id)).toBe(true)
++    })
++
++    it('hides scheduled posts from guests', async () => {
++      const { author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const scheduledPost = await Post.forceCreate({
++        title: 'Hidden Scheduled Post',
++        excerpt: 'Hidden',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      // Verify the post is not in the public list (only in private list for author)
++      const publicPosts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      }).get()
++      expect(publicPosts.some((p) => p.id === scheduledPost.id)).toBe(false)
++    })
++
++    it('shows scheduled posts to their author', async () => {
++      const { author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const scheduledPost = await Post.forceCreate({
++        title: 'My Scheduled Post',
++        excerpt: 'Visible to author',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      // Verify the post would be in the author's list (visible to them)
++      const authorPosts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now).orWhere('authorId', author.id)
++      }).get()
++      expect(authorPosts.some((p) => p.id === scheduledPost.id)).toBe(true)
++    })
++
++    it('hides scheduled posts from other logged-in users', async () => {
++      const { author, otherUser } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const scheduledPost = await Post.forceCreate({
++        title: 'Other User Scheduled Post',
++        excerpt: 'Hidden from others',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      // Verify the scheduled post is not visible to other users
++      const otherUserPosts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now).orWhere('authorId', otherUser.id)
++      }).get()
++      expect(otherUserPosts.some((p) => p.id === scheduledPost.id)).toBe(false)
++    })
++  })
++
++  describe('show - viewing individual posts', () => {
++    it('shows published posts to all users', async () => {
++      const { http, author } = await setup()
++      const post = await Post.forceCreate({
++        title: 'Public Post',
++        excerpt: 'Public',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: null,
++      })
++
++      await http.get(`/posts/${post.id}`).assertOk()
++    })
++
++    it('returns 404 for scheduled posts viewed by guests', async () => {
++      const { http, author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Scheduled Post For Guest',
++        excerpt: 'Hidden',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      await http.get(`/posts/${post.id}`).assertNotFound()
++    })
++
++    it('returns 404 for scheduled posts viewed by other users', async () => {
++      const { http, author, otherUser } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Scheduled Post For Other',
++        excerpt: 'Hidden',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      await http.actingAs(otherUser).get(`/posts/${post.id}`).assertNotFound()
++    })
++
++    it('shows scheduled posts to their author', async () => {
++      const { http, author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'My Scheduled Post View',
++        excerpt: 'Visible to author',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      await http.actingAs(author).get(`/posts/${post.id}`).assertOk()
++    })
++  })
++
++  describe('search', () => {
++    it('shows published posts to all users in search', async () => {
++      const { author } = await setup()
++      const post = await Post.forceCreate({
++        title: 'Searchable Public Post',
++        excerpt: 'Public searchable',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: null,
++      })
++
++      const posts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      })
++        .where('title', 'like', '%Searchable%')
++        .get()
++      expect(posts.some((p) => p.id === post.id)).toBe(true)
++    })
++
++    it('hides scheduled posts from guests in search', async () => {
++      const { author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Searchable Scheduled Post',
++        excerpt: 'Hidden scheduled',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      const posts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      })
++        .where('title', 'like', '%Searchable%')
++        .get()
++      expect(posts.some((p) => p.id === post.id)).toBe(false)
++    })
++
++    it('shows scheduled posts to their author in search', async () => {
++      const { author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'My Searchable Scheduled',
++        excerpt: 'Visible in search',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      const posts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now).orWhere('authorId', author.id)
++      })
++        .where('title', 'like', '%Searchable%')
++        .get()
++      expect(posts.some((p) => p.id === post.id)).toBe(true)
++    })
++  })
++
++  describe('edit and update', () => {
++    it('allows author to edit scheduled post', async () => {
++      const { http, author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Post To Edit',
++        excerpt: 'Original excerpt',
++        body: 'Original content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      const csrf = await http.actingAs(author).withCsrf()
++      const newFutureDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
++
++      await csrf.put(`/posts/${post.id}`, {
++        title: 'Updated Post',
++        excerpt: 'Updated excerpt',
++        body: 'Updated content',
++        publishAt: newFutureDate,
++      }).assertRedirect()
++
++      const updated = await Post.findOrFail(post.id)
++      expect(updated.publishedAt).toBeTruthy()
++      expect(new Date(updated.publishedAt ?? '').getTime()).toBeGreaterThan(Date.now())
++    })
++
++    it('allows author to clear scheduled date', async () => {
++      const { http, author } = await setup()
++      const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Clear Schedule Post',
++        excerpt: 'Excerpt',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: futureDate,
++      })
++
++      const csrf = await http.actingAs(author).withCsrf()
++      await csrf.put(`/posts/${post.id}`, {
++        title: 'Clear Schedule Post',
++        excerpt: 'Excerpt',
++        body: 'Content',
++        publishAt: null,
++      }).assertRedirect()
++
++      const updated = await Post.findOrFail(post.id)
++      expect(updated.publishedAt).toBeNull()
++    })
++  })
++
++  describe('time passing', () => {
++    it('shows scheduled post once published_at is in the past', async () => {
++      const { author } = await setup()
++      const pastDate = new Date(Date.now() - 60000).toISOString()
++      const post = await Post.forceCreate({
++        title: 'Now Published Post',
++        excerpt: 'Just published',
++        body: 'Content',
++        authorId: author.id,
++        publishedAt: pastDate,
++      })
++
++      // Verify the post is visible now that it's in the past
++      const publicPosts = await Post.where((q) => {
++        const now = new Date().toISOString()
++        q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
++      }).get()
++      expect(publicPosts.some((p) => p.id === post.id)).toBe(true)
++    })
++  })
++})

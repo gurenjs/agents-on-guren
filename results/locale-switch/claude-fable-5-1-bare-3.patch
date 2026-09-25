@@ -1,0 +1,950 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..4d4bf0a 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -22,6 +22,11 @@ export interface ApiRoutes {
+     method: 'GET'
+     path: '/'
+   }
++  'locale.store': {
++    method: 'POST'
++    path: '/locale'
++    body: { locale: "en" | "ja" }
++  }
+   'login': {
+     method: 'GET'
+     path: '/login'
+@@ -305,6 +310,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ const routes: Record<string, { method: string; path: string }> = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
++  'locale.store': { method: 'POST', path: '/locale' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..b72affd 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -4,6 +4,7 @@
+ export const routeManifest = {
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
++  'locale.store': { method: 'POST', path: '/locale' },
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
+@@ -69,6 +70,9 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ export const routes = {
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
++  locale: {
++    store: (query?: RouteQuery) => route('locale.store', query)
++  },
+   login: Object.assign(
+     (query?: RouteQuery) => route('login', query),
+     {
+@@ -147,6 +151,7 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
++      'locale.store': { body: { locale: "en" | "ja" } }
+       'posts.search': { body: { keywords: string[]; limit: number } }
+       'posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.update': { body: { title: string; excerpt: string; body: string } }
+diff --git a/.guren/translations.gen.ts b/.guren/translations.gen.ts
+index ede4663..dca1a7b 100644
+--- a/.guren/translations.gen.ts
++++ b/.guren/translations.gen.ts
+@@ -1,4 +1,4 @@
+-// Generated from lang/ (locales: en) — DO NOT EDIT
++// Generated from lang/ (locales: en, ja) — DO NOT EDIT
+ // Run `guren codegen` to regenerate.
+ 
+ /**
+@@ -6,7 +6,35 @@
+  * keys are reported by `guren check --i18n`, not here.
+  */
+ export type TranslationKey =
++  | 'auth.login'
++  | 'auth.logout'
++  | 'locale.en'
++  | 'locale.ja'
+   | 'messages.welcome'
++  | 'nav.dashboard'
++  | 'nav.home'
++  | 'nav.language'
++  | 'nav.posts'
++  | 'posts.allPosts'
++  | 'posts.by'
++  | 'posts.clear'
++  | 'posts.confirmDelete'
++  | 'posts.delete'
++  | 'posts.edit'
++  | 'posts.editHead'
++  | 'posts.editTitle'
++  | 'posts.fields.body'
++  | 'posts.fields.excerpt'
++  | 'posts.fields.title'
++  | 'posts.new'
++  | 'posts.publish'
++  | 'posts.results'
++  | 'posts.save'
++  | 'posts.search'
++  | 'posts.searchFailedConnection'
++  | 'posts.searchFailedKeywords'
++  | 'posts.searchPlaceholder'
++  | 'posts.title'
+ 
+ // Type this app's translation helpers via declaration merging:
+ // `this.t()` / `this.tc()` in controllers and `useTranslation()` in pages
+diff --git a/app/Http/Controllers/LocaleController.ts b/app/Http/Controllers/LocaleController.ts
+new file mode 100644
+index 0000000..bc8c97f
+--- /dev/null
++++ b/app/Http/Controllers/LocaleController.ts
+@@ -0,0 +1,29 @@
++import { Controller, isSafeRedirectUrl } from '@guren/core'
++import { setCookie } from 'hono/cookie'
++import { LOCALE_COOKIE_MAX_AGE_SECONDS, LOCALE_COOKIE_NAME } from '../../../config/i18n.js'
++
++export default class LocaleController extends Controller {
++  /**
++   * Remembers the reader's language in the cookie the locale middleware reads
++   * ahead of Accept-Language, then sends them back where they were. Open to
++   * guests and signed-in users alike; the route-bound schema already rejected
++   * any locale the app does not serve.
++   */
++  async store(): Promise<Response> {
++    const { locale } = this.validated('locale.store').body
++
++    setCookie(this.ctx, LOCALE_COOKIE_NAME, locale, {
++      path: '/',
++      httpOnly: true,
++      sameSite: 'Lax',
++      maxAge: LOCALE_COOKIE_MAX_AGE_SECONDS,
++    })
++
++    // The Referer is browser-set, but only follow it back onto this site: a
++    // stale or foreign one lands on the home page instead of off-site.
++    const referer = this.request.header('referer')
++    const back = referer && isSafeRedirectUrl(referer, this.request.url) ? referer : '/'
++
++    return this.redirect(back)
++  }
++}
+diff --git a/app/Http/Validators/LocaleValidator.ts b/app/Http/Validators/LocaleValidator.ts
+new file mode 100644
+index 0000000..0f1eb3a
+--- /dev/null
++++ b/app/Http/Validators/LocaleValidator.ts
+@@ -0,0 +1,8 @@
++import { z } from 'zod'
++import { supportedLocales } from '../../../config/i18n.js'
++
++export const LocaleSchema = z.object({
++  locale: z.enum(supportedLocales, { message: 'Choose one of the supported languages.' }),
++})
++
++export type LocaleInput = z.infer<typeof LocaleSchema>
+diff --git a/config/audit.ts b/config/audit.ts
+new file mode 100644
+index 0000000..6e27c4e
+--- /dev/null
++++ b/config/audit.ts
+@@ -0,0 +1,15 @@
++/**
++ * Findings `bunx guren audit` may skip, each with the reason it is safe. Keys
++ * are the exact `finding.key` values `guren audit --json` prints; an entry that
++ * matches nothing is reported as stale so this list cannot rot.
++ */
++export default {
++  ignore: [
++    {
++      key: 'authz:POST /locale',
++      reason:
++        'The language switcher is meant for guests as well as signed-in readers. It only writes the locale cookie, ' +
++        'accepts nothing but the two supported locales, and sits behind the app-wide CSRF check.',
++    },
++  ],
++}
+diff --git a/config/i18n.ts b/config/i18n.ts
+new file mode 100644
+index 0000000..dbd4f30
+--- /dev/null
++++ b/config/i18n.ts
+@@ -0,0 +1,25 @@
++import type { I18nPluginOptions } from '@guren/core'
++
++/**
++ * Locales the app serves, first one the default. Translations live in
++ * lang/<locale>/*.json (namespace = file name); keep every locale directory
++ * carrying the same keys — `bunx guren check --i18n` reports any drift.
++ */
++export const supportedLocales = ['en', 'ja'] as const
++
++export type SupportedLocale = (typeof supportedLocales)[number]
++
++/** Name of the cookie the locale middleware reads (its default), set by `POST /locale`. */
++export const LOCALE_COOKIE_NAME = 'locale'
++
++/** A year: the switcher's pick outlives the session it was made in. */
++export const LOCALE_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365
++
++// Detection order stays the framework default (?locale=, the cookie, then
++// Accept-Language), so an explicit pick beats the browser's preference.
++const i18n: I18nPluginOptions = {
++  supported: [...supportedLocales],
++  fallback: supportedLocales[0],
++}
++
++export default i18n
+diff --git a/lang/en/auth.json b/lang/en/auth.json
+new file mode 100644
+index 0000000..b1fb5c4
+--- /dev/null
++++ b/lang/en/auth.json
+@@ -0,0 +1,4 @@
++{
++  "login": "Sign in",
++  "logout": "Log out"
++}
+diff --git a/lang/en/locale.json b/lang/en/locale.json
+new file mode 100644
+index 0000000..1144145
+--- /dev/null
++++ b/lang/en/locale.json
+@@ -0,0 +1,4 @@
++{
++  "en": "English",
++  "ja": "日本語"
++}
+diff --git a/lang/en/nav.json b/lang/en/nav.json
+new file mode 100644
+index 0000000..ec364d7
+--- /dev/null
++++ b/lang/en/nav.json
+@@ -0,0 +1,6 @@
++{
++  "home": "Home",
++  "posts": "Posts",
++  "dashboard": "Dashboard",
++  "language": "Language"
++}
+diff --git a/lang/en/posts.json b/lang/en/posts.json
+new file mode 100644
+index 0000000..9fb4513
+--- /dev/null
++++ b/lang/en/posts.json
+@@ -0,0 +1,24 @@
++{
++  "title": "Posts",
++  "new": "New post",
++  "edit": "Edit",
++  "editTitle": "Edit post",
++  "editHead": "Edit :title",
++  "delete": "Delete",
++  "confirmDelete": "Delete this post?",
++  "search": "Search",
++  "searchPlaceholder": "Search posts…",
++  "searchFailedKeywords": "Search failed — try fewer or shorter keywords.",
++  "searchFailedConnection": "Search failed — check your connection and try again.",
++  "results": ":count result|:count results",
++  "clear": "Clear",
++  "by": "by :name",
++  "allPosts": "← All posts",
++  "fields": {
++    "title": "Title",
++    "excerpt": "Excerpt",
++    "body": "Body"
++  },
++  "publish": "Publish",
++  "save": "Save changes"
++}
+diff --git a/lang/ja/auth.json b/lang/ja/auth.json
+new file mode 100644
+index 0000000..ab30220
+--- /dev/null
++++ b/lang/ja/auth.json
+@@ -0,0 +1,4 @@
++{
++  "login": "ログイン",
++  "logout": "ログアウト"
++}
+diff --git a/lang/ja/locale.json b/lang/ja/locale.json
+new file mode 100644
+index 0000000..1144145
+--- /dev/null
++++ b/lang/ja/locale.json
+@@ -0,0 +1,4 @@
++{
++  "en": "English",
++  "ja": "日本語"
++}
+diff --git a/lang/ja/messages.json b/lang/ja/messages.json
+new file mode 100644
+index 0000000..2111b1e
+--- /dev/null
++++ b/lang/ja/messages.json
+@@ -0,0 +1,3 @@
++{
++  "welcome": ":nameへようこそ！"
++}
+diff --git a/lang/ja/nav.json b/lang/ja/nav.json
+new file mode 100644
+index 0000000..0f9eb3a
+--- /dev/null
++++ b/lang/ja/nav.json
+@@ -0,0 +1,6 @@
++{
++  "home": "ホーム",
++  "posts": "記事",
++  "dashboard": "ダッシュボード",
++  "language": "言語"
++}
+diff --git a/lang/ja/posts.json b/lang/ja/posts.json
+new file mode 100644
+index 0000000..8db37dc
+--- /dev/null
++++ b/lang/ja/posts.json
+@@ -0,0 +1,24 @@
++{
++  "title": "記事",
++  "new": "新規投稿",
++  "edit": "編集",
++  "editTitle": "記事を編集",
++  "editHead": ":titleを編集",
++  "delete": "削除",
++  "confirmDelete": "この記事を削除しますか？",
++  "search": "検索",
++  "searchPlaceholder": "記事を検索…",
++  "searchFailedKeywords": "検索に失敗しました。キーワードを減らすか短くしてみてください。",
++  "searchFailedConnection": "検索に失敗しました。接続を確認してもう一度お試しください。",
++  "results": ":count件の結果",
++  "clear": "クリア",
++  "by": "投稿者: :name",
++  "allPosts": "← 記事一覧",
++  "fields": {
++    "title": "タイトル",
++    "excerpt": "概要",
++    "body": "本文"
++  },
++  "publish": "公開する",
++  "save": "変更を保存"
++}
+diff --git a/resources/js/components/Layout.tsx b/resources/js/components/Layout.tsx
+index dbae710..dd352f8 100644
+--- a/resources/js/components/Layout.tsx
++++ b/resources/js/components/Layout.tsx
+@@ -1,9 +1,13 @@
+ import { Link, usePage } from '@inertiajs/react'
++import { useTranslation } from '@guren/inertia-client'
+ import type { PropsWithChildren } from 'react'
++import { route } from '@/.guren/routes.gen'
++import { supportedLocales } from '../../../config/i18n.js'
+ 
+ export default function Layout({ children }: PropsWithChildren) {
+   const { props } = usePage<{ auth?: { user?: { name?: string } } }>()
+   const user = props.auth?.user
++  const { t, locale } = useTranslation()
+ 
+   return (
+     <div className="min-h-screen bg-g-page font-sans text-g-text">
+@@ -13,16 +17,19 @@ export default function Layout({ children }: PropsWithChildren) {
+             Agents On Guren App
+           </Link>
+           <nav className="flex items-center gap-4 text-sm text-g-text-2">
++            <Link href="/" className="transition hover:text-g-heading">
++              {t('nav.home')}
++            </Link>
+             <Link href="/posts" className="transition hover:text-g-heading">
+-              Posts
++              {t('nav.posts')}
+             </Link>
+             {user ? (
+               <>
+                 <Link href="/posts/create" className="transition hover:text-g-heading">
+-                  Write
++                  {t('posts.new')}
+                 </Link>
+                 <Link href="/dashboard" className="transition hover:text-g-heading">
+-                  Dashboard
++                  {t('nav.dashboard')}
+                 </Link>
+                 {/* Inertia's Link posts through Axios, which copies the
+                     XSRF-TOKEN cookie into the request header. A native <form>
+@@ -34,7 +41,7 @@ export default function Layout({ children }: PropsWithChildren) {
+                   as="button"
+                   className="rounded-g-ctl border border-g-line-strong px-3 py-1 text-g-text transition hover:border-g-muted"
+                 >
+-                  Log out
++                  {t('auth.logout')}
+                 </Link>
+               </>
+             ) : (
+@@ -42,9 +49,35 @@ export default function Layout({ children }: PropsWithChildren) {
+                 href="/login"
+                 className="rounded-g-ctl border border-g-line-strong px-3 py-1 text-g-text transition hover:border-g-muted"
+               >
+-                Sign in
++                {t('auth.login')}
+               </Link>
+             )}
++            {/* Language switcher: posts the pick (the same CSRF path as
++                "Log out") and the server redirects back to this page via
++                the Referer, so the reader stays where they were. */}
++            <span
++              role="group"
++              aria-label={t('nav.language')}
++              className="flex items-center gap-1 border-l border-g-line pl-4 font-mono text-xs"
++            >
++              {supportedLocales.map((code) => (
++                <Link
++                  key={code}
++                  href={route('locale.store')}
++                  method="post"
++                  as="button"
++                  data={{ locale: code }}
++                  aria-current={code === locale ? 'true' : undefined}
++                  className={
++                    code === locale
++                      ? 'rounded-g-ctl bg-g-ink px-2 py-1 text-g-on-ink'
++                      : 'rounded-g-ctl px-2 py-1 text-g-text-2 transition hover:text-g-heading'
++                  }
++                >
++                  {t(`locale.${code}`)}
++                </Link>
++              ))}
++            </span>
+           </nav>
+         </div>
+       </header>
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index c5f3d76..1229d57 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -1,4 +1,5 @@
+ import { Head, useForm } from '@inertiajs/react'
++import { useTranslation } from '@guren/inertia-client'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+@@ -13,6 +14,7 @@ const fieldClass =
+   'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
+ 
+ export default function EditPost({ post }: Props) {
++  const { t } = useTranslation()
+   const form = useForm<PostFormData>({
+     title: post.title,
+     excerpt: post.excerpt,
+@@ -21,11 +23,11 @@ export default function EditPost({ post }: Props) {
+ 
+   return (
+     <Layout>
+-      <Head title={`Edit ${post.title}`} />
++      <Head title={t('posts.editHead', { title: post.title })} />
+       <section className="space-y-6">
+         <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
+           <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
+-          Edit post
++          {t('posts.editTitle')}
+         </h1>
+ 
+         <form
+@@ -36,7 +38,7 @@ export default function EditPost({ post }: Props) {
+           }}
+         >
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Title</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.title')}</label>
+             <input
+               type="text"
+               value={form.data.title}
+@@ -47,7 +49,7 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Excerpt</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.excerpt')}</label>
+             <input
+               type="text"
+               value={form.data.excerpt}
+@@ -58,7 +60,7 @@ export default function EditPost({ post }: Props) {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Body</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.body')}</label>
+             <textarea
+               rows={10}
+               value={form.data.body}
+@@ -73,7 +75,7 @@ export default function EditPost({ post }: Props) {
+             disabled={form.processing}
+             className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
+           >
+-            Save changes
++            {t('posts.save')}
+           </button>
+         </form>
+       </section>
+diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
+index f4731cc..5ea4cb4 100644
+--- a/resources/js/pages/posts/Index.tsx
++++ b/resources/js/pages/posts/Index.tsx
+@@ -1,5 +1,6 @@
+ import { useState, type FormEvent } from 'react'
+ import { Head, Link } from '@inertiajs/react'
++import { useTranslation } from '@guren/inertia-client'
+ import type { PaginatedPageProps } from '@guren/core'
+ import type { PostResourceData } from '@/app/Http/Resources/PostResource'
+ import { route } from '@/.guren/routes.gen'
+@@ -18,6 +19,7 @@ interface Props extends PaginatedPageProps<PostResourceData> {}
+ const api = createApiClient<ApiRoutes>({ baseUrl: '' })
+ 
+ export default function PostsIndex({ data, pagination }: Props) {
++  const { t, tc } = useTranslation()
+   const [keywords, setKeywords] = useState('')
+   const [results, setResults] = useState<PostResourceData[] | null>(null)
+   const [searching, setSearching] = useState(false)
+@@ -37,13 +39,13 @@ export default function PostsIndex({ data, pagination }: Props) {
+     try {
+       const response = await api.request('posts.search', { body: { keywords: terms } })
+       if (!response.ok) {
+-        setError('Search failed — try fewer or shorter keywords.')
++        setError(t('posts.searchFailedKeywords'))
+         return
+       }
+       const payload = await response.json()
+       setResults(payload.data)
+     } catch {
+-      setError('Search failed — check your connection and try again.')
++      setError(t('posts.searchFailedConnection'))
+     } finally {
+       setSearching(false)
+     }
+@@ -53,11 +55,11 @@ export default function PostsIndex({ data, pagination }: Props) {
+ 
+   return (
+     <Layout>
+-      <Head title="Posts" />
++      <Head title={t('posts.title')} />
+       <section className="space-y-6">
+         <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
+           <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
+-          Posts
++          {t('posts.title')}
+         </h1>
+ 
+         <form className="flex gap-2" onSubmit={search}>
+@@ -65,7 +67,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+             type="search"
+             value={keywords}
+             onChange={(event) => setKeywords(event.target.value)}
+-            placeholder="Search posts…"
++            placeholder={t('posts.searchPlaceholder')}
+             className="w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent"
+           />
+           <button
+@@ -73,7 +75,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+             disabled={searching}
+             className="rounded-g-ctl border border-g-line-strong bg-g-panel px-4 py-2 text-sm font-bold text-g-text transition hover:border-g-muted disabled:cursor-not-allowed disabled:opacity-45"
+           >
+-            Search
++            {t('posts.search')}
+           </button>
+         </form>
+ 
+@@ -81,7 +83,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+ 
+         {results !== null && (
+           <p className="text-sm text-g-text-2">
+-            {results.length} {results.length === 1 ? 'result' : 'results'} ·{' '}
++            {tc('posts.results', results.length)} ·{' '}
+             <button
+               type="button"
+               onClick={() => {
+@@ -91,7 +93,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+               }}
+               className="text-g-accent-text transition hover:underline"
+             >
+-              Clear
++              {t('posts.clear')}
+             </button>
+           </p>
+         )}
+@@ -107,7 +109,9 @@ export default function PostsIndex({ data, pagination }: Props) {
+               </Link>
+               <p className="mt-2 text-sm text-g-text-2">{post.excerpt}</p>
+               {post.author ? (
+-                <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
++                <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">
++                  {t('posts.by', { name: post.author.name })}
++                </p>
+               ) : null}
+             </article>
+           ))}
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index e06958d..2e98d39 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -1,4 +1,5 @@
+ import { Head, useForm } from '@inertiajs/react'
++import { useTranslation } from '@guren/inertia-client'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+@@ -9,15 +10,16 @@ const fieldClass =
+   'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
+ 
+ export default function NewPost() {
++  const { t } = useTranslation()
+   const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
+ 
+   return (
+     <Layout>
+-      <Head title="New post" />
++      <Head title={t('posts.new')} />
+       <section className="space-y-6">
+         <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
+           <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
+-          New post
++          {t('posts.new')}
+         </h1>
+ 
+         <form
+@@ -28,7 +30,7 @@ export default function NewPost() {
+           }}
+         >
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Title</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.title')}</label>
+             <input
+               type="text"
+               value={form.data.title}
+@@ -39,7 +41,7 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Excerpt</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.excerpt')}</label>
+             <input
+               type="text"
+               value={form.data.excerpt}
+@@ -50,7 +52,7 @@ export default function NewPost() {
+           </div>
+ 
+           <div>
+-            <label className="block text-sm font-bold text-g-heading">Body</label>
++            <label className="block text-sm font-bold text-g-heading">{t('posts.fields.body')}</label>
+             <textarea
+               rows={10}
+               value={form.data.body}
+@@ -65,7 +67,7 @@ export default function NewPost() {
+             disabled={form.processing}
+             className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
+           >
+-            Publish
++            {t('posts.publish')}
+           </button>
+         </form>
+       </section>
+diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
+index 537c81e..2887ea6 100644
+--- a/resources/js/pages/posts/Show.tsx
++++ b/resources/js/pages/posts/Show.tsx
+@@ -1,4 +1,5 @@
+ import { Head, Link, usePage } from '@inertiajs/react'
++import { useTranslation } from '@guren/inertia-client'
+ import type { PostResourceData } from '@/app/Http/Resources/PostResource'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+@@ -9,6 +10,7 @@ interface Props {
+ 
+ export default function PostShow({ post }: Props) {
+   const { props } = usePage<{ auth?: { user?: { id?: number } } }>()
++  const { t } = useTranslation()
+   // Mirrors PostPolicy — the server rejects it either way, this only keeps
+   // controls the viewer cannot use off the page.
+   const canManage = props.auth?.user?.id === post.authorId
+@@ -23,7 +25,7 @@ export default function PostShow({ post }: Props) {
+             {post.title}
+           </h1>
+           <p className="text-sm text-g-muted">
+-            {post.author ? `by ${post.author.name} · ` : ''}
++            {post.author ? `${t('posts.by', { name: post.author.name })} · ` : ''}
+             {new Date(post.createdAt).toLocaleDateString()}
+           </p>
+           <p className="text-g-text-2">{post.excerpt}</p>
+@@ -33,21 +35,21 @@ export default function PostShow({ post }: Props) {
+ 
+         <footer className="flex items-center gap-4 border-t border-g-line pt-6 text-sm">
+           <Link href={route('posts.index')} className="text-g-text-2 transition hover:text-g-heading">
+-            ← All posts
++            {t('posts.allPosts')}
+           </Link>
+           {canManage ? (
+             <>
+               <Link href={route('posts.edit', { id: post.id })} className="text-g-accent-text transition hover:underline">
+-                Edit
++                {t('posts.edit')}
+               </Link>
+               <Link
+                 href={route('posts.destroy', { id: post.id })}
+                 method="delete"
+                 as="button"
+-                onBefore={() => window.confirm('Delete this post?')}
++                onBefore={() => window.confirm(t('posts.confirmDelete'))}
+                 className="rounded-g-ctl border border-g-danger-chip px-3 py-1 font-bold text-g-danger transition hover:bg-g-danger-tint"
+               >
+-                Delete
++                {t('posts.delete')}
+               </Link>
+             </>
+           ) : null}
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..1c3201f 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,6 +1,8 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
++import LocaleController from '../app/Http/Controllers/LocaleController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import { LocaleSchema } from '../app/Http/Validators/LocaleValidator.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -17,6 +19,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+   // Health check endpoint for load balancers and uptime monitors
+   router.get('/health', (c) => c.json({ status: 'ok' }))
+ 
++  // The header's language switcher, for guests and signed-in readers alike.
++  // Remembers the pick in a cookie and sends the reader back to the Referer.
++  router.post('/locale', { name: 'locale.store', body: LocaleSchema }, [LocaleController, 'store'])
++
+   registerAuthRoutes(router)
+ 
+   router.group('/posts', (posts) => {
+diff --git a/src/app.ts b/src/app.ts
+index 3789858..dde4e97 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -11,6 +11,7 @@ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
+ import database from '../config/database.js'
+ import env from '../config/env.js'
+ import http from '../config/http.js'
++import i18n from '../config/i18n.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ const app = createApp({
+@@ -26,10 +27,11 @@ const app = createApp({
+   auth: {},
+   routes: registerWebRoutes,
+   providers: [AuthProvider, AuthorizationProvider],
+-  // Translations live in lang/<locale>/*.json. Add locales to `supported`
+-  // and the request locale is detected from ?locale=, a locale cookie, or
+-  // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+-  i18n: { supported: ['en'] },
++  // Translations live in lang/<locale>/*.json; config/i18n.ts lists the
++  // locales. The request locale is detected from ?locale=, the locale cookie
++  // POST /locale sets, or Accept-Language. `guren codegen` types the keys for
++  // t()/useTranslation().
++  i18n,
+ })
+ 
+ export default app
+diff --git a/tests/LocaleController.test.ts b/tests/LocaleController.test.ts
+new file mode 100644
+index 0000000..886882e
+--- /dev/null
++++ b/tests/LocaleController.test.ts
+@@ -0,0 +1,115 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp, readInertiaResponse, type TestResponse } from '@guren/testing'
++import app from '../src/app.js'
++
++interface I18nProps {
++  locale: string
++  fallbackLocale: string
++  messages: Record<string, Record<string, unknown>>
++}
++
++// The `_i18n` shared prop createApp({ i18n }) attaches to every Inertia page.
++async function i18nOf(response: TestResponse): Promise<I18nProps> {
++  const { payload } = await readInertiaResponse(response.raw)
++  return payload.props._i18n as I18nProps
++}
++
++// The `locale` cookie the switcher sets, as `name=value`, or null when the
++// response set no such cookie.
++function localeCookie(response: TestResponse): string | null {
++  const pair = response.headers
++    .getSetCookie()
++    .map((cookie) => cookie.split(';')[0]?.trim() ?? '')
++    .find((cookie) => cookie.startsWith('locale='))
++  return pair ?? null
++}
++
++describe('locale detection', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('defaults to English', async () => {
++    const i18n = await i18nOf(await http.get('/').assertOk())
++    expect(i18n.locale).toBe('en')
++    expect(i18n.messages.en?.nav).toMatchObject({ posts: 'Posts' })
++  })
++
++  it('follows a Japanese browser on a first visit', async () => {
++    const plain = await i18nOf(await http.withHeader('Accept-Language', 'ja').get('/').assertOk())
++    expect(plain.locale).toBe('ja')
++
++    const weighted = await i18nOf(
++      await http.withHeader('Accept-Language', 'ja-JP,ja;q=0.9,en;q=0.8').get('/').assertOk(),
++    )
++    expect(weighted.locale).toBe('ja')
++    expect(weighted.messages.ja?.nav).toMatchObject({ posts: '記事' })
++  })
++
++  it('lets a remembered pick win over the browser', async () => {
++    const i18n = await i18nOf(
++      await http
++        .withHeaders({ 'Accept-Language': 'ja', Cookie: 'locale=en' })
++        .get('/')
++        .assertOk(),
++    )
++    expect(i18n.locale).toBe('en')
++  })
++})
++
++describe('POST /locale', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await (await TestApp.fromApp(app)).withCsrf()
++  })
++
++  it('remembers the pick and sends the reader back to the Referer', async () => {
++    const response = await http
++      .withHeader('Referer', 'http://localhost/posts')
++      .post('/locale', { locale: 'ja' })
++      .assertRedirect('http://localhost/posts')
++
++    const cookie = localeCookie(response)
++    expect(cookie).toBe('locale=ja')
++
++    const i18n = await i18nOf(await http.withHeader('Cookie', cookie!).get('/').assertOk())
++    expect(i18n.locale).toBe('ja')
++    expect(i18n.messages.ja).toMatchObject({
++      nav: { home: 'ホーム', posts: '記事', dashboard: 'ダッシュボード' },
++      posts: { new: '新規投稿', edit: '編集', delete: '削除', search: '検索' },
++      auth: { login: 'ログイン', logout: 'ログアウト' },
++    })
++  })
++
++  it('switches back to English the same way', async () => {
++    const response = await http
++      .withHeader('Referer', 'http://localhost/posts/1')
++      .post('/locale', { locale: 'en' })
++      .assertRedirect('http://localhost/posts/1')
++    expect(localeCookie(response)).toBe('locale=en')
++  })
++
++  it('falls back to the home page without a Referer', async () => {
++    await http.post('/locale', { locale: 'ja' }).assertRedirect('/')
++  })
++
++  it('does not follow a Referer off the site', async () => {
++    await http
++      .withHeader('Referer', 'https://evil.example/phish')
++      .post('/locale', { locale: 'ja' })
++      .assertRedirect('/')
++  })
++
++  it('rejects a language the app does not serve', async () => {
++    const response = await http.post('/locale', { locale: 'fr' }).assertStatus(422)
++    expect(localeCookie(response)).toBeNull()
++  })
++
++  it('rejects a missing locale', async () => {
++    const response = await http.post('/locale', {}).assertStatus(422)
++    expect(localeCookie(response)).toBeNull()
++  })
++})
+diff --git a/tests/translations.test.ts b/tests/translations.test.ts
+new file mode 100644
+index 0000000..c452064
+--- /dev/null
++++ b/tests/translations.test.ts
+@@ -0,0 +1,68 @@
++import { describe, expect, it } from 'bun:test'
++import { readdir } from 'node:fs/promises'
++import { join } from 'node:path'
++import { supportedLocales } from '../config/i18n.js'
++
++const langDir = new URL('../lang', import.meta.url).pathname
++
++// Flattens lang/<locale>/*.json the way the JsonLoader and `guren check --i18n`
++// read it: the file name is the namespace, nested objects join with dots.
++async function catalogKeys(locale: string): Promise<Map<string, string>> {
++  const entries = new Map<string, string>()
++  const walk = (value: unknown, prefix: string) => {
++    if (typeof value === 'string') {
++      entries.set(prefix, value)
++      return
++    }
++    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
++      walk(nested, `${prefix}.${key}`)
++    }
++  }
++  for (const file of await readdir(join(langDir, locale))) {
++    if (!file.endsWith('.json')) continue
++    const parsed = await Bun.file(join(langDir, locale, file)).json()
++    walk(parsed, file.slice(0, -'.json'.length))
++  }
++  return entries
++}
++
++describe('translation catalogs', () => {
++  it('ship every supported locale', async () => {
++    const present = (await readdir(langDir, { withFileTypes: true }))
++      .filter((entry) => entry.isDirectory())
++      .map((entry) => entry.name)
++      .sort()
++    expect(present).toEqual([...supportedLocales].sort())
++  })
++
++  it('keep the same keys in every locale', async () => {
++    const [reference, ...others] = await Promise.all(supportedLocales.map((locale) => catalogKeys(locale)))
++    const referenceKeys = [...reference!.keys()].sort()
++    expect(referenceKeys.length).toBeGreaterThan(0)
++    for (const other of others) {
++      expect([...other.keys()].sort()).toEqual(referenceKeys)
++    }
++  })
++
++  it('carry the labels the pages read, in both languages', async () => {
++    const en = await catalogKeys('en')
++    const ja = await catalogKeys('ja')
++    const expected: Record<string, string> = {
++      'nav.home': 'ホーム',
++      'nav.posts': '記事',
++      'nav.dashboard': 'ダッシュボード',
++      'posts.new': '新規投稿',
++      'posts.edit': '編集',
++      'posts.delete': '削除',
++      'posts.search': '検索',
++      'auth.login': 'ログイン',
++      'auth.logout': 'ログアウト',
++      'messages.welcome': ':nameへようこそ！',
++    }
++    for (const [key, japanese] of Object.entries(expected)) {
++      expect(ja.get(key)).toBe(japanese)
++      expect(en.get(key)).toBeString()
++      expect(en.get(key)).not.toBe(japanese)
++    }
++  })
++})

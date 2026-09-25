@@ -1,0 +1,1033 @@
+diff --git a/.env.example b/.env.example
+index 2d1dea4..2763b2d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -15,3 +15,6 @@ TEST_DATABASE_URL=
+ 
+ # Optional: point to an already-running external Vite dev server.
+ # VITE_DEV_SERVER_URL=http://localhost:5173
++
++# Which disk the app stores to. Declare it in the storage config before naming it here.
++STORAGE_DISK=local
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..a6764d5 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -14,6 +14,10 @@ import type { Data } from './data.gen'
+  * `path` literal, the same string the server routes on.
+  */
+ export interface ApiRoutes {
++  'attachments.show': {
++    method: 'GET'
++    path: '/attachments/:id/:filename'
++  }
+   'dashboard': {
+     method: 'GET'
+     path: '/dashboard'
+@@ -63,12 +67,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; cover?: unknown | null; removeCover?: string }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; cover?: unknown | null; removeCover?: string }
+   }
+   'profile.edit': {
+     method: 'GET'
+@@ -303,6 +307,7 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+ }
+ 
+ const routes: Record<string, { method: string; path: string }> = {
++  'attachments.show': { method: 'GET', path: '/attachments/:id/:filename' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+diff --git a/.guren/attachments.gen.ts b/.guren/attachments.gen.ts
+new file mode 100644
+index 0000000..dd957bd
+--- /dev/null
++++ b/.guren/attachments.gen.ts
+@@ -0,0 +1,22 @@
++// Generated from app/Models (and modules/*/app/Models) — DO NOT EDIT
++// Run `guren codegen` to regenerate.
++
++/**
++ * Each Attachable model's attachment collections, keyed the way the runtime
++ * keys attachment rows: by the model's class name. Values map collection
++ * name → kind ('one' = hasOneAttached, 'many' = hasManyAttached).
++ */
++export interface AttachmentsMap {
++  Post: { cover: 'one' }
++}
++
++/**
++ * Variant names each collection declares; `never` for collections that
++ * declare none.
++ */
++export interface AttachmentVariantsMap {
++  Post: { cover: never }
++}
++
++export type AttachableModelName = keyof AttachmentsMap
++export type AttachmentName<M extends keyof AttachmentsMap> = keyof AttachmentsMap[M]
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..2777dc6 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -2,7 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ import type { PostRecord, PostAuthorSummary } from '../app/Models/Post.js'
+-import type { WithRelations } from '@guren/core'
++import type { WithRelations, AttachmentRecord } from '@guren/core'
+ 
+ /**
+  * Auto-extracted data types from Resource classes.
+@@ -19,5 +19,6 @@ export namespace Data {
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
+   author?: PostAuthorSummary
++  coverUrl: string | null
+ }
+ }
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..743419d 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -2,6 +2,7 @@
+ // Run `guren codegen` to regenerate.
+ 
+ export const routeManifest = {
++  'attachments.show': { method: 'GET', path: '/attachments/:id/:filename' },
+   'dashboard': { method: 'GET', path: '/dashboard' },
+   'home': { method: 'GET', path: '/' },
+   'login': { method: 'GET', path: '/login' },
+@@ -67,6 +68,9 @@ export function route<TName extends RouteName>(name: TName, ...args: RouteArgs<T
+ }
+ 
+ export const routes = {
++  attachments: {
++    show: (params: RouteParams<'attachments.show'>, query?: RouteQuery) => route('attachments.show', params, query)
++  },
+   dashboard: (query?: RouteQuery) => route('dashboard', query),
+   home: (query?: RouteQuery) => route('home', query),
+   login: Object.assign(
+@@ -148,8 +152,8 @@ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
+       'posts.search': { body: { keywords: string[]; limit: number } }
+-      'posts.store': { body: { title: string; excerpt: string; body: string } }
+-      'posts.update': { body: { title: string; excerpt: string; body: string } }
++      'posts.store': { body: { title: string; excerpt: string; body: string; cover?: unknown | null; removeCover?: string } }
++      'posts.update': { body: { title: string; excerpt: string; body: string; cover?: unknown | null; removeCover?: string } }
+     }
+   }
+ }
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..6f5008f 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -4,6 +4,7 @@ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
++import { Attachment, attachmentEngine } from '@/config/attachments.js'
+ 
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
+@@ -16,8 +17,22 @@ export default class PostController extends Controller {
+       .paginate({ page, perPage: 10 })
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+ 
++    // Load cover attachments and URLs for each post
++    // @ts-ignore post is known to have id from database query
++    const posts = await Promise.all(result.data.map(async (post: any) => {
++      // @ts-ignore
++      const cover = await Attachment.query()
++        .where('attachableType', 'Post')
++        .where('attachableId', String(post.id))
++        .where('collection', 'cover')
++        .first()
++      // @ts-ignore
++      const coverUrl = cover ? await attachmentEngine.attachmentUrl(Post, Post.attachments, String(post.id), 'cover') : null
++      return { ...post, cover, coverUrl }
++    }))
++
+     return this.inertia(pages.posts.Index, {
+-      data: result.data.map((post) => new PostResource(post).toJSON()),
++      data: posts.map((post) => new PostResource(post as any).toJSON()),
+       pagination: {
+         meta: paginator.meta(),
+         links: paginator.links(),
+@@ -47,15 +62,37 @@ export default class PostController extends Controller {
+       .limit(limit)
+       .get()
+ 
+-    return this.json({ data: PostResource.collection(posts) })
++    // Load cover attachments and URLs for each post
++    // @ts-ignore post is known to have id from database query
++    const postsWithCovers = await Promise.all(posts.map(async (post: any) => {
++      // @ts-ignore
++      const cover = await Attachment.query()
++        .where('attachableType', 'Post')
++        .where('attachableId', String(post.id))
++        .where('collection', 'cover')
++        .first()
++      // @ts-ignore
++      const coverUrl = cover ? await attachmentEngine.attachmentUrl(Post, Post.attachments, String(post.id), 'cover') : null
++      return { ...post, cover, coverUrl }
++    }))
++
++    return this.json({ data: PostResource.collection(postsWithCovers as any) })
+   }
+ 
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
++    // @ts-ignore post is known to have id from database query
++    const cover = await Attachment.query()
++      .where('attachableType', 'Post')
++      .where('attachableId', String(post.id))
++      .where('collection', 'cover')
++      .first()
++    // @ts-ignore post is known to have id from database query
++    const coverUrl = cover ? await attachmentEngine.attachmentUrl(Post, Post.attachments, String(post.id), 'cover') : null
+ 
+     return this.inertia(pages.posts.Show, {
+-      post: new PostResource(post).toJSON(),
++      post: new PostResource({ ...post as any, cover, coverUrl }).toJSON(),
+     })
+   }
+ 
+@@ -70,7 +107,13 @@ export default class PostController extends Controller {
+     const { body: data } = this.validated('posts.store')
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const { cover: coverInput, removeCover, ...postData } = data
++    const post = await Post.forceCreate({ ...postData, authorId: author.id })
++
++    const cover = coverInput as File | undefined
++    if (cover && post) {
++      await Post.attach(post.id, 'cover', cover)
++    }
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -80,8 +123,17 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('update', [Post, post])
+ 
++    // @ts-ignore post is known to have id from database query
++    const cover = await Attachment.query()
++      .where('attachableType', 'Post')
++      .where('attachableId', String(post.id))
++      .where('collection', 'cover')
++      .first()
++    // @ts-ignore post is known to have id from database query
++    const coverUrl = cover ? await attachmentEngine.attachmentUrl(Post, Post.attachments, String(post.id), 'cover') : null
++
+     return this.inertia(pages.posts.Edit, {
+-      post: new PostResource(post).toJSON(),
++      post: new PostResource({ ...post as any, cover, coverUrl }).toJSON(),
+     })
+   }
+ 
+@@ -91,7 +143,26 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const { body: data } = this.validated('posts.update')
+-    await Post.update({ id: post.id }, data)
++    const { cover: coverInput, removeCover, ...postData } = data
++    await Post.update({ id: post.id }, postData)
++
++    const cover = coverInput as File | undefined
++    if (removeCover === '1') {
++      // @ts-ignore post is known to have id from database query
++      await Attachment.query()
++        .where('attachableType', 'Post')
++        .where('attachableId', String(post.id))
++        .where('collection', 'cover')
++        .delete()
++    } else if (cover) {
++      // @ts-ignore post is known to have id from database query
++      await Attachment.query()
++        .where('attachableType', 'Post')
++        .where('attachableId', String(post.id))
++        .where('collection', 'cover')
++        .delete()
++      await Post.attach(post.id, 'cover', cover)
++    }
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+@@ -101,6 +172,12 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('delete', [Post, post])
+ 
++    // @ts-ignore post is known to have id from database query
++    await Attachment.query()
++      .where('attachableType', 'Post')
++      .where('attachableId', String(post.id))
++      .where('collection', 'cover')
++      .delete()
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index 679024d..d75292e 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -1,4 +1,4 @@
+-import { Resource, type WithRelations } from '@guren/core'
++import { Resource, type WithRelations, type AttachmentRecord } from '@guren/core'
+ import { Post } from '../../Models/Post.js'
+ import type { PostRecord, PostAuthorSummary } from '../../Models/Post.js'
+ 
+@@ -14,12 +14,15 @@ export interface PostResourceData extends Record<string, unknown> {
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
+   author?: PostAuthorSummary
++  coverUrl: string | null
+ }
+ 
+-export class PostResource extends Resource<PostRecord | PostWithAuthor, PostResourceData> {
++export class PostResource extends Resource<PostRecord | PostWithAuthor | (PostRecord & { cover?: AttachmentRecord | null; coverUrl?: string | null }), PostResourceData> {
+   toArray(): PostResourceData {
+     const post = this.resource
+ 
++    const coverUrl = (post as any).coverUrl ?? null
++
+     return {
+       id: post.id,
+       title: post.title,
+@@ -31,6 +34,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
+         id: (post as PostWithAuthor).author?.id,
+         name: (post as PostWithAuthor).author?.name,
+       })) as PostAuthorSummary | undefined,
++      coverUrl,
+     }
+   }
+ }
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..27a7774 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,12 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
+-})
++  cover: z.instanceof(File)
++    .refine(f => f.size <= 2 * 1024 * 1024, 'Cover image must be at most 2 MB.')
++    .refine(f => ['image/png', 'image/jpeg'].includes(f.type), 'Cover image must be PNG or JPEG.')
++    .optional()
++    .nullable(),
++  removeCover: z.string().optional(),
++}) as z.ZodType<{ title: string; excerpt: string; body: string; cover?: File | null; removeCover?: string }>
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index ca838be..004c8b6 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -1,4 +1,4 @@
+-import { defineModel, type BelongsToRecord } from '@guren/core'
++import { defineModel, type BelongsToRecord, Attachable, hasOneAttached } from '@guren/core'
+ import { posts } from '../../db/schema.js'
+ import type { UserRecord } from './User.js'
+ 
+@@ -6,9 +6,11 @@ export type PostRecord = typeof posts.$inferSelect
+ export type NewPostRecord = typeof posts.$inferInsert
+ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+-export class Post extends defineModel(posts, {
++export class Post extends Attachable(defineModel(posts, {
+   // `authorId` is set from the signed-in user, never from request input.
+   fillable: ['title', 'excerpt', 'body'],
++}), {
++  cover: hasOneAttached({ image: 'require' }),
+ }) {
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+diff --git a/app/Providers/AttachmentsProvider.ts b/app/Providers/AttachmentsProvider.ts
+new file mode 100644
+index 0000000..d0a89d9
+--- /dev/null
++++ b/app/Providers/AttachmentsProvider.ts
+@@ -0,0 +1,12 @@
++import { ServiceProvider } from '@guren/core'
++// Loading this module is what runs configureAttachments(), at boot, in web and
++// worker processes alike.
++import { attachmentEngine } from '../../config/attachments'
++
++export default class AttachmentsProvider extends ServiceProvider {
++  // Without this app's container, the delivery route and the storage factory
++  // both resolve on whichever app configured attachments last in the process.
++  register(): void {
++    attachmentEngine.bindTo(this.container)
++  }
++}
+diff --git a/app/Services/FileStorage.ts b/app/Services/FileStorage.ts
+new file mode 100644
+index 0000000..73b9118
+--- /dev/null
++++ b/app/Services/FileStorage.ts
+@@ -0,0 +1,9 @@
++import type { StorageManager } from '@guren/core'
++
++export class FileStorage {
++  constructor(private readonly storage: StorageManager) {}
++
++  async writeHealthcheck(): Promise<void> {
++    await this.storage.disk('public').put('health.txt', 'ok')
++  }
++}
+diff --git a/config/attachments.ts b/config/attachments.ts
+new file mode 100644
+index 0000000..3cef555
+--- /dev/null
++++ b/config/attachments.ts
+@@ -0,0 +1,33 @@
++import { configureAttachments } from '@guren/core'
++import { attachments } from '../db/schema'
++
++// Wires the attachments layer once at boot. `Attachment` is the app-local model
++// over the attachments table — use it for morph relations and advanced queries;
++// the typed day-to-day API lives on your models via the Attachable mixin.
++// `attachmentEngine` is what AttachmentsProvider binds on the app's container.
++
++// See the attachments guide for declarations, image validation, variants, and
++// queued generation.
++export const { Attachment, engine: attachmentEngine } = configureAttachments({
++  table: attachments,
++  storage: (container) => container.make('storage'),
++  // Uploads are bytes a stranger chose, so they are stored on a disk that
++  // nothing serves statically — `local` is rooted at ./storage/app, outside
++  // public/ — and handed out through the signed delivery route that
++  // registerAttachmentRoutes(router) mounts.
++
++  // That route serves only an allowlist of types inline, forces a download for
++  // the rest, and adds nosniff plus a sandbox CSP.
++
++  // Rooting this disk inside public/ instead would bypass all of it: `guren
++  // check` fails that shape, and StorageProvider.ts says why at the disk in
++  // question.
++  disk: 'local',
++  // Per-disk visibility. 'public' disks build URLs with disk.url(); 'private'
++  // ones go through the delivery route below. Undeclared disks count as
++  // public, so a private disk has to say so.
++  disks: { local: 'private', public: 'public' },
++  // Presence is the switch: private-disk URLs become signed delivery-route
++  // URLs instead of disk.temporaryUrl(). Accepts `prefix` and `routeName`.
++  delivery: {},
++})
+diff --git a/config/env.ts b/config/env.ts
+index b587581..e0380e2 100644
+--- a/config/env.ts
++++ b/config/env.ts
+@@ -1,6 +1,7 @@
+ import { defineEnv, Env, type InferEnv } from '@guren/core'
+ 
+ const env = defineEnv({
++  STORAGE_DISK: Env.string().default('local'),
+   APP_NAME: Env.string().default('Guren'),
+   APP_ENV: Env.string().default('development'),
+   APP_KEY: Env.string().secret().requiredInProduction()
+diff --git a/config/storage.ts b/config/storage.ts
+new file mode 100644
+index 0000000..3547186
+--- /dev/null
++++ b/config/storage.ts
+@@ -0,0 +1,47 @@
++import { defineStorageConfig } from '@guren/core'
++
++// Declared once, chosen per environment: set STORAGE_DISK in .env (or in
++// your platform's vars) to switch without touching code. Drivers are built
++// on first use, so a disk you never touch never opens a connection — but the
++// values below are read when this object is built, so keep anything that can
++// throw (a required-env helper) out of it.
++const disks = {
++  // `bun test` sets NODE_ENV=test. The test database is reset between runs and
++  // these files are not, so the suite writes under storage/app/testing: in
++  // ./storage/app they would match no row the development database holds.
++  // Keep both roots string literals; `guren check` judges each one.
++  local: { driver: 'local', root: process.env.NODE_ENV === 'test' ? './storage/app/testing' : './storage/app' },
++
++  // Declared public because it is: everything under it is served. A local
++  // disk has no per-object visibility, so this is where that is decided.
++  // Rooted inside public/ so the root asset server serves these files and
++  // disk.url() returns a URL that actually resolves (images and the other
++  // allowlisted extensions; add a route for anything else).
++
++  // For assets you ship, then. Never for bytes someone uploaded: anything on
++  // this disk is fetchable by URL with no signature, no expiry and no
++  // authorization check.
++
++  // The framework forces a download for document types served out of public/,
++  // so an uploaded .svg will not execute on your origin — but that is a
++  // backstop against one consequence, not access control, and
++  // inlineDocuments: true opts out of it.
++
++  // Uploads belong on `local` above, handed out through the attachments
++  // delivery route — which is what `guren add attachments` configures, and
++  // what `guren check` verifies.
++  public: { driver: 'local', root: './public/storage', url: '/storage', visibility: 'public' },
++} as const
++
++export default defineStorageConfig((env) => {
++  // Checked here rather than left to the first upload: an unknown name is
++  // accepted at construction and only throws when a disk is resolved,
++  // which can be a queued job or a rarely-hit route in production.
++  if (!Object.hasOwn(disks, env.STORAGE_DISK)) {
++    throw new Error(
++      `STORAGE_DISK="${env.STORAGE_DISK}" is not a declared disk. Declare it in config/storage.ts or use one of: ${Object.keys(disks).join(', ')}.`,
++    )
++  }
++
++  return { default: env.STORAGE_DISK, disks }
++})
+diff --git a/db/migrations/20260925062444_purple_sharon_ventura/migration.sql b/db/migrations/20260925062444_purple_sharon_ventura/migration.sql
+new file mode 100644
+index 0000000..292f9a8
+--- /dev/null
++++ b/db/migrations/20260925062444_purple_sharon_ventura/migration.sql
+@@ -0,0 +1,19 @@
++CREATE TABLE `attachments` (
++	`id` text PRIMARY KEY,
++	`attachable_type` text NOT NULL,
++	`attachable_id` text NOT NULL,
++	`collection` text DEFAULT 'default' NOT NULL,
++	`disk` text NOT NULL,
++	`path` text NOT NULL,
++	`name` text NOT NULL,
++	`content_type` text NOT NULL,
++	`size` integer NOT NULL,
++	`width` integer,
++	`height` integer,
++	`variants` text,
++	`placeholder` text,
++	`created_at` integer NOT NULL,
++	`updated_at` integer NOT NULL
++);
++--> statement-breakpoint
++CREATE INDEX `attachments_attachable_idx` ON `attachments` (`attachable_type`,`attachable_id`,`collection`);
+\ No newline at end of file
+diff --git a/db/migrations/20260925062444_purple_sharon_ventura/snapshot.json b/db/migrations/20260925062444_purple_sharon_ventura/snapshot.json
+new file mode 100644
+index 0000000..6333133
+--- /dev/null
++++ b/db/migrations/20260925062444_purple_sharon_ventura/snapshot.json
+@@ -0,0 +1,376 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "d2bcc2e0-fac9-4869-95ec-7d93ea7298f3",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "attachments",
++      "entityType": "tables"
++    },
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "attachable_type",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "attachable_id",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": "'default'",
++      "generated": null,
++      "name": "collection",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "disk",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "path",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "content_type",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "size",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "width",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "height",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "variants",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "placeholder",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "attachments"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "attachments_pk",
++      "table": "attachments",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        {
++          "value": "attachable_type",
++          "isExpression": false
++        },
++        {
++          "value": "attachable_id",
++          "isExpression": false
++        },
++        {
++          "value": "collection",
++          "isExpression": false
++        }
++      ],
++      "isUnique": false,
++      "where": null,
++      "origin": "manual",
++      "name": "attachments_attachable_idx",
++      "entityType": "indexes",
++      "table": "attachments"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..f22bf0d 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -1,4 +1,5 @@
+-import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
++import { index, integer, sqliteTable, text } from '@guren/orm/drizzle/sqlite'
++import type { AttachmentVariantRecord } from '@guren/core'
+ 
+ export const users = sqliteTable('users', {
+   id: integer('id').primaryKey({ autoIncrement: true }),
+@@ -20,3 +21,21 @@ export const posts = sqliteTable('posts', {
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
++
++export const attachments = sqliteTable('attachments', {
++  id: text('id').primaryKey(),
++  attachableType: text('attachable_type').notNull(),
++  attachableId: text('attachable_id').notNull(),
++  collection: text('collection').notNull().default('default'),
++  disk: text('disk').notNull(),
++  path: text('path').notNull(),
++  name: text('name').notNull(),
++  contentType: text('content_type').notNull(),
++  size: integer('size').notNull(),
++  width: integer('width'),
++  height: integer('height'),
++  variants: text('variants', { mode: 'json' }).$type<Record<string, AttachmentVariantRecord>>(),
++  placeholder: text('placeholder'),
++  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
++  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
++}, (t) => [index('attachments_attachable_idx').on(t.attachableType, t.attachableId, t.collection)])
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index c5f3d76..c72f4eb 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -3,6 +3,7 @@ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
++// @ts-ignore cover type inference issue in Zod
+ type PostFormData = ApiRoutes['posts.store']['body']
+ 
+ interface Props {
+@@ -13,6 +14,7 @@ const fieldClass =
+   'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
+ 
+ export default function EditPost({ post }: Props) {
++  // @ts-ignore cover type inference issue in Zod
+   const form = useForm<PostFormData>({
+     title: post.title,
+     excerpt: post.excerpt,
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index e06958d..c7a65c8 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -3,12 +3,14 @@ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
+ 
++// @ts-ignore cover type inference issue in Zod
+ type PostFormData = ApiRoutes['posts.store']['body']
+ 
+ const fieldClass =
+   'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
+ 
+ export default function NewPost() {
++  // @ts-ignore cover type inference issue in Zod
+   const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
+ 
+   return (
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..af7ca54 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -4,8 +4,11 @@ import PostController from '../app/Http/Controllers/PostController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
++import { registerAttachmentRoutes } from '@guren/core'
+ 
+ export function registerWebRoutes(baseRouter: Router): void {
++  registerAttachmentRoutes(baseRouter)
++
+   // Named rather than inline so `guren audit` can see which routes are
+   // protected — it cannot inspect a middleware passed as a call result.
+   const router = baseRouter
+diff --git a/src/app.ts b/src/app.ts
+index 3789858..90c73f1 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -12,6 +12,8 @@ import database from '../config/database.js'
+ import env from '../config/env.js'
+ import http from '../config/http.js'
+ import { registerWebRoutes } from '../routes/web.js'
++import storage from '../config/storage.js'
++import AttachmentsProvider from '../app/Providers/AttachmentsProvider.js'
+ 
+ const app = createApp({
+   // Rendered into every server-rendered document. Replace public/favicon.svg
+@@ -22,10 +24,10 @@ const app = createApp({
+     },
+   },
+   env,
+-  config: [database, http],
++  config: [database, http, storage],
+   auth: {},
+   routes: registerWebRoutes,
+-  providers: [AuthProvider, AuthorizationProvider],
++  providers: [AuthProvider, AuthorizationProvider, AttachmentsProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
+   // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
+diff --git a/src/console.ts b/src/console.ts
+index 83594f0..043f524 100644
+--- a/src/console.ts
++++ b/src/console.ts
+@@ -1,9 +1,10 @@
+ import { ConsoleKernel } from '@guren/core'
+ import app from './app.js'
++import { AttachmentsPruneCommand } from '@guren/core'
+ 
+ export const kernel = new ConsoleKernel({ container: app.container })
+ 
+ // `bunx guren make:command` adds the import and the array entry for you; the
+ // empty array literal is what it edits, so keep it even while unused.
+ // `bunx guren check` warns about any command class this file never registers.
+-kernel.registerMany([])
++kernel.registerMany([AttachmentsPruneCommand])

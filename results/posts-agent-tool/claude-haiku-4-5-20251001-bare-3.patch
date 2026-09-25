@@ -1,0 +1,259 @@
+diff --git a/app/Http/Controllers/McpController.ts b/app/Http/Controllers/McpController.ts
+new file mode 100644
+index 0000000..cf0a244
+--- /dev/null
++++ b/app/Http/Controllers/McpController.ts
+@@ -0,0 +1,179 @@
++import { Controller, deriveAgentTools, readBearerToken, verifyApiToken } from '@guren/core'
++import { createAgentInvocationPipeline } from '@guren/server'
++import type { VerifiedApiToken } from '@guren/core'
++import type { AgentPrincipal, DerivedAgentTool } from '@guren/server'
++
++interface JsonRpcRequest {
++  jsonrpc: string
++  id: string | number | null
++  method: string
++  params?: unknown
++}
++
++interface JsonRpcResponse {
++  jsonrpc: string
++  id: string | number | null
++  result?: unknown
++  error?: { code: number; message: string; data?: unknown }
++}
++
++export default class McpController extends Controller {
++  private static agentTools: DerivedAgentTool[] = []
++  private static toolsInitialized = false
++
++  async handle(): Promise<Response> {
++    const authHeader = this.request.header('authorization')
++    const bearerToken = readBearerToken(authHeader)
++
++    if (!bearerToken) {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, { status: 401 })
++    }
++
++    const apiTokenStore = this.make('api-token-store') as any
++    let verifiedToken: VerifiedApiToken | null = null
++
++    try {
++      verifiedToken = await verifyApiToken(bearerToken, apiTokenStore)
++    } catch {
++      // Token verification failed
++    }
++
++    if (!verifiedToken) {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, { status: 401 })
++    }
++
++    let request: JsonRpcRequest
++    try {
++      const body = await this.request.json()
++      request = body as JsonRpcRequest
++    } catch {
++      return this.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, { status: 400 })
++    }
++
++    if (request.jsonrpc !== '2.0' || !request.method) {
++      return this.json({ jsonrpc: '2.0', id: request.id ?? null, error: { code: -32600, message: 'Invalid Request' } }, { status: 400 })
++    }
++
++    const response = await this.dispatchMcpCall(request, verifiedToken, bearerToken)
++    const status = response.error?.code === -32600 || response.error?.code === -32700 ? 400 : 200
++    return this.json(response, { status })
++  }
++
++  private getTools(): DerivedAgentTool[] {
++    if (!McpController.toolsInitialized) {
++      const app = this.make('app') as any
++      const definitions = app.router.definitions()
++      const result = deriveAgentTools(definitions)
++      McpController.agentTools = result.tools
++      McpController.toolsInitialized = true
++    }
++    return McpController.agentTools
++  }
++
++  private async dispatchMcpCall(request: JsonRpcRequest, token: VerifiedApiToken, bearerToken: string): Promise<JsonRpcResponse> {
++    if (request.method === 'tools/list') {
++      return {
++        jsonrpc: '2.0',
++        id: request.id ?? null,
++        result: { tools: this.formatTools() },
++      }
++    }
++
++    if (request.method === 'tools/call') {
++      const params = request.params as { name?: string; arguments?: Record<string, unknown> } | undefined
++      if (!params?.name || typeof params.name !== 'string' || !params.arguments || typeof params.arguments !== 'object') {
++        return {
++          jsonrpc: '2.0',
++          id: request.id ?? null,
++          error: { code: -32602, message: 'Invalid params' },
++        }
++      }
++
++      return await this.callTool(params.name, params.arguments as Record<string, unknown>, token, bearerToken)
++    }
++
++    return {
++      jsonrpc: '2.0',
++      id: request.id ?? null,
++      error: { code: -32601, message: 'Method not found' },
++    }
++  }
++
++  private formatTools(): unknown[] {
++    return this.getTools().map((tool) => ({
++      name: tool.toolName,
++      description: tool.description || '',
++      inputSchema: tool.inputSchema,
++      ...(tool.annotations?.readOnlyHint && { annotations: { readOnly: true } }),
++    }))
++  }
++
++  private async callTool(toolName: string, args: Record<string, unknown>, token: VerifiedApiToken, bearerToken: string): Promise<JsonRpcResponse> {
++    const tool = this.getTools().find((t) => t.toolName === toolName)
++    if (!tool) {
++      return {
++        jsonrpc: '2.0',
++        id: null,
++        error: { code: -32601, message: 'Method not found' },
++      }
++    }
++
++    const principal: AgentPrincipal = {
++      kind: 'user',
++      id: token.userId,
++      abilities: token.abilities,
++    }
++
++    const abilities = token.abilities || []
++    const app = this.make('app')
++
++    const pipeline = createAgentInvocationPipeline({
++      app,
++      principal,
++      abilities,
++      surface: 'mcp',
++      authorization: `Bearer ${bearerToken}`,
++    })
++
++    try {
++      const result = await pipeline.invoke({
++        tool,
++        args,
++      })
++
++      if (result.status === 'executed') {
++        const outcome = result.outcome
++        return {
++          jsonrpc: '2.0',
++          id: null,
++          result: {
++            content: outcome.content,
++            isError: outcome.isError,
++          },
++        }
++      } else if (result.status === 'denied') {
++        return {
++          jsonrpc: '2.0',
++          id: null,
++          error: {
++            code: -32600,
++            message: result.denial.message,
++            data: result.denial.body,
++          },
++        }
++      } else {
++        return {
++          jsonrpc: '2.0',
++          id: null,
++          error: { code: -32603, message: 'Internal error' },
++        }
++      }
++    } catch (error) {
++      return {
++        jsonrpc: '2.0',
++        id: null,
++        error: { code: -32603, message: 'Internal error' },
++      }
++    }
++  }
++}
+diff --git a/config/http.ts b/config/http.ts
+index 194077d..9f680f3 100644
+--- a/config/http.ts
++++ b/config/http.ts
+@@ -1,6 +1,6 @@
+ import { defineHttpConfig } from '@guren/core'
+ 
+-const exclude = ['/health']
++const exclude = ['/health', '/mcp']
+ 
+ // The Host header is client-controlled, so production answers only to the host
+ // this app is deployed as, which APP_URL carries. Emailed links do not depend
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..8062b41 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,6 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import McpController from '../app/Http/Controllers/McpController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -24,7 +25,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.middleware('auth').group((authed) => {
+       authed.get('/create', [PostController, 'create']).name('posts.create')
+       authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
+-      authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
++      authed.post('/', {
++        name: 'posts.store',
++        body: PostPayloadSchema,
++      }, [PostController, 'store']).agent({ toolName: 'posts_store' })
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
+     })
+@@ -42,6 +46,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+       // the client's json() comes back typed — no runtime validation, just the
+       // type codegen already extracts from the Resource.
+       resource: { data: [PostResource] },
+-    }, [PostController, 'search'])
++    }, [PostController, 'search']).agent({ toolName: 'posts_search', readOnlyHint: true })
+   })
++
++  // MCP endpoint for assistants using bearer token authentication
++  router.post('/mcp', [McpController, 'handle'])
+ }
+diff --git a/tests/McpEndpoint.test.ts b/tests/McpEndpoint.test.ts
+new file mode 100644
+index 0000000..bec047d
+--- /dev/null
++++ b/tests/McpEndpoint.test.ts
+@@ -0,0 +1,21 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++
++// MCP endpoint tests. The endpoint requires bearer token authentication.
++// POST /mcp without a credential should answer 401 (or 403 if host is not authorized).
++// With valid bearer token, tools/list and tools/call should work.
++describe('MCP endpoint', () => {
++  let http: TestApp
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++  })
++
++  it('rejects requests without authorization', async () => {
++    const response = await http.post('/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' })
++    // Endpoint returns 401 for missing bearer token, or 403 if host authorization rejects first
++    const isUnauthorized = response.status === 401 || response.status === 403
++    expect(isUnauthorized).toBe(true)
++  })
++})

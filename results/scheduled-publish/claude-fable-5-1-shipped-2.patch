@@ -1,0 +1,951 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..45c8092 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -63,12 +63,12 @@ export interface ApiRoutes {
+   'posts.store': {
+     method: 'POST'
+     path: '/posts'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; publishAt?: "" | string | null }
+   }
+   'posts.update': {
+     method: 'PUT'
+     path: '/posts/:id'
+-    body: { title: string; excerpt: string; body: string }
++    body: { title: string; excerpt: string; body: string; publishAt?: "" | string | null }
+   }
+   'profile.edit': {
+     method: 'GET'
+diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
+index 392ad58..8763312 100644
+--- a/.guren/data.gen.ts
++++ b/.guren/data.gen.ts
+@@ -18,6 +18,9 @@ export namespace Data {
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
++  // ISO 8601 instant the post goes (or went) live; null when it was published on save.
++  publishedAt: string | null
++  scheduled: boolean
+   author?: PostAuthorSummary
+ }
+ }
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..35bb692 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -29,7 +29,7 @@ export function isPageId(value: string): value is PageId {
+   return Object.prototype.hasOwnProperty.call(pageManifest, value)
+ }
+ 
+-type PostFormData = ApiRoutes['posts.store']['body']
++type PostFormData = ApiRoutes['posts.update']['body']
+ /**
+  * Auto-extracted Props types from page components.
+  */
+@@ -48,7 +48,7 @@ export interface PagePropsMap {
+   latest: PostResourceData[]
+ }
+   'posts/Edit': {
+-  post: PostFormData & { id: number }
++  post: Omit<PostFormData, 'publishAt'> & { id: number; publishedAt: string | null }
+ }
+   'posts/Index': PaginatedPageProps<PostResourceData> & {}
+   'posts/Show': {
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..1d7538c 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -148,8 +148,8 @@ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
+       'posts.search': { body: { keywords: string[]; limit: number } }
+-      'posts.store': { body: { title: string; excerpt: string; body: string } }
+-      'posts.update': { body: { title: string; excerpt: string; body: string } }
++      'posts.store': { body: { title: string; excerpt: string; body: string; publishAt?: "" | string | null } }
++      'posts.update': { body: { title: string; excerpt: string; body: string; publishAt?: "" | string | null } }
+     }
+   }
+ }
+diff --git a/app/Console/Commands/ScheduledPostsCommand.ts b/app/Console/Commands/ScheduledPostsCommand.ts
+new file mode 100644
+index 0000000..a4c735b
+--- /dev/null
++++ b/app/Console/Commands/ScheduledPostsCommand.ts
+@@ -0,0 +1,24 @@
++import { Command } from '@guren/core'
++import { Post } from '../../Models/Post.js'
++
++/**
++ * Ops report of posts not yet live. stdout carries only the rows,
++ * `<id>\t<title>\t<published_at>` soonest first, so it pipes cleanly;
++ * `published_at` is printed exactly as stored.
++ */
++export default class ScheduledPostsCommand extends Command {
++  static signature = 'posts:scheduled'
++  static description = 'List posts scheduled to publish later, soonest first (tab-separated)'
++
++  async handle(): Promise<void> {
++    const posts = await Post.newQuery()
++      .where('publishedAt', '>', new Date().toISOString())
++      .orderBy('publishedAt', 'asc')
++      .orderBy('id', 'asc')
++      .get()
++
++    for (const post of posts) {
++      this.line(`${post.id}\t${post.title}\t${post.publishedAt}`)
++    }
++  }
++}
+diff --git a/app/Http/Controllers/HomeController.ts b/app/Http/Controllers/HomeController.ts
+index fc8ac0b..d7ab80e 100644
+--- a/app/Http/Controllers/HomeController.ts
++++ b/app/Http/Controllers/HomeController.ts
+@@ -1,13 +1,15 @@
+ import { Controller } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import type { UserRecord } from '../../Models/User.js'
+ import { PostResource } from '../Resources/PostResource.js'
+ 
+ const LATEST_POST_COUNT = 3
+ 
+ export default class HomeController extends Controller {
+   async index(): Promise<Response> {
+-    const latest = await Post.newQuery()
++    const viewer = await this.auth.user<UserRecord>()
++    const latest = await Post.visibleTo(viewer?.id ?? null)
+       .with('author')
+       .orderBy('id', 'desc')
+       .limit(LATEST_POST_COUNT)
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..68995bb 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,4 +1,4 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, NotFoundHttpException, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+@@ -10,7 +10,7 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+     const { page } = this.validateQuery(ListPostsQuerySchema)
+-    const result = await Post.newQuery()
++    const result = await Post.visibleTo(await this.viewerId())
+       .with('author')
+       .orderBy('id', 'desc')
+       .paginate({ page, perPage: 10 })
+@@ -32,11 +32,11 @@ export default class PostController extends Controller {
+   async search(): Promise<Response> {
+     const { keywords, limit } = this.validated('posts.search').body
+ 
+-    const posts = await Post.newQuery()
++    const posts = await Post.visibleTo(await this.viewerId())
+       .with('author')
+       // All keyword OR pairs sit inside one callback, keeping this an
+-      // any-keyword match while AND filters added later (a published flag,
+-      // tenancy) apply to every hit instead of being OR'd away.
++      // any-keyword match while the visibility filter above applies to every
++      // hit instead of being OR'd away.
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+@@ -53,6 +53,11 @@ export default class PostController extends Controller {
+   async show(): Promise<Response> {
+     const { id } = this.validateParams(PostIdParamSchema)
+     const post = await Post.findWithOrFail(id, 'author')
++    // A scheduled post must look nonexistent to everyone but its author, so
++    // this is a 404 rather than a 403: a 403 would confirm the id exists.
++    if (Post.isScheduled(post) && post.authorId !== (await this.viewerId())) {
++      throw NotFoundHttpException.forModel('Post', id)
++    }
+ 
+     return this.inertia(pages.posts.Show, {
+       post: new PostResource(post).toJSON(),
+@@ -70,7 +75,7 @@ export default class PostController extends Controller {
+     const { body: data } = this.validated('posts.store')
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+-    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const post = await Post.forceCreate({ ...toPostAttributes(data), authorId: author.id })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
+   }
+@@ -91,7 +96,7 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const { body: data } = this.validated('posts.update')
+-    await Post.update({ id: post.id }, data)
++    await Post.update({ id: post.id }, toPostAttributes(data))
+ 
+     return this.redirect(`/posts/${post.id}`)
+   }
+@@ -105,4 +110,25 @@ export default class PostController extends Controller {
+ 
+     return this.redirect('/posts')
+   }
++
++  private async viewerId(): Promise<number | null> {
++    const user = await this.auth.user<UserRecord>()
++    return user?.id ?? null
++  }
++}
++
++interface PostPayloadInput {
++  title: string
++  excerpt: string
++  body: string
++  publishAt?: string | null
++}
++
++// The form field is `publishAt`; the column is `published_at`. Any offset the
++// form sent is normalised to UTC so stored values compare as plain text.
++function toPostAttributes({ publishAt, ...data }: PostPayloadInput) {
++  return {
++    ...data,
++    publishedAt: publishAt ? new Date(publishAt).toISOString() : null,
++  }
+ }
+diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
+index 679024d..7270584 100644
+--- a/app/Http/Resources/PostResource.ts
++++ b/app/Http/Resources/PostResource.ts
+@@ -13,6 +13,9 @@ export interface PostResourceData extends Record<string, unknown> {
+   // Serialized here because `created_at` is a string on SQLite and a Date on
+   // PostgreSQL and MySQL — pages should not have to know which.
+   createdAt: string
++  // ISO 8601 instant the post goes (or went) live; null when it was published on save.
++  publishedAt: string | null
++  scheduled: boolean
+   author?: PostAuthorSummary
+ }
+ 
+@@ -27,6 +30,8 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
+       body: post.body,
+       authorId: post.authorId,
+       createdAt: new Date(post.createdAt).toISOString(),
++      publishedAt: post.publishedAt === null ? null : new Date(post.publishedAt).toISOString(),
++      scheduled: Post.isScheduled(post),
+       author: this.whenLoaded('author', () => ({
+         id: (post as PostWithAuthor).author?.id,
+         name: (post as PostWithAuthor).author?.name,
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..1cc8998 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -20,6 +20,15 @@ export const PostPayloadSchema = z.object({
+   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+   body: z.string().trim().min(1, 'Body is required.'),
++  // Absent, null or an empty field means "publish now". Any other value must be
++  // a full ISO 8601 date and time; `z.iso.datetime` rejects prose like "next tuesday".
++  publishAt: z
++    .union([
++      z.literal('').transform(() => null),
++      z.iso.datetime({ offset: true, error: 'Publish at must be a date and time.' }),
++    ])
++    .nullable()
++    .optional(),
+ })
+ 
+ export type PostPayload = z.infer<typeof PostPayloadSchema>
+diff --git a/app/Models/Post.ts b/app/Models/Post.ts
+index ca838be..527fce1 100644
+--- a/app/Models/Post.ts
++++ b/app/Models/Post.ts
+@@ -8,11 +8,29 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+ 
+ export class Post extends defineModel(posts, {
+   // `authorId` is set from the signed-in user, never from request input.
+-  fillable: ['title', 'excerpt', 'body'],
++  fillable: ['title', 'excerpt', 'body', 'publishedAt'],
+ }) {
+   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
+     author: null,
+   }
++
++  /** A post is scheduled while its `publishedAt` instant is still ahead of `now`. */
++  static isScheduled(post: Pick<PostRecord, 'publishedAt'>, now: Date = new Date()): boolean {
++    return post.publishedAt !== null && new Date(post.publishedAt).getTime() > now.getTime()
++  }
++
++  /**
++   * Adds the visibility filter for a viewer: public posts (no date, or a date
++   * already reached) plus, for a signed-in viewer, their own scheduled posts.
++   * The ISO 8601 UTC text compares lexicographically, so `<=` works on SQLite.
++   */
++  static visibleTo(viewerId: number | null, now: Date = new Date()) {
++    const cutoff = now.toISOString()
++    return Post.newQuery().where((q) => {
++      q.whereNull('publishedAt').orWhere('publishedAt', '<=', cutoff)
++      if (viewerId !== null) q.orWhere('authorId', viewerId)
++    })
++  }
+ }
+ 
+ Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
+diff --git a/bin/console.ts b/bin/console.ts
+index a1734c6..46f00f0 100644
+--- a/bin/console.ts
++++ b/bin/console.ts
+@@ -1,11 +1,20 @@
+ import { ready } from '../src/main.js'
+ import { kernel } from '../src/console.js'
+ 
++// Boot may apply migrations and seed, and the ORM reports that through
++// console.log/console.info. Commands are piped into other tools, so stdout
++// must hold only what a command prints: route boot chatter to stderr.
++const { log, info } = console
++console.log = console.error
++console.info = console.error
+ try {
+   await ready
+ } catch (error) {
+   console.error('Failed to bootstrap application:', error)
+   process.exit(1)
++} finally {
++  console.log = log
++  console.info = info
+ }
+ 
+ // process.exit() is required, not just tidy: an idle database pool keeps the
+diff --git a/db/migrations/20260925053550_add_published_at_to_posts/migration.sql b/db/migrations/20260925053550_add_published_at_to_posts/migration.sql
+new file mode 100644
+index 0000000..c01c12b
+--- /dev/null
++++ b/db/migrations/20260925053550_add_published_at_to_posts/migration.sql
+@@ -0,0 +1 @@
++ALTER TABLE `posts` ADD `published_at` text;
+\ No newline at end of file
+diff --git a/db/migrations/20260925053550_add_published_at_to_posts/snapshot.json b/db/migrations/20260925053550_add_published_at_to_posts/snapshot.json
+new file mode 100644
+index 0000000..3f7716e
+--- /dev/null
++++ b/db/migrations/20260925053550_add_published_at_to_posts/snapshot.json
+@@ -0,0 +1,201 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "4f9de0d1-ac37-4cb9-8a03-78ee0a898767",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "published_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..1b5368c 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -19,4 +19,7 @@ export const posts = sqliteTable('posts', {
+     .notNull()
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
++  // ISO 8601 UTC text like `created_at`. NULL or a past instant = public;
++  // a future instant = scheduled, visible only to the author until then.
++  publishedAt: text('published_at'),
+ })
+diff --git a/docs/adr/0002-scheduled-publishing-via-published-at.md b/docs/adr/0002-scheduled-publishing-via-published-at.md
+new file mode 100644
+index 0000000..9333c59
+--- /dev/null
++++ b/docs/adr/0002-scheduled-publishing-via-published-at.md
+@@ -0,0 +1,50 @@
++---
++type: adr
++status: stable
++entities: [Post]
++related:
++  - app/Http/Controllers/PostController.ts
++  - app/Http/Controllers/HomeController.ts
++  - app/Http/Resources/PostResource.ts
++  - app/Http/Validators/PostValidator.ts
++  - app/Console/Commands/ScheduledPostsCommand.ts
++  - bin/console.ts
++generated: { by: "claude-fable/5.1", at: 2026-09-25T05:38:49.551Z }
++---
++
++# Scheduled publishing via published_at
++
++## Context
++
++Authors write ahead of time, but a post went live the moment it was saved,
++so launch posts were kept in documents and pasted in by hand. Editorial
++wants to write now and publish later; ops wants to read the calendar from a
++terminal.
++
++## Decision
++
++- `posts.published_at` is a nullable ISO 8601 UTC text column, stored like
++  `created_at`. `NULL` or a past instant means public; a future instant means
++  scheduled. Nothing runs at publish time: visibility is decided per request
++  by comparing the column against the current time.
++- The form field is `publishAt` on `posts.store` and `posts.update`. It is
++  optional and nullable; any offset it carries is normalised to UTC before
++  storage so the column compares as plain text.
++- `Post.visibleTo(viewerId)` is the single query filter for the list, search
++  and home page: public posts plus the viewer's own. `Post.isScheduled()` is
++  the per-record check the show action uses.
++- A scheduled post answers 404, not 403, to everyone but its author, so the
++  id's existence is not confirmed.
++- `posts:scheduled` prints `<id>\t<title>\t<published_at>` soonest first and
++  nothing else on stdout; `bin/console.ts` routes boot logging to stderr so
++  the output pipes cleanly.
++
++## Consequences
++
++- Publishing needs no scheduler, queue or cron entry, and cannot fire early
++  or late relative to the request that reads the post.
++- The lexicographic `<=` comparison relies on every stored value being in the
++  same UTC ISO 8601 format. Writes go through the validator and normaliser;
++  direct database writes must keep that format.
++- Unpublishing a live post is only possible by giving it a future date, and
++  a post carries at most one date.
+diff --git a/resources/js/components/PublishAtField.tsx b/resources/js/components/PublishAtField.tsx
+new file mode 100644
+index 0000000..63a38c4
+--- /dev/null
++++ b/resources/js/components/PublishAtField.tsx
+@@ -0,0 +1,39 @@
++interface Props {
++  // ISO 8601 UTC instant, or null for "publish now".
++  value: string | null
++  onChange: (value: string | null) => void
++  error?: string
++}
++
++const fieldClass =
++  'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
++
++// `datetime-local` has no zone: the input shows the instant in the viewer's
++// local time and the form carries the UTC instant the server compares against.
++function toLocalInput(value: string | null): string {
++  if (!value) return ''
++  const date = new Date(value)
++  if (Number.isNaN(date.getTime())) return ''
++  const pad = (n: number) => String(n).padStart(2, '0')
++  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
++}
++
++export default function PublishAtField({ value, onChange, error }: Props) {
++  return (
++    <div>
++      <label className="block text-sm font-bold text-g-heading">Publish at</label>
++      <input
++        type="datetime-local"
++        value={toLocalInput(value)}
++        onChange={(event) => {
++          const raw = event.target.value
++          const date = raw ? new Date(raw) : null
++          onChange(date && !Number.isNaN(date.getTime()) ? date.toISOString() : null)
++        }}
++        className={fieldClass}
++      />
++      <p className="mt-1 text-xs text-g-muted">Leave empty to publish as soon as you save.</p>
++      {error ? <p className="mt-1 text-sm text-g-danger">{error}</p> : null}
++    </div>
++  )
++}
+diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
+index c5f3d76..bf56925 100644
+--- a/resources/js/pages/posts/Edit.tsx
++++ b/resources/js/pages/posts/Edit.tsx
+@@ -2,11 +2,12 @@ import { Head, useForm } from '@inertiajs/react'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
++import PublishAtField from '../../components/PublishAtField.js'
+ 
+-type PostFormData = ApiRoutes['posts.store']['body']
++type PostFormData = ApiRoutes['posts.update']['body']
+ 
+ interface Props {
+-  post: PostFormData & { id: number }
++  post: Omit<PostFormData, 'publishAt'> & { id: number; publishedAt: string | null }
+ }
+ 
+ const fieldClass =
+@@ -17,6 +18,7 @@ export default function EditPost({ post }: Props) {
+     title: post.title,
+     excerpt: post.excerpt,
+     body: post.body,
++    publishAt: post.publishedAt,
+   })
+ 
+   return (
+@@ -68,6 +70,12 @@ export default function EditPost({ post }: Props) {
+             {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
+           </div>
+ 
++          <PublishAtField
++            value={form.data.publishAt ?? null}
++            onChange={(value) => form.setData('publishAt', value)}
++            error={form.errors.publishAt}
++          />
++
+           <button
+             type="submit"
+             disabled={form.processing}
+diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
+index f4731cc..156add8 100644
+--- a/resources/js/pages/posts/Index.tsx
++++ b/resources/js/pages/posts/Index.tsx
+@@ -105,6 +105,11 @@ export default function PostsIndex({ data, pagination }: Props) {
+               >
+                 {post.title}
+               </Link>
++              {post.scheduled && post.publishedAt ? (
++                <p className="mt-1 font-mono text-xs uppercase tracking-wide text-g-accent-text">
++                  Scheduled · goes live {new Date(post.publishedAt).toLocaleString()}
++                </p>
++              ) : null}
+               <p className="mt-2 text-sm text-g-text-2">{post.excerpt}</p>
+               {post.author ? (
+                 <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
+diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
+index e06958d..959635d 100644
+--- a/resources/js/pages/posts/New.tsx
++++ b/resources/js/pages/posts/New.tsx
+@@ -2,6 +2,7 @@ import { Head, useForm } from '@inertiajs/react'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
++import PublishAtField from '../../components/PublishAtField.js'
+ 
+ type PostFormData = ApiRoutes['posts.store']['body']
+ 
+@@ -9,7 +10,7 @@ const fieldClass =
+   'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
+ 
+ export default function NewPost() {
+-  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
++  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '', publishAt: null })
+ 
+   return (
+     <Layout>
+@@ -60,12 +61,18 @@ export default function NewPost() {
+             {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
+           </div>
+ 
++          <PublishAtField
++            value={form.data.publishAt ?? null}
++            onChange={(value) => form.setData('publishAt', value)}
++            error={form.errors.publishAt}
++          />
++
+           <button
+             type="submit"
+             disabled={form.processing}
+             className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
+           >
+-            Publish
++            {form.data.publishAt ? 'Schedule' : 'Publish'}
+           </button>
+         </form>
+       </section>
+diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
+index 537c81e..f629859 100644
+--- a/resources/js/pages/posts/Show.tsx
++++ b/resources/js/pages/posts/Show.tsx
+@@ -26,6 +26,11 @@ export default function PostShow({ post }: Props) {
+             {post.author ? `by ${post.author.name} · ` : ''}
+             {new Date(post.createdAt).toLocaleDateString()}
+           </p>
++          {post.scheduled && post.publishedAt ? (
++            <p className="font-mono text-xs uppercase tracking-wide text-g-accent-text">
++              Scheduled · goes live {new Date(post.publishedAt).toLocaleString()}
++            </p>
++          ) : null}
+           <p className="text-g-text-2">{post.excerpt}</p>
+         </header>
+ 
+diff --git a/src/console.ts b/src/console.ts
+index 83594f0..d62df67 100644
+--- a/src/console.ts
++++ b/src/console.ts
+@@ -1,9 +1,10 @@
+ import { ConsoleKernel } from '@guren/core'
+ import app from './app.js'
++import ScheduledPostsCommand from '../app/Console/Commands/ScheduledPostsCommand.js'
+ 
+ export const kernel = new ConsoleKernel({ container: app.container })
+ 
+ // `bunx guren make:command` adds the import and the array entry for you; the
+ // empty array literal is what it edits, so keep it even while unused.
+ // `bunx guren check` warns about any command class this file never registers.
+-kernel.registerMany([])
++kernel.registerMany([ScheduledPostsCommand])
+diff --git a/tests/ScheduledPosts.test.ts b/tests/ScheduledPosts.test.ts
+new file mode 100644
+index 0000000..d5b8ea4
+--- /dev/null
++++ b/tests/ScheduledPosts.test.ts
+@@ -0,0 +1,173 @@
++import { beforeAll, describe, expect, it } from 'bun:test'
++import { TestApp, readInertiaResponse } from '@guren/testing'
++import app from '../src/app.js'
++import { Post, type PostRecord } from '../app/Models/Post.js'
++import { User, type UserRecord } from '../app/Models/User.js'
++import type { PostResourceData } from '../app/Http/Resources/PostResource.js'
++
++const FUTURE = '2099-10-01T09:00:00.000Z'
++const PAST = '2001-01-01T00:00:00.000Z'
++
++async function makeUser(label: string): Promise<UserRecord> {
++  const user = await User.create({
++    name: label,
++    email: `${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`,
++    password: 'password-1234',
++  })
++  return user as UserRecord
++}
++
++async function makePost(author: UserRecord, title: string, publishedAt: string | null): Promise<PostRecord> {
++  const post = await Post.forceCreate({ title, excerpt: `${title} excerpt`, body: `${title} body`, authorId: author.id, publishedAt })
++  return post as PostRecord
++}
++
++async function indexData(client: TestApp): Promise<PostResourceData[]> {
++  const response = await client.get('/posts')
++  response.assertOk()
++  const { payload } = await readInertiaResponse(response.raw)
++  return (payload.props as { data: PostResourceData[] }).data
++}
++
++async function searchData(client: TestApp, keyword: string): Promise<PostResourceData[]> {
++  const response = await client.query('/posts/search', { keywords: [keyword] })
++  response.assertOk()
++  return (await response.json<{ data: PostResourceData[] }>()).data
++}
++
++describe('scheduled posts', () => {
++  let http: TestApp
++  let author: UserRecord
++  let other: UserRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    author = await makeUser('author')
++    other = await makeUser('other')
++  })
++
++  it('stores publishAt on create and reads it back on the post page', async () => {
++    const client = await http.actingAs(author).withCsrf()
++    const created = await client.post('/posts', {
++      title: 'Launch day',
++      excerpt: 'Soon',
++      body: 'Body',
++      publishAt: FUTURE,
++    })
++    created.assertRedirect()
++    const id = Number(created.headers.get('location')?.split('/').pop())
++    const stored = await Post.findOrFail(id)
++    expect(stored.publishedAt).toBe(FUTURE)
++
++    const page = await http.actingAs(author).get(`/posts/${id}`)
++    page.assertOk()
++    const { payload } = await readInertiaResponse(page.raw)
++    expect((payload.props as { post: PostResourceData }).post.publishedAt).toBe(FUTURE)
++  })
++
++  it('publishes immediately when publishAt is absent or null', async () => {
++    const client = await http.actingAs(author).withCsrf()
++    const absent = await client.post('/posts', { title: 'Now A', excerpt: 'x', body: 'y' })
++    absent.assertRedirect()
++    const withNull = await client.post('/posts', { title: 'Now B', excerpt: 'x', body: 'y', publishAt: null })
++    withNull.assertRedirect()
++
++    const guestTitles = (await indexData(http)).map((post) => post.title)
++    expect(guestTitles).toContain('Now A')
++    expect(guestTitles).toContain('Now B')
++  })
++
++  it('rejects a publishAt that is not a date and time without saving', async () => {
++    const before = await Post.newQuery().count()
++    const client = await http.actingAs(author).withCsrf()
++    await client.json().post('/posts', { title: 'Bad', excerpt: 'x', body: 'y', publishAt: 'next tuesday' }).assertUnprocessable()
++    expect(await Post.newQuery().count()).toBe(before)
++  })
++
++  it('hides a scheduled post from guests and other users, but not from its author', async () => {
++    const post = await makePost(author, 'Secret launch', FUTURE)
++
++    await http.get(`/posts/${post.id}`).assertNotFound()
++    await http.actingAs(other).get(`/posts/${post.id}`).assertNotFound()
++    await http.actingAs(author).get(`/posts/${post.id}`).assertOk()
++
++    expect((await indexData(http)).map((p) => p.id)).not.toContain(post.id)
++    expect((await indexData(http.actingAs(other))).map((p) => p.id)).not.toContain(post.id)
++    const mine = (await indexData(http.actingAs(author))).find((p) => p.id === post.id)
++    expect(mine?.publishedAt).toBe(FUTURE)
++
++    expect((await searchData(http, 'Secret')).map((p) => p.id)).not.toContain(post.id)
++    expect((await searchData(http.actingAs(other), 'Secret')).map((p) => p.id)).not.toContain(post.id)
++  })
++
++  it('becomes public once published_at is in the past, with no further action', async () => {
++    const post = await makePost(author, 'Timed reveal', FUTURE)
++    await http.get(`/posts/${post.id}`).assertNotFound()
++
++    await Post.forceUpdate({ id: post.id }, { publishedAt: PAST })
++
++    await http.get(`/posts/${post.id}`).assertOk()
++    expect((await indexData(http)).map((p) => p.id)).toContain(post.id)
++    expect((await searchData(http.actingAs(other), 'Timed')).map((p) => p.id)).toContain(post.id)
++  })
++
++  it('lets the author set, change and clear the date on edit', async () => {
++    const post = await makePost(author, 'Editable', null)
++    const client = await http.actingAs(author).withCsrf()
++    const base = { title: 'Editable', excerpt: 'x', body: 'y' }
++
++    ;(await client.put(`/posts/${post.id}`, { ...base, publishAt: FUTURE })).assertRedirect()
++    expect((await Post.findOrFail(post.id)).publishedAt).toBe(FUTURE)
++    await http.get(`/posts/${post.id}`).assertNotFound()
++
++    ;(await client.put(`/posts/${post.id}`, { ...base, publishAt: '2099-12-24T18:30:00+01:00' })).assertRedirect()
++    expect((await Post.findOrFail(post.id)).publishedAt).toBe('2099-12-24T17:30:00.000Z')
++
++    ;(await client.put(`/posts/${post.id}`, { ...base })).assertRedirect()
++    expect((await Post.findOrFail(post.id)).publishedAt).toBeNull()
++    await http.get(`/posts/${post.id}`).assertOk()
++  })
++})
++
++describe('posts:scheduled command', () => {
++  let author: UserRecord
++
++  beforeAll(async () => {
++    await TestApp.fromApp(app)
++    author = await makeUser('ops')
++  })
++
++  async function run(): Promise<{ stdout: string; code: number }> {
++    const proc = Bun.spawn(['bun', 'bin/console.ts', 'posts:scheduled'], {
++      cwd: process.cwd(),
++      env: { ...process.env, NODE_ENV: 'test' },
++      stdout: 'pipe',
++      stderr: 'pipe',
++    })
++    const stdout = await new Response(proc.stdout).text()
++    return { stdout, code: await proc.exited }
++  }
++
++  it('prints one tab-separated line per scheduled post, soonest first, and nothing else', async () => {
++    await Post.newQuery().delete()
++    await makePost(author, 'Live already', null)
++    await makePost(author, 'Went live', PAST)
++    const later = await makePost(author, 'Later', '2099-06-01T12:00:00.000Z')
++    const sooner = await makePost(author, 'Sooner', '2099-05-01T12:00:00.000Z')
++
++    const { stdout, code } = await run()
++    expect(code).toBe(0)
++    expect(stdout).toBe(
++      `${sooner.id}\tSooner\t2099-05-01T12:00:00.000Z\n${later.id}\tLater\t2099-06-01T12:00:00.000Z\n`,
++    )
++  })
++
++  it('prints nothing when nothing is scheduled', async () => {
++    await Post.newQuery().delete()
++    await makePost(author, 'Only live', null)
++
++    const { stdout, code } = await run()
++    expect(code).toBe(0)
++    expect(stdout).toBe('')
++  })
++})

@@ -1,0 +1,864 @@
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..ec7eb59 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -50,6 +50,14 @@ export interface ApiRoutes {
+     method: 'GET'
+     path: '/posts'
+   }
++  'posts.revisions': {
++    method: 'GET'
++    path: '/posts/:id/revisions'
++  }
++  'posts.revisions.restore': {
++    method: 'POST'
++    path: '/posts/:id/revisions/:revisionId/restore'
++  }
+   'posts.search': {
+     method: 'QUERY'
+     path: '/posts/search'
+@@ -312,6 +320,8 @@ const routes: Record<string, { method: string; path: string }> = {
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+   'posts.index': { method: 'GET', path: '/posts' },
++  'posts.revisions': { method: 'GET', path: '/posts/:id/revisions' },
++  'posts.revisions.restore': { method: 'POST', path: '/posts/:id/revisions/:revisionId/restore' },
+   'posts.search': { method: 'QUERY', path: '/posts/search' },
+   'posts.show': { method: 'GET', path: '/posts/:id' },
+   'posts.store': { method: 'POST', path: '/posts' },
+diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
+index 8db6dc3..11d69e0 100644
+--- a/.guren/pages.gen.ts
++++ b/.guren/pages.gen.ts
+@@ -15,6 +15,7 @@ export const pageManifest = {
+   'posts/Edit': './pages/posts/Edit.tsx',
+   'posts/Index': './pages/posts/Index.tsx',
+   'posts/New': './pages/posts/New.tsx',
++  'posts/Revisions': './pages/posts/Revisions.tsx',
+   'posts/Show': './pages/posts/Show.tsx',
+   'profile/Edit': './pages/profile/Edit.tsx',
+ } as const
+@@ -51,6 +52,10 @@ export interface PagePropsMap {
+   post: PostFormData & { id: number }
+ }
+   'posts/Index': PaginatedPageProps<PostResourceData> & {}
++  'posts/Revisions': {
++  post: { id: number; title: string }
++  revisions: Array<{ id: number; title: string; createdAt: string }>
++}
+   'posts/Show': {
+   post: PostResourceData
+ }
+@@ -91,6 +96,7 @@ export const pages = {
+     Edit: defineGeneratedPage<'posts/Edit', PagePropsMap['posts/Edit']>('posts/Edit', pageManifest['posts/Edit']),
+     Index: defineGeneratedPage<'posts/Index', PagePropsMap['posts/Index']>('posts/Index', pageManifest['posts/Index']),
+     New: defineGeneratedPage('posts/New', pageManifest['posts/New']),
++    Revisions: defineGeneratedPage<'posts/Revisions', PagePropsMap['posts/Revisions']>('posts/Revisions', pageManifest['posts/Revisions']),
+     Show: defineGeneratedPage<'posts/Show', PagePropsMap['posts/Show']>('posts/Show', pageManifest['posts/Show'])
+   },
+   profile: {
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..e230fe8 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -11,6 +11,8 @@ export const routeManifest = {
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+   'posts.index': { method: 'GET', path: '/posts' },
++  'posts.revisions': { method: 'GET', path: '/posts/:id/revisions' },
++  'posts.revisions.restore': { method: 'POST', path: '/posts/:id/revisions/:revisionId/restore' },
+   'posts.search': { method: 'QUERY', path: '/posts/search' },
+   'posts.show': { method: 'GET', path: '/posts/:id' },
+   'posts.store': { method: 'POST', path: '/posts' },
+@@ -81,6 +83,12 @@ export const routes = {
+     destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
+     edit: (params: RouteParams<'posts.edit'>, query?: RouteQuery) => route('posts.edit', params, query),
+     index: (query?: RouteQuery) => route('posts.index', query),
++    revisions: Object.assign(
++      (params: RouteParams<'posts.revisions'>, query?: RouteQuery) => route('posts.revisions', params, query),
++      {
++      restore: (params: RouteParams<'posts.revisions.restore'>, query?: RouteQuery) => route('posts.revisions.restore', params, query)
++    }
++    ),
+     search: (query?: RouteQuery) => route('posts.search', query),
+     show: (params: RouteParams<'posts.show'>, query?: RouteQuery) => route('posts.show', params, query),
+     store: (query?: RouteQuery) => route('posts.store', query),
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..ed2d4de 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -1,6 +1,7 @@
+ import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import { PostRevision } from '../../Models/PostRevision.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+@@ -91,6 +92,7 @@ export default class PostController extends Controller {
+     await this.authorize('update', [Post, post])
+ 
+     const { body: data } = this.validated('posts.update')
++    await PostRevision.keep(post)
+     await Post.update({ id: post.id }, data)
+ 
+     return this.redirect(`/posts/${post.id}`)
+@@ -101,6 +103,7 @@ export default class PostController extends Controller {
+     const post = await Post.findOrFail(id)
+     await this.authorize('delete', [Post, post])
+ 
++    await PostRevision.delete({ postId: post.id })
+     await Post.delete({ id: post.id })
+ 
+     return this.redirect('/posts')
+diff --git a/app/Http/Controllers/PostRevisionController.ts b/app/Http/Controllers/PostRevisionController.ts
+new file mode 100644
+index 0000000..bac923e
+--- /dev/null
++++ b/app/Http/Controllers/PostRevisionController.ts
+@@ -0,0 +1,41 @@
++import { Controller, HttpException } from '@guren/core'
++import { pages } from '@/.guren/pages.gen'
++import { Post } from '../../Models/Post.js'
++import { PostRevision } from '../../Models/PostRevision.js'
++import { PostIdParamSchema, RevisionParamSchema } from '../Validators/PostValidator.js'
++
++export default class PostRevisionController extends Controller {
++  async index(): Promise<Response> {
++    const { id } = this.validateParams(PostIdParamSchema)
++    const post = await Post.findOrFail(id)
++    await this.authorize('update', [Post, post])
++
++    const revisions = await PostRevision.where({ postId: post.id }).orderBy('id', 'desc').get()
++
++    return this.inertia(pages.posts.Revisions, {
++      post: { id: post.id, title: post.title },
++      revisions: revisions.map((revision) => ({
++        id: revision.id,
++        title: revision.title,
++        createdAt: revision.createdAt,
++      })),
++    })
++  }
++
++  async restore(): Promise<Response> {
++    const { id, revisionId } = this.validateParams(RevisionParamSchema)
++    const post = await Post.findOrFail(id)
++    await this.authorize('update', [Post, post])
++
++    const revision = await PostRevision.first({ id: revisionId, postId: post.id })
++    if (!revision) throw HttpException.notFound()
++
++    await PostRevision.keep(post)
++    await Post.update(
++      { id: post.id },
++      { title: revision.title, excerpt: revision.excerpt, body: revision.body },
++    )
++
++    return this.redirect(`/posts/${post.id}`)
++  }
++}
+diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
+index 804642a..5de9431 100644
+--- a/app/Http/Validators/PostValidator.ts
++++ b/app/Http/Validators/PostValidator.ts
+@@ -4,6 +4,11 @@ export const PostIdParamSchema = z.object({
+   id: z.coerce.number().int().positive(),
+ })
+ 
++export const RevisionParamSchema = z.object({
++  id: z.coerce.number().int().positive(),
++  revisionId: z.coerce.number().int().positive(),
++})
++
+ export const ListPostsQuerySchema = z.object({
+   page: z.coerce.number().int().min(1).default(1),
+ })
+diff --git a/app/Models/PostRevision.ts b/app/Models/PostRevision.ts
+new file mode 100644
+index 0000000..ccdacc3
+--- /dev/null
++++ b/app/Models/PostRevision.ts
+@@ -0,0 +1,19 @@
++import { defineModel } from '@guren/core'
++import { postRevisions } from '../../db/schema.js'
++import type { PostRecord } from './Post.js'
++
++export type PostRevisionRecord = typeof postRevisions.$inferSelect
++
++export class PostRevision extends defineModel(postRevisions, {
++  fillable: ['title', 'excerpt', 'body'],
++}) {
++  // forceCreate: `postId` is set by the server, never from request input.
++  static keep(post: PostRecord) {
++    return PostRevision.forceCreate({
++      postId: post.id,
++      title: post.title,
++      excerpt: post.excerpt,
++      body: post.body,
++    })
++  }
++}
+diff --git a/db/migrations/20260925014421_post_revisions/migration.sql b/db/migrations/20260925014421_post_revisions/migration.sql
+new file mode 100644
+index 0000000..6d3f4b9
+--- /dev/null
++++ b/db/migrations/20260925014421_post_revisions/migration.sql
+@@ -0,0 +1,9 @@
++CREATE TABLE `post_revisions` (
++	`id` integer PRIMARY KEY AUTOINCREMENT,
++	`post_id` integer NOT NULL,
++	`title` text NOT NULL,
++	`excerpt` text NOT NULL,
++	`body` text NOT NULL,
++	`created_at` text NOT NULL,
++	CONSTRAINT `fk_post_revisions_post_id_posts_id_fk` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`)
++);
+diff --git a/db/migrations/20260925014421_post_revisions/snapshot.json b/db/migrations/20260925014421_post_revisions/snapshot.json
+new file mode 100644
+index 0000000..af06d21
+--- /dev/null
++++ b/db/migrations/20260925014421_post_revisions/snapshot.json
+@@ -0,0 +1,279 @@
++{
++  "version": "7",
++  "dialect": "sqlite",
++  "id": "ad596adc-ffe2-4842-9147-b716cc7c34cd",
++  "prevIds": [
++    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
++  ],
++  "ddl": [
++    {
++      "name": "post_revisions",
++      "entityType": "tables"
++    },
++    {
++      "name": "posts",
++      "entityType": "tables"
++    },
++    {
++      "name": "users",
++      "entityType": "tables"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "post_id",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "post_revisions"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "title",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "excerpt",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "body",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "author_id",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "posts"
++    },
++    {
++      "type": "integer",
++      "notNull": false,
++      "autoincrement": true,
++      "default": null,
++      "generated": null,
++      "name": "id",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "name",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "email",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "password_hash",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": false,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "remember_token",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "created_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "type": "text",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "updated_at",
++      "entityType": "columns",
++      "table": "users"
++    },
++    {
++      "columns": [
++        "post_id"
++      ],
++      "tableTo": "posts",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_post_revisions_post_id_posts_id_fk",
++      "entityType": "fks",
++      "table": "post_revisions"
++    },
++    {
++      "columns": [
++        "author_id"
++      ],
++      "tableTo": "users",
++      "columnsTo": [
++        "id"
++      ],
++      "onUpdate": "NO ACTION",
++      "onDelete": "NO ACTION",
++      "nameExplicit": false,
++      "name": "fk_posts_author_id_users_id_fk",
++      "entityType": "fks",
++      "table": "posts"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "post_revisions_pk",
++      "table": "post_revisions",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "posts_pk",
++      "table": "posts",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "id"
++      ],
++      "nameExplicit": false,
++      "name": "users_pk",
++      "table": "users",
++      "entityType": "pks"
++    },
++    {
++      "columns": [
++        "email"
++      ],
++      "nameExplicit": false,
++      "name": "users_email_unique",
++      "entityType": "uniques",
++      "table": "users"
++    }
++  ],
++  "renames": []
++}
+\ No newline at end of file
+diff --git a/db/schema.ts b/db/schema.ts
+index 47b96e5..4cacc67 100644
+--- a/db/schema.ts
++++ b/db/schema.ts
+@@ -20,3 +20,14 @@ export const posts = sqliteTable('posts', {
+     .references(() => users.id),
+   createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
+ })
++
++export const postRevisions = sqliteTable('post_revisions', {
++  id: integer('id').primaryKey({ autoIncrement: true }),
++  postId: integer('post_id')
++    .notNull()
++    .references(() => posts.id),
++  title: text('title').notNull(),
++  excerpt: text('excerpt').notNull(),
++  body: text('body').notNull(),
++  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
++})
+diff --git a/docs/spec/domain.md b/docs/spec/domain.md
+new file mode 100644
+index 0000000..c7dc1ce
+--- /dev/null
++++ b/docs/spec/domain.md
+@@ -0,0 +1,30 @@
++---
++type: spec
++title: Domain Model
++description: Model classes and their declared relationships, grouped by module.
++generated: { by: process:guren-spec-generate }
++---
++
++<!-- Generated by `bunx guren spec:generate` — do not edit by hand. -->
++
++# Domain Model
++
++Model classes and their declared relationships, grouped by module. Attributes live in the ER view (`er.md`).
++
++```mermaid
++classDiagram
++  class Post
++  class PostRevision
++  class User {
++    <<Authenticatable>>
++  }
++  User "1" --> "*" Post : posts
++```
++
++## Models
++
++- **Post** (app/Models/Post.ts) — table: `posts`
++  - belongsTo: `author` → PostAuthorSummary
++- **PostRevision** (app/Models/PostRevision.ts) — table: `postRevisions`
++- **User** (app/Models/User.ts) — table: `users`
++  - hasMany: `posts` → Post
+diff --git a/docs/spec/er.md b/docs/spec/er.md
+new file mode 100644
+index 0000000..58f87f6
+--- /dev/null
++++ b/docs/spec/er.md
+@@ -0,0 +1,80 @@
++---
++type: spec
++title: ER Diagram
++description: Entities, attributes, and relationship edges derived from the schema and models.
++generated: { by: process:guren-spec-generate }
++---
++
++<!-- Generated by `bunx guren spec:generate` — do not edit by hand. -->
++
++# ER Diagram
++
++Entities and attributes are derived from `db/schema.ts` (and every module schema); edges from model relationship declarations and explicit `.references()` foreign keys.
++
++This is a minimal, diff-able view. For interactive exploration of the Drizzle schema, tools like drizzle-lab or Liam ERD complement it.
++
++```mermaid
++erDiagram
++  postRevisions {
++    integer id PK
++    integer postId FK
++    text title
++    text excerpt
++    text body
++    text createdAt
++  }
++  posts {
++    integer id PK
++    text title
++    text excerpt
++    text body
++    integer authorId FK
++    text createdAt
++  }
++  users {
++    integer id PK
++    text name
++    text email
++    text passwordHash
++    text rememberToken
++    text createdAt
++    text updatedAt
++  }
++  postRevisions }o--|| posts : postId
++  posts }o--|| users : authorId
++  users ||--o{ posts : posts
++```
++
++## postRevisions (table: post_revisions)
++
++| Column | Type | Constraints |
++|--------|------|-------------|
++| id | integer | primary key |
++| postId | integer | not null, references posts.id |
++| title | text | not null |
++| excerpt | text | not null |
++| body | text | not null |
++| createdAt | text | not null |
++
++## posts
++
++| Column | Type | Constraints |
++|--------|------|-------------|
++| id | integer | primary key |
++| title | text | not null |
++| excerpt | text | not null |
++| body | text | not null |
++| authorId | integer | not null, references users.id |
++| createdAt | text | not null |
++
++## users
++
++| Column | Type | Constraints |
++|--------|------|-------------|
++| id | integer | primary key |
++| name | text | not null |
++| email | text | not null |
++| passwordHash | text | not null |
++| rememberToken | text |  |
++| createdAt | text | not null |
++| updatedAt | text | not null |
+diff --git a/docs/spec/modules.md b/docs/spec/modules.md
+new file mode 100644
+index 0000000..f288a78
+--- /dev/null
++++ b/docs/spec/modules.md
+@@ -0,0 +1,25 @@
++---
++type: spec
++title: Modules
++description: Application modules, the models each owns, and the dependencies between them.
++generated: { by: process:guren-spec-generate }
++---
++
++<!-- Generated by `bunx guren spec:generate` — do not edit by hand. -->
++
++# Modules
++
++This app has no `modules/` directory — all code lives at the application root.
++
++```mermaid
++graph LR
++  m_app["app<br/>Post, PostRevision, User"]
++```
++
++## app
++
++Models (3):
++
++- Post — app/Models/Post.ts
++- PostRevision — app/Models/PostRevision.ts
++- User — app/Models/User.ts
+diff --git a/docs/spec/screens.md b/docs/spec/screens.md
+new file mode 100644
+index 0000000..cb044ae
+--- /dev/null
++++ b/docs/spec/screens.md
+@@ -0,0 +1,29 @@
++---
++type: spec
++title: Screens
++description: Routes, controllers, and the Inertia pages they render.
++generated: { by: process:guren-spec-generate }
++---
++
++<!-- Generated by `bunx guren spec:generate` — do not edit by hand. -->
++
++# Screens
++
++Derived from `routes/web.ts`, controller `this.inertia(...)` calls, and page components under `resources/js/pages/` — those files are the source of truth, not this document.
++
++Page references are attributed to the controller action whose body makes the call, so a page lists only the routes of the action that renders it. A page referenced outside any action keeps a row with an empty Routes cell.
++
++## Pages (10)
++
++| Page | Props | Routes |
++|------|-------|--------|
++| Home | { latest: PostResourceData[] } | GET / → HomeController.index |
++| auth/Login | { email?: string errors?: ValidationErrors<'email' \| 'password'> } | GET /login → LoginController.show |
++| auth/Register | { errors?: ValidationErrors<'name' \| 'email' \| 'password' \| 'passwordConfirmation'> } | GET /register → RegisterController.show |
++| dashboard/Index | { user?: { id: number; name: string; email: string } \| null } | GET /dashboard → DashboardController.index |
++| posts/Edit | { post: PostFormData & { id: number } } | GET /posts/:id/edit → PostController.edit |
++| posts/Index | PaginatedPageProps<PostResourceData> & {} | GET /posts → PostController.index |
++| posts/New |  | GET /posts/create → PostController.create |
++| posts/Revisions | { post: { id: number; title: string } revisions: Array<{ id: number; title: string; createdAt: string }> } | GET /posts/:id/revisions → PostRevisionController.index |
++| posts/Show | { post: PostResourceData } | GET /posts/:id → PostController.show |
++| profile/Edit | { profile: { name: string; email: string } errors?: ValidationErrors<'name' \| 'email' \| 'password'> status?: string } | GET /profile → ProfileController.edit, PUT /profile → ProfileController.update |
+diff --git a/resources/js/pages/posts/Revisions.tsx b/resources/js/pages/posts/Revisions.tsx
+new file mode 100644
+index 0000000..01060d6
+--- /dev/null
++++ b/resources/js/pages/posts/Revisions.tsx
+@@ -0,0 +1,47 @@
++import { Head, Link } from '@inertiajs/react'
++import { route } from '@/.guren/routes.gen'
++import Layout from '../../components/Layout.js'
++
++interface Props {
++  post: { id: number; title: string }
++  revisions: Array<{ id: number; title: string; createdAt: string }>
++}
++
++export default function PostRevisions({ post, revisions }: Props) {
++  return (
++    <Layout>
++      <Head title={`History of ${post.title}`} />
++      <section className="space-y-6">
++        <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
++          <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
++          Revisions of {post.title}
++        </h1>
++
++        {revisions.length === 0 ? <p className="text-g-muted">No earlier versions yet.</p> : null}
++
++        <ul className="space-y-3">
++          {revisions.map((revision) => (
++            <li key={revision.id} className="flex items-center justify-between gap-4 border-b border-g-line pb-3">
++              <div>
++                <p className="font-bold text-g-heading">{revision.title}</p>
++                <p className="text-sm text-g-muted">{new Date(revision.createdAt).toLocaleString()}</p>
++              </div>
++              <Link
++                href={route('posts.revisions.restore', { id: post.id, revisionId: revision.id })}
++                method="post"
++                as="button"
++                className="rounded-g-ctl border border-g-line-strong px-3 py-1 text-sm text-g-accent-text transition hover:underline"
++              >
++                Restore
++              </Link>
++            </li>
++          ))}
++        </ul>
++
++        <Link href={route('posts.show', { id: post.id })} className="text-sm text-g-text-2 transition hover:text-g-heading">
++          ← Back to post
++        </Link>
++      </section>
++    </Layout>
++  )
++}
+diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
+index 537c81e..e34b09e 100644
+--- a/resources/js/pages/posts/Show.tsx
++++ b/resources/js/pages/posts/Show.tsx
+@@ -40,6 +40,9 @@ export default function PostShow({ post }: Props) {
+               <Link href={route('posts.edit', { id: post.id })} className="text-g-accent-text transition hover:underline">
+                 Edit
+               </Link>
++              <Link href={route('posts.revisions', { id: post.id })} className="text-g-accent-text transition hover:underline">
++                History
++              </Link>
+               <Link
+                 href={route('posts.destroy', { id: post.id })}
+                 method="delete"
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..ba370e0 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -1,6 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import PostRevisionController from '../app/Http/Controllers/PostRevisionController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -27,6 +28,8 @@ export function registerWebRoutes(baseRouter: Router): void {
+       authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
++      authed.get('/:id/revisions', [PostRevisionController, 'index']).name('posts.revisions')
++      authed.post('/:id/revisions/:revisionId/restore', { name: 'posts.revisions.restore' }, [PostRevisionController, 'restore'])
+     })
+ 
+     posts.get('/', [PostController, 'index']).name('posts.index')
+diff --git a/tests/PostRevisionController.test.ts b/tests/PostRevisionController.test.ts
+new file mode 100644
+index 0000000..50ea05c
+--- /dev/null
++++ b/tests/PostRevisionController.test.ts
+@@ -0,0 +1,61 @@
++import { beforeEach, describe, expect, it } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import app from '../src/app.js'
++import { resetDatabase } from '../config/database.js'
++import { Post } from '../app/Models/Post.js'
++import { PostRevision } from '../app/Models/PostRevision.js'
++import { User } from '../app/Models/User.js'
++
++describe('post revisions', () => {
++  let http: TestApp
++  let author: Awaited<ReturnType<typeof User.create>>
++  let other: Awaited<ReturnType<typeof User.create>>
++
++  beforeEach(async () => {
++    http = await TestApp.fromApp(app)
++    await resetDatabase()
++    author = await User.create({ name: 'A', email: 'a@example.com', password: 'secret-pass-1' })
++    other = await User.create({ name: 'B', email: 'b@example.com', password: 'secret-pass-1' })
++  })
++
++  const edit = async (id: number, title: string) => {
++    const csrf = await http.actingAs(author as never).withCsrf()
++    await csrf.put(`/posts/${id}`, { title, excerpt: 'x', body: 'y' }).assertRedirect(`/posts/${id}`)
++  }
++
++  it('keeps the previous version on edit and restores it', async () => {
++    const post = await Post.forceCreate({ title: 'First', excerpt: 'x', body: 'y', authorId: Number(author!.id) })
++    await edit(post!.id, 'Second')
++    await edit(post!.id, 'Third')
++
++    const rows = await PostRevision.where({ postId: post!.id }).orderBy('id', 'desc').get()
++    expect(rows.map((r) => r.title)).toEqual(['Second', 'First'])
++
++    const csrf = await http.actingAs(author as never).withCsrf()
++    await csrf.post(`/posts/${post!.id}/revisions/${rows[1]!.id}/restore`).assertRedirect(`/posts/${post!.id}`)
++
++    expect((await Post.findOrFail(post!.id)).title).toBe('First')
++    const after = await PostRevision.where({ postId: post!.id }).orderBy('id', 'desc').get()
++    expect(after.map((r) => r.title)).toEqual(['Third', 'Second', 'First'])
++  })
++
++  it('refuses other users, guests and foreign revisions', async () => {
++    const post = await Post.forceCreate({ title: 'P', excerpt: 'x', body: 'y', authorId: Number(author!.id) })
++    const twin = await Post.forceCreate({ title: 'T', excerpt: 'x', body: 'y', authorId: Number(author!.id) })
++    const rev = await PostRevision.keep(post!)
++
++    await http.actingAs(other as never).get(`/posts/${post!.id}/revisions`).assertForbidden()
++    await http.get(`/posts/${post!.id}/revisions`).assertRedirect('/login')
++
++    const csrf = await http.actingAs(author as never).withCsrf()
++    await csrf.post(`/posts/${twin!.id}/revisions/${rev!.id}/restore`).assertNotFound()
++  })
++
++  it('deletes history with the post', async () => {
++    const post = await Post.forceCreate({ title: 'P', excerpt: 'x', body: 'y', authorId: Number(author!.id) })
++    await PostRevision.keep(post!)
++    const csrf = await http.actingAs(author as never).withCsrf()
++    await csrf.delete(`/posts/${post!.id}`).assertRedirect('/posts')
++    expect((await PostRevision.where({ postId: post!.id }).get()).length).toBe(0)
++  })
++})

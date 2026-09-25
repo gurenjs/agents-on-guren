@@ -1,0 +1,197 @@
+diff --git a/.guren/agents.gen.ts b/.guren/agents.gen.ts
+new file mode 100644
+index 0000000..798af81
+--- /dev/null
++++ b/.guren/agents.gen.ts
+@@ -0,0 +1,132 @@
++// Generated — DO NOT EDIT
++// Run `guren codegen` to regenerate.
++
++import type { Data } from './data.gen'
++
++/**
++ * Agent tools derived from the routes that declare `.agent()` metadata
++ * (RFC 0016). Every field here comes from a contract the route already
++ * carries — nothing is restated by hand, so a tool cannot advertise a schema
++ * the endpoint does not validate.
++ *
++ * `inputSchema` merges the route's `params`, `query` and `body` schemas into
++ * one JSON Schema 2020-12 object, with path parameters supplemented as
++ * required strings; it describes what a caller *sends*, so a coercing schema
++ * appears as the type it accepts. `inputSources` records which of those
++ * contracts each merged property came from, and `inputBodyNested` marks a
++ * route whose non-object body was nested under a `body` key to give the tool
++ * an object root; together they are what lets a client rebuild the HTTP
++ * request from a flat tool call. `outputSchema` is present only for routes
++ * that bind an `output` schema — the one shape validated at runtime. Routes
++ * that instead declare a `resource` hint carry its payload type in the
++ * description and in {@link AgentToolOutputTypes}.
++ *
++ * `annotations` are MCP `ToolAnnotations`, resolved to explicit values. They
++ * are hints for client UX, never enforcement: authorization lives in policies
++ * and scopes, and `authorization.ability` here reports the policy ability the
++ * route's middleware chain checks, when that is statically derivable.
++ */
++export const agentTools = {
++  'posts_search': {
++    toolName: "posts_search",
++    routeName: "posts.search",
++    method: "QUERY",
++    path: "/posts/search",
++    description: "Search posts by keywords\n\nReturns: { data: Array<{\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}> }",
++    inputSchema: {
++      "type": "object",
++      "properties": {
++        "keywords": {
++          "type": "array",
++          "items": {
++            "type": "string",
++            "minLength": 1
++          },
++          "minItems": 1,
++          "maxItems": 10
++        },
++        "limit": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 50
++        }
++      },
++      "required": [
++        "keywords"
++      ]
++    },
++    inputSources: {
++      "keywords": "body",
++      "limit": "body"
++    },
++    inputBodyNested: false,
++    annotations: {
++      "readOnlyHint": true,
++      "destructiveHint": false,
++      "idempotentHint": true
++    },
++    expose: {
++      "mcp": true,
++      "webMcp": true
++    },
++  },
++  'posts_store': {
++    toolName: "posts_store",
++    routeName: "posts.store",
++    method: "POST",
++    path: "/posts",
++    description: "Create a new post\n\nReturns: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}",
++    inputSchema: {
++      "type": "object",
++      "properties": {
++        "title": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 255
++        },
++        "excerpt": {
++          "type": "string",
++          "minLength": 1,
++          "maxLength": 500
++        },
++        "body": {
++          "type": "string",
++          "minLength": 1
++        }
++      },
++      "required": [
++        "title",
++        "excerpt",
++        "body"
++      ]
++    },
++    inputSources: {
++      "title": "body",
++      "excerpt": "body",
++      "body": "body"
++    },
++    inputBodyNested: false,
++    annotations: {
++      "readOnlyHint": false,
++      "destructiveHint": true,
++      "idempotentHint": false
++    },
++    expose: {
++      "mcp": true,
++      "webMcp": true
++    },
++  },
++} as const
++
++export type AgentToolName = keyof typeof agentTools
++
++/**
++ * The payload shape each tool's route declares through a `resource` response
++ * hint — declared, not validated: the server never checks its response
++ * against this. Tools that bind an `output` schema are absent; their
++ * `outputSchema` is the enforced contract and needs no type-level twin.
++ */
++export interface AgentToolOutputTypes {
++  'posts_search': { data: Array<Data.Post> }
++  'posts_store': Data.Post
++}
+diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
+index 61e4c73..1034c76 100644
+--- a/.guren/api-client.gen.ts
++++ b/.guren/api-client.gen.ts
+@@ -64,6 +64,7 @@ export interface ApiRoutes {
+     method: 'POST'
+     path: '/posts'
+     body: { title: string; excerpt: string; body: string }
++    response: Data.Post
+   }
+   'posts.update': {
+     method: 'PUT'
+diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
+index 8f702c5..c716da1 100644
+--- a/app/Http/Controllers/PostController.ts
++++ b/app/Http/Controllers/PostController.ts
+@@ -71,8 +71,9 @@ export default class PostController extends Controller {
+     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+     // it comes from the session, and a request must never be able to set it.
+     const post = await Post.forceCreate({ ...data, authorId: author.id })
++    const postWithAuthor = await Post.findWithOrFail(post!.id, 'author')
+ 
+-    return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
++    return this.json(new PostResource(postWithAuthor).toJSON(), { status: 201 })
+   }
+ 
+   async edit(): Promise<Response> {
+diff --git a/routes/web.ts b/routes/web.ts
+index 4c174ac..8034dac 100644
+--- a/routes/web.ts
++++ b/routes/web.ts
+@@ -24,7 +24,15 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.middleware('auth').group((authed) => {
+       authed.get('/create', [PostController, 'create']).name('posts.create')
+       authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
+-      authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
++      authed.post('/', {
++        name: 'posts.store',
++        body: PostPayloadSchema,
++        resource: PostResource,
++        agent: {
++          toolName: 'posts_store',
++          description: 'Create a new post',
++        },
++      }, [PostController, 'store'])
+       authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
+       authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
+     })
+@@ -42,6 +50,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+       // the client's json() comes back typed — no runtime validation, just the
+       // type codegen already extracts from the Resource.
+       resource: { data: [PostResource] },
++      agent: {
++        toolName: 'posts_search',
++        description: 'Search posts by keywords',
++      },
+     }, [PostController, 'search'])
+   })
+ }
