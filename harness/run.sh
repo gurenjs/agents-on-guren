@@ -31,7 +31,7 @@ ALLOWED_TOOLS=(
   "Bash(grep:*)" "Bash(rg:*)" "Bash(find:*)" "Bash(sed:*)" "Bash(awk:*)"
   "Bash(mkdir:*)" "Bash(cp:*)" "Bash(mv:*)" "Bash(touch:*)"
   "Bash(sqlite3:*)" "Bash(openssl:*)" "Bash(sleep:*)" "Bash(kill:*)"
-  "Bash(git:*)"
+  "Bash(git:*)" "Bash(env:*)" "Bash(python3:*)"
 )
 # No network documentation access in either condition: the shipped condition's
 # context is exactly what `agent:init` installs plus node_modules. WebFetch /
