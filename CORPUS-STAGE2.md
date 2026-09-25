@@ -316,7 +316,7 @@ The Part A task ported onto the blog baseline, so A and B share one ticket.
 - All nine tasks were authored by Opus 5.5 subagents from the briefs above,
   each admitted only after `harness/validate-task.sh` passed and after the
   author broke its own reference at least three ways to show the hidden tests
-  can fail. 85 hidden tests in total; plans on S1, S2 and S4 (authoring cost
+  can fail. 84 hidden tests in total; plans on S1, S2 and S4 (authoring cost
   recorded in each `task.json` `plan_authoring`).
 - **Calibration** (Sonnet 5, N=1, bare / shipped / shipped+plan, 21 cells,
   $16 API-equivalent): 20 pass, 1 fail. The fail (newsletter-module, bare)
