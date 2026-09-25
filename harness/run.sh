@@ -31,6 +31,7 @@ ALLOWED_TOOLS=(
   "Bash(grep:*)" "Bash(rg:*)" "Bash(find:*)" "Bash(sed:*)" "Bash(awk:*)"
   "Bash(mkdir:*)" "Bash(cp:*)" "Bash(mv:*)" "Bash(touch:*)"
   "Bash(sqlite3:*)" "Bash(openssl:*)" "Bash(sleep:*)" "Bash(kill:*)"
+  "Bash(git:*)"
 )
 # No network documentation access in either condition: the shipped condition's
 # context is exactly what `agent:init` installs plus node_modules. WebFetch /
@@ -60,6 +61,8 @@ else
 fi
 
 PROMPT="$(build_prompt "$TASK" "$COND")"
+# The patch is taken against the start commit, not HEAD: a plan cell commits per step.
+START_COMMIT="$(git -C "$WT" rev-parse HEAD)"
 echo "== starting agent (model: $MODEL, max-turns: $MAX_TURNS)"
 START=$(date +%s)
 cd "$WT"
@@ -105,6 +108,6 @@ print()
 ' "$TASK" "$MODEL" "$COND" "$TRIAL" "$((END-START))" "$BASE" "$MAX_TURNS" "$CLAUDE_VERSION" > "$OUT.meta.json"
 
 git -C "$WT" add -A >/dev/null 2>&1 || true
-git -C "$WT" diff --cached --binary HEAD -- . ':(exclude)*.db' ':(exclude)*.db-shm' ':(exclude)*.db-wal' ':(exclude)data/' > "$OUT.patch" 2>/dev/null || true
+git -C "$WT" diff --cached --binary "$START_COMMIT" -- . ':(exclude)*.db' ':(exclude)*.db-shm' ':(exclude)*.db-wal' ':(exclude)data/' > "$OUT.patch" 2>/dev/null || true
 drop_worktree "$WT"
 echo "== saved: results/$CELL.{stream.jsonl,result.json,patch,meta.json}"
