@@ -39,7 +39,7 @@ https://github.com/gurenjs/framework-comparison
 
 今回はランナーを隔離しています。`--strict-mcp-config`、プロジェクトとローカルの設定のみ、Webツールなし、auto-memoryなしです。セルごとにCLIの版(Claude Code 2.1.281)、モデル、アプリのコミットを記録しました。
 
-Gurenのアプリは現行リリース(cli 2.27.0、core 1.21.0、server 2.26.0、orm 2.12.0)に上げ、ハーネスも作り直しています。対照として、同じランナーでHonoと、夏の計測を終えた時点のGurenアプリも流しました。後者はコミット716117a(cli 2.0とその時点のハーネス)で、データ上のラベルは`guren-july`です。21セルすべてが合格しました。
+Gurenのアプリは計測時点の最新リリース(cli 2.27.0、core 1.21.0、server 2.26.0、orm 2.12.0)に上げ、ハーネスも作り直しています。対照として、同じランナーでHonoと、夏の計測を終えた時点のGurenアプリも流しました。後者はコミット716117a(cli 2.0とその時点のハーネス)で、データ上のラベルは`guren-july`です。21セルすべてが合格しました。
 
 ### 結果
 
@@ -53,7 +53,7 @@ Gurenのアプリは現行リリース(cli 2.27.0、core 1.21.0、server 2.26.0�
 | Hono | Opus 5.5 | 40(38〜41) | $0.88($0.83〜0.91) | 1.00倍 |
 | Guren、shippedハーネス(cli 2.27) | Opus 5.5 | 40(38〜45) | $1.32($1.31〜1.55) | 1.49倍 |
 
-いずれもarmごとに3回流した中央値です。括弧内の範囲は3回の最小と最大で、中央値の信頼区間ではありません。コストはCLIが報告するAPI換算値です。「rulesのfrontmatterを修正」の行は、shippedハーネスの誤りを1つ直したものです。rulesのファイルがClaude Codeの読まない`globs:`を使っていたので、`paths:`に直しました(#1056で修正済み、リリース待ち)。
+いずれもarmごとに3回流した中央値です。括弧内の範囲は3回の最小と最大で、中央値の信頼区間ではありません。コストはCLIが報告するAPI換算値です。「rulesのfrontmatterを修正」の行は、shippedハーネスの誤りを1つ直したものです。rulesのファイルがClaude Codeの読まない`globs:`を使っていたので、`paths:`に直しました(#1056で修正し、cli 2.28.0でリリース済み)。
 
 このタスクでは、Gurenは素のHonoより高くつきます。Sonnetで1.44倍、Opus 5.5で1.5倍です。ターン数は近く、Sonnetで41対38、Opusで40対40です。Sonnetについては、後述するトークンコストの内訳から、差は1ターンあたりに載る文脈の量から来ていると見ています。Opusのセルは内訳を集計していないので、差の出どころは測っていません。
 
@@ -194,12 +194,12 @@ RFC 0024(server/coreの統合)は据え置きます。0024の根拠は名前の�
 
 今回の計測では、Guren自身について22件の発見がありました。大半はチケットを書く途中で見つかったものです。主なものを分類して挙げます。
 
-- ハーネス: rulesのファイルがClaude Codeの読む`paths:`でなく`globs:`を使っていたため、6本すべてが毎セッションの開始時に読み込まれていた(#1056)。ダイジェストにAPIトークン・bearer認証・レート制限の関数がない。`guren context`がモジュールと`guren.arch.ts`に触れない。スキャフォールドされた`settings.json`のフックが相対パスなので、エージェントが`cd`したあとの編集後フックが「Module not found」で失敗する(今回12回、すべて`cd`の直後)
-- CLIの検査: `guren audit`に、Policyのあるモデルの変更系アクションで認可が抜けていることを見る規則がなかった(#1054で警告するようになりました。マージ済み、リリース待ち)。`check --arch`がディレクトリimport(`make:module`自身が書く`'../modules/newsletter'`の形)を素通りさせる。`introspect`の子プロセスが、親が落ちても残り続ける
-- ORMとAPIの罠: `where('publishedAt', 'is null')`が文字列`'is null'`との比較になる(エージェント自身のテストとgateは通り、隠しテストが捕まえた)。`DatabaseApiTokenStore`がSQLiteのtext型タイムスタンプ列に`Date`を書いて500になる。`data.gen.ts`が同じ識別子を二重に宣言することがある。`belongsToMany`に`attach`/`sync`がない。未認証のエージェントツール呼び出しが302になり、ツールのdispatchがそれを成功として扱う。`@guren/plugin-mcp`はトークンのテーブルがないと全リクエストが500になるのに、それを生成するものがない。attachmentsにMIMEの許可リストとコレクション単位のサイズ上限がない。codegenが`z.file()`を`unknown`と型付けする。テストクライアントにcookie jarと`arrayBuffer()`がない
+- ハーネス: rulesのファイルがClaude Codeの読む`paths:`でなく`globs:`を使っていたため、6本すべてが毎セッションの開始時に読み込まれていた(#1056)。ダイジェストにAPIトークン・bearer認証・レート制限の関数がなかった(#1074)。`guren context`がモジュールと`guren.arch.ts`に触れない。スキャフォールドされた`settings.json`のフックが相対パスだったので、エージェントが`cd`したあとの編集後フックが「Module not found」で失敗していた(今回12回、すべて`cd`の直後。#1085)
+- CLIの検査: `guren audit`に、Policyのあるモデルの変更系アクションで認可が抜けていることを見る規則がなかった(#1054で警告するようになりました)。`check --arch`がディレクトリimport(`make:module`自身が書く`'../modules/newsletter'`の形)を素通りさせていた(#1071)。`introspect`の子プロセスが、親が落ちても残り続けていた(#1084)
+- ORMとAPIの罠: `where('publishedAt', 'is null')`が文字列`'is null'`との比較になっていた(エージェント自身のテストとgateは通り、隠しテストが捕まえた。#1080で拒否するようにしました)。`DatabaseApiTokenStore`がSQLiteのtext型タイムスタンプ列に`Date`を書いて500になっていた(#1065)。`data.gen.ts`が同じ識別子を二重に宣言することがあった(#1064)。`belongsToMany`に`attach`/`sync`がない。未認証のエージェントツール呼び出しが302になり、ツールのdispatchがそれを成功として扱っていた(#1073)。`@guren/plugin-mcp`はトークンのテーブルがないと全リクエストが500になるのに、それを生成するものがない。attachmentsにMIMEの許可リストとコレクション単位のサイズ上限がない。codegenが`z.file()`を`unknown`と型付けする。テストクライアントにcookie jarと`arrayBuffer()`がない
 - 計画: 計画のスキーマにconsoleコマンドとquery scopeの要素がない。前述のStopフックの穴
 
-このうち10件はチケットにしました。`guren audit`の規則(#1054)とrulesの`paths:`への修正(#1056)はマージ済みでリリース待ち、ほかの8件はオープンのチケットです。残りはまだチケットにしていません。
+番号を付けた10件は修正済みで、v2.27.0のリリース(cli 2.28.0、server 2.27.0、core 1.22.0、orm 2.13.0)に入っています。残りはまだチケットにしていません。
 
 ## 5. 注意点
 

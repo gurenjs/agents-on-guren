@@ -29,7 +29,7 @@ The July runner loaded the operator's own MCP servers, plugins and skills. This 
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
 
-Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it. The "rule frontmatter fixed" row is the shipped harness with one mistake corrected: its rule files used `globs:`, a key Claude Code does not read, instead of `paths:` (fixed in [#1056](https://github.com/gurenjs/guren/pull/1056), not yet released).
+Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it. The "rule frontmatter fixed" row is the shipped harness with one mistake corrected: its rule files used `globs:`, a key Claude Code does not read, instead of `paths:` (fixed in [#1056](https://github.com/gurenjs/guren/pull/1056), released in cli 2.28.0).
 
 On this task Guren costs more than plain Hono: 1.44 times on Sonnet and 1.5 times on Opus 5.5. The turn counts are close (41 against 38 on Sonnet, 40 each on Opus). For Sonnet, the token accounting below puts the difference in context carried per turn; the Opus cells were not accounted, so their mechanism is unmeasured. Against the bare app the harness saves 23% of turns and 15% of cost at the median, but only 3% of cost at the mean (the same direction as in the summer rounds, with overlapping ranges).
 
@@ -142,12 +142,12 @@ RFC 0024 stays where it is. Its case rested on name confusion between `@guren/co
 
 The round turned up 22 findings about Guren itself, most of them while the tickets were being written. The main ones:
 
-- Harness: the rule files used `globs:` where Claude Code reads `paths:`, so all six loaded at every session start (#1056); the digest had nothing on API tokens, bearer auth or rate limits; `guren context` never mentions modules or `guren.arch.ts`; the hook commands in the scaffolded `settings.json` are relative paths, so after an agent runs `cd` the after-edit hook fails with "Module not found" (12 times in this run, every one right after a `cd`).
-- CLI checks: `guren audit` had no rule for a mutating action that skips a model's policy (it now warns, #1054, merged and not yet released); `check --arch` let a directory import (`'../modules/newsletter'`, the form `make:module` writes) through; `introspect` child processes outlive a crashed parent.
-- ORM and API traps: `where('publishedAt', 'is null')` compares against the string `'is null'` (the agent's tests and the gate passed it, a hidden test did not); `DatabaseApiTokenStore` writes a `Date` into SQLite text timestamps and answers 500; `data.gen.ts` can declare an identifier twice; `belongsToMany` has no `attach`/`sync`; an unauthenticated agent-tool call gets a 302 that tool dispatch maps to success; `@guren/plugin-mcp` answers 500 until a token table exists, and nothing scaffolds one; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
+- Harness: the rule files used `globs:` where Claude Code reads `paths:`, so all six loaded at every session start (#1056); the digest had nothing on API tokens, bearer auth or rate limits (#1074); `guren context` never mentions modules or `guren.arch.ts`; the hook commands in the scaffolded `settings.json` were relative paths, so after an agent ran `cd` the after-edit hook failed with "Module not found" (12 times in this run, every one right after a `cd`; #1085).
+- CLI checks: `guren audit` had no rule for a mutating action that skips a model's policy (it now warns, #1054); `check --arch` let a directory import (`'../modules/newsletter'`, the form `make:module` writes) through (#1071); `introspect` child processes outlived a crashed parent (#1084).
+- ORM and API traps: `where('publishedAt', 'is null')` compared against the string `'is null'` (the agent's tests and the gate passed it, a hidden test did not; it is now refused, #1080); `DatabaseApiTokenStore` wrote a `Date` into SQLite text timestamps and answered 500 (#1065); `data.gen.ts` could declare an identifier twice (#1064); `belongsToMany` has no `attach`/`sync`; an unauthenticated agent-tool call got a 302 that tool dispatch mapped to success (#1073); `@guren/plugin-mcp` answers 500 until a token table exists, and nothing scaffolds one; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
 - Plans: no plan element for a console command or a query scope, and the Stop hook gap above.
 
-Ten are filed. The audit rule (#1054) and the rules `paths:` fix (#1056) are merged and not yet released; the other eight are open tickets. The rest are not yet ticketed.
+The ten with a number are fixed and shipped in the v2.27.0 release (cli 2.28.0, server 2.27.0, core 1.22.0, orm 2.13.0). The rest are not yet ticketed.
 
 ## Caveats
 
