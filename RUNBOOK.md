@@ -97,6 +97,10 @@ bash harness/loop.sh --tasks "$T" --models claude-haiku-4-5-20251001 --condition
 # fourth model once a loop ends; a slow model can be split by task set into two loops (disjoint --tasks only)
 ```
 
+Before the matrix: `ls ~/.claude/projects/-Users-*-agents-on-guren-app/memory/`
+must be empty or absent, and after the first cell its `meta.json` must show
+`"memory_paths": null`.
+
 `loop.sh` runs under caffeinate and resumes after API errors. Watch with
 `grep -c '→' logs/*.log` and `grep FAIL`. Cell times in round 2: Sonnet and
 Opus 2–4 min, Haiku 5–7, Fable 6–7.
@@ -115,8 +119,13 @@ git add results results-calibration-* && git commit        # streams are gitigno
 ## 3. Harness rules learned in round 2 (already in the scripts; do not undo)
 
 - Every condition runs with the same allowlist, `--strict-mcp-config`,
-  `--setting-sources project,local`, no web tools, auto memory off, and
-  `--include-hook-events` (the stop-hook and plan-loop columns need it).
+  `--setting-sources project,local`, no web tools,
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, and `--include-hook-events` (the
+  stop-hook and plan-loop columns need it).
+- Auto memory must be off. It is keyed on the main repository, so every
+  worktree shares one directory: round 2's first production run left it on,
+  Fable started writing notes at 13:21, and every later cell loaded them at
+  session start. `meta.json` records `memory_paths`; it must be `null`.
 - `Bash(git:*)` is allowed and the patch is diffed against the recorded start
   commit: the plan loop commits per step.
 - The `shipped+plan` prompt line ends with "Implement the plan." (the skill's

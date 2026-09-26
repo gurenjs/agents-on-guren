@@ -72,7 +72,9 @@ cd "$WT"
 # cell sees only the worktree (+ agent:init's .claude/ in the shipped condition).
 # --include-hook-events only adds the Stop/PostToolUse hook events to the stream
 # (SessionStart is there regardless), which summarize.ts counts gate blocks from.
-claude -p "$PROMPT" \
+# Auto memory is keyed on the main repo, not the worktree, so every cell would
+# share one memory directory and later cells would load what earlier ones wrote.
+env CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude -p "$PROMPT" \
   --model "$MODEL" \
   --max-turns "$MAX_TURNS" \
   --output-format stream-json --verbose --include-hook-events \
@@ -103,9 +105,11 @@ import json, sys
 t, m, c, tr, w, b, mt, cv = sys.argv[1:9]
 json.dump({"task": t, "model": m, "condition": c, "trial": int(tr), "wall_seconds": int(w),
            "baseline": b, "max_turns": int(mt), "include_hook_events": True,
-           "plan": c == "shipped+plan", "claude_version": cv}, sys.stdout)
+           "plan": c == "shipped+plan", "claude_version": cv,
+           "memory_paths": next((e.get("memory_paths") for e in map(json.loads, filter(str.strip, open(sys.argv[9])))
+                                 if e.get("subtype") == "init"), None)}, sys.stdout)
 print()
-' "$TASK" "$MODEL" "$COND" "$TRIAL" "$((END-START))" "$BASE" "$MAX_TURNS" "$CLAUDE_VERSION" > "$OUT.meta.json"
+' "$TASK" "$MODEL" "$COND" "$TRIAL" "$((END-START))" "$BASE" "$MAX_TURNS" "$CLAUDE_VERSION" "$OUT.stream.jsonl" > "$OUT.meta.json"
 
 git -C "$WT" add -A >/dev/null 2>&1 || true
 git -C "$WT" diff --cached --binary "$START_COMMIT" -- . ':(exclude)*.db' ':(exclude)*.db-shm' ':(exclude)*.db-wal' ':(exclude)data/' > "$OUT.patch" 2>/dev/null || true
