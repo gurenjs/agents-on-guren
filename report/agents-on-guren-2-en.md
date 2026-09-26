@@ -1,4 +1,4 @@
-# Agents on Guren, round 2: what 246 runs say about "convention as token efficiency"
+# Agents on Guren, round 2: what 249 runs say about "convention as token efficiency"
 
 *guren.dev, 2026-09-25.*
 
@@ -8,7 +8,7 @@ On 23 September, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 
 Guren borrows Rails' conventions and is under a year old, absent from the training corpora as far as we can tell, so both the token claim and a Stage 2 style corpus can be measured on it. This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
 
-- Part A: one feature, one spec, one model, built on Guren and on plain Hono. 21 cells.
+- Part A: one feature, one spec, one model, built on Guren and on plain Hono. 24 cells.
 - Part B: nine product tickets on a Guren blog, four models, with and without the agent harness `guren agent:init` installs, plus a small experiment with approved implementation plans. 225 cells.
 
 Rails ran its benchmark on its own runners (lemans and miniswen); ours is headless Claude Code, so the two sets of numbers are not on one scale.
@@ -17,7 +17,7 @@ Rails ran its benchmark on its own runners (lemans and miniswen); ours is headle
 
 The task comes from [framework-comparison](https://github.com/gurenjs/framework-comparison): add tags to a small blog (schema, forms, display, a `?tag=` filter, validation, tests). Scoring is blind: typecheck, the app's tests, and a hidden HTTP smoke that checks the filter. In July, with Sonnet 5 on that runner, Guren cost 1.65 times the cheapest stack (Hono).
 
-The July runner loaded the operator's own MCP servers, plugins and skills. This round's runner is isolated (`--strict-mcp-config`, project and local settings only, no web tools, auto-memory off) and records the CLI version (Claude Code 2.1.281), model and app commit per cell. The Guren app is on the current releases (cli 2.27.0, core 1.21.0, server 2.26.0, orm 2.12.0) with a regenerated harness. Two controls ran beside it under the same runner: Hono, and the Guren app as the summer rounds left it (commit 716117a, cli 2.0, labelled `guren-july` in the data). All 21 cells passed.
+The July runner loaded the operator's own MCP servers, plugins and skills. This round's runner is isolated (`--strict-mcp-config`, project and local settings only, no web tools, auto-memory off) and records the CLI version (Claude Code 2.1.281), model and app commit per cell. The Guren app is on the releases current when the round ran (cli 2.27.0, core 1.21.0, server 2.26.0, orm 2.12.0) with a regenerated harness. Two controls ran beside it under the same runner: Hono, and the Guren app as the summer rounds left it (commit 716117a, cli 2.0, labelled `guren-july` in the data). All 24 cells passed.
 
 | arm | model | turns (range) | cost (range) | cost vs Hono |
 |---|---|---|---|---|
@@ -26,10 +26,11 @@ The July runner loaded the operator's own MCP servers, plugins and skills. This 
 | Guren, no harness | Sonnet 5 | 53 (47–59) | $0.71 ($0.59–0.79) | 1.68× |
 | Guren, summer app (716117a) | Sonnet 5 | 37 (35–46) | $0.56 ($0.50–0.62) | 1.33× |
 | Guren, shipped, rule frontmatter fixed | Sonnet 5 | 31 (30–50) | $0.53 ($0.53–0.68) | 1.27× |
+| Guren, shipped harness (cli 2.28) | Sonnet 5 | 36 (30–39) | $0.54 ($0.53–0.59) | 1.28× |
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
 
-Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it. The "rule frontmatter fixed" row is the shipped harness with one mistake corrected: its rule files used `globs:`, a key Claude Code does not read, instead of `paths:` (fixed in [#1056](https://github.com/gurenjs/guren/pull/1056), released in cli 2.28.0).
+Medians of three runs per arm. A range is the lowest and highest of those runs, not an interval around the median. Cost is API-equivalent, as the CLI reports it. The "rule frontmatter fixed" row is the shipped harness with one mistake corrected: its rule files used `globs:`, a key Claude Code does not read, instead of `paths:` (fixed in [#1056](https://github.com/gurenjs/guren/pull/1056)). The "cli 2.28" row reran the shipped arm after that fix was released (cli 2.28.0, core 1.22.0, orm 2.13.0). The release changed more than the frontmatter (the digest gained API token and rate limit sections, and the harness a plan-writing skill), so the row measures the released harness as a whole. It lands at 1.28×, with the median and the mean in agreement: the estimate from the unreleased fix holds for what users install.
 
 On this task Guren costs more than plain Hono: 1.44 times on Sonnet and 1.5 times on Opus 5.5. The turn counts are close (41 against 38 on Sonnet, 40 each on Opus). For Sonnet, the token accounting below puts the difference in context carried per turn; the Opus cells were not accounted, so their mechanism is unmeasured. Against the bare app the harness saves 23% of turns and 15% of cost at the median, but only 3% of cost at the mean (the same direction as in the summer rounds, with overlapping ranges).
 
