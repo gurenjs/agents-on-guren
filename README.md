@@ -28,20 +28,24 @@ Runner: headless Claude Code, `--max-turns 120`, isolated (no MCP, no user
 settings/plugins, no web tools). 20 tasks × 3 models × 2 conditions × 3 trials.
 Cash cost $0 (Claude Max); API-equivalent $600.
 
-## Round 2 (Stage 2, 2026-09-25)
+## Round 2 (Stage 2, 2026-09-29/30)
 
 Nine product tickets that each span three or more subsystems, graded by 84
 hidden behaviour tests (pass = hidden tests + typecheck) with a separate
 idiom column, run on four models with and without the harness, plus approved
-implementation plans on three tickets. 225 cells, Claude Code 2.1.281, an
+implementation plans on three tickets. 225 cells, Claude Code 2.1.284, an
 isolated runner.
 
 | model | pass bare → shipped | turns (median) | cost USD (median) |
 |---|---|---|---|
-| Sonnet 5 | 93% → 96% | 37 → 29 | 0.57 → 0.63 |
-| Opus 5.5 | 100% → 100% | 65 → 43 | 1.58 → 1.31 |
-| Haiku 4.5 | 41% → 56% | 96 → 81 | 1.00 → 0.90 |
-| Fable 5.1 | 100% → 100% | 77 → 59 | 4.01 → 3.51 |
+| Sonnet 5.5 | 96% → 100% | 37 → 29 | 0.57 → 0.61 |
+| Opus 5.5 | 100% → 100% | 59 → 43 | 1.51 → 1.29 |
+| Haiku 4.5 | 30% → 44% | 90 → 80 | 0.79 → 0.89 |
+| Fable 5.1 | 100% → 100% | 99 → 78 | 6.27 → 5.42 |
+
+The first production run (2026-09-25, 0cb2d52) had auto memory on, and its
+Opus, Haiku and Fable cells were run again with it off; its Sonnet 5 cells are
+kept in `results-sonnet5-stage2/`, since Sonnet 5.5 replaced Sonnet 5.
 
 - Corpus and its rules: [CORPUS-STAGE2.md](CORPUS-STAGE2.md); tasks under
   `tasks/<id>/` with `"baseline"` set to the app's `stage2` branch (0fd1654).
