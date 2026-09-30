@@ -10,19 +10,19 @@ index 2d1dea4..2763b2d 100644
 +# Which disk the app stores to. Declare it in the storage config before naming it here.
 +STORAGE_DISK=local
 diff --git a/.gitignore b/.gitignore
-index ac50137..39169e6 100644
+index ac50137..88edc39 100644
 --- a/.gitignore
 +++ b/.gitignore
 @@ -2,6 +2,7 @@ node_modules
  dist
  .env
  data/
-+storage/
++storage/app/
  public/assets/
  .guren/ssr/
  .DS_Store
 diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
-index 61e4c73..8860c18 100644
+index 61e4c73..0cee02e 100644
 --- a/.guren/api-client.gen.ts
 +++ b/.guren/api-client.gen.ts
 @@ -14,6 +14,10 @@ import type { Data } from './data.gen'
@@ -47,7 +47,7 @@ index 61e4c73..8860c18 100644
      method: 'PUT'
      path: '/posts/:id'
 -    body: { title: string; excerpt: string; body: string }
-+    body: { title: string; excerpt: string; body: string; cover: unknown; removeCover: unknown }
++    body: { title: string; excerpt: string; body: string; cover: unknown; removeCover?: unknown }
    }
    'profile.edit': {
      method: 'GET'
@@ -88,7 +88,7 @@ index 0000000..dd957bd
 +export type AttachableModelName = keyof AttachmentsMap
 +export type AttachmentName<M extends keyof AttachmentsMap> = keyof AttachmentsMap[M]
 diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
-index 392ad58..68997e7 100644
+index 392ad58..14587f5 100644
 --- a/.guren/data.gen.ts
 +++ b/.guren/data.gen.ts
 @@ -1,8 +1,8 @@
@@ -101,12 +101,11 @@ index 392ad58..68997e7 100644
  
  /**
   * Auto-extracted data types from Resource classes.
-@@ -18,6 +18,9 @@ export namespace Data {
+@@ -18,6 +18,8 @@ export namespace Data {
    // Serialized here because `created_at` is a string on SQLite and a Date on
    // PostgreSQL and MySQL — pages should not have to know which.
    createdAt: string
-+  // Signed delivery-route URL of the cover, or null when the post has none (or
-+  // its covers were not loaded with Post.withAttachments).
++  // A signed delivery-route URL: covers live on the private disk, not public/.
 +  coverUrl: string | null
    author?: PostAuthorSummary
  }
@@ -133,7 +132,7 @@ index 8db6dc3..5e1cf41 100644
    'posts/Index': PaginatedPageProps<PostResourceData> & {}
    'posts/Show': {
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..e1a0cf8 100644
+index 846382c..75fc746 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -2,6 +2,7 @@
@@ -161,39 +160,33 @@ index 846382c..e1a0cf8 100644
 -      'posts.store': { body: { title: string; excerpt: string; body: string } }
 -      'posts.update': { body: { title: string; excerpt: string; body: string } }
 +      'posts.store': { body: { title: string; excerpt: string; body: string; cover?: unknown } }
-+      'posts.update': { body: { title: string; excerpt: string; body: string; cover?: unknown; removeCover: boolean } }
++      'posts.update': { body: { title: string; excerpt: string; body: string; cover?: unknown; removeCover?: boolean } }
      }
    }
  }
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..df683a3 100644
+index 8f702c5..030db89 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -1,9 +1,9 @@
--import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
-+import { Controller, ValidationException, paginate, type PaginatedPageProps } from '@guren/core'
- import { pages } from '@/.guren/pages.gen'
+@@ -3,7 +3,7 @@ import { pages } from '@/.guren/pages.gen'
  import { Post } from '../../Models/Post.js'
  import type { UserRecord } from '../../Models/User.js'
  import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
 -import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
-+import { PostIdParamSchema, ListPostsQuerySchema, COVER_TYPE_MESSAGE } from '../Validators/PostValidator.js'
++import { PostIdParamSchema, ListPostsQuerySchema, readCoverImage } from '../Validators/PostValidator.js'
  
  type PostsIndexProps = PaginatedPageProps<PostResourceData>
  
-@@ -15,9 +15,10 @@ export default class PostController extends Controller {
-       .orderBy('id', 'desc')
-       .paginate({ page, perPage: 10 })
+@@ -17,7 +17,7 @@ export default class PostController extends Controller {
      const paginator = paginate(result, { path: this.request.path ?? '/posts' })
-+    const posts = await Post.withAttachments(result.data, ['cover'])
  
      return this.inertia(pages.posts.Index, {
 -      data: result.data.map((post) => new PostResource(post).toJSON()),
-+      data: posts.map((post) => new PostResource(post).toJSON()),
++      data: (await Post.withAttachments(result.data, ['cover'])).map((post) => new PostResource(post).toJSON()),
        pagination: {
          meta: paginator.meta(),
          links: paginator.links(),
-@@ -47,15 +48,18 @@ export default class PostController extends Controller {
+@@ -47,15 +47,18 @@ export default class PostController extends Controller {
        .limit(limit)
        .get()
  
@@ -210,25 +203,26 @@ index 8f702c5..df683a3 100644
  
      return this.inertia(pages.posts.Show, {
 -      post: new PostResource(post).toJSON(),
-+      post: new PostResource(withCover ?? post).toJSON(),
++      post: new PostResource(withCover).toJSON(),
      })
    }
  
-@@ -67,11 +71,22 @@ export default class PostController extends Controller {
+@@ -67,11 +70,23 @@ export default class PostController extends Controller {
    async store(): Promise<Response> {
      await this.authorize('create', Post)
      const author = await this.auth.userOrFail<UserRecord>()
 -    const { body: data } = this.validated('posts.store')
 +    const { body: { cover, ...data } } = this.validated('posts.store')
-+    // Checked before anything is written, so a refused cover saves nothing.
-+    const coverFile = await verifiedCover(cover)
++    // Checked before anything is written, so a rejected cover saves no post.
++    // Codegen types the schema's file field as `unknown`; it is a File or absent.
++    const coverImage = cover instanceof File ? await readCoverImage(cover) : null
      // forceCreate, because `authorId` is deliberately absent from Post.fillable:
      // it comes from the session, and a request must never be able to set it.
      const post = await Post.forceCreate({ ...data, authorId: author.id })
  
-+    if (coverFile && post?.id) {
++    if (post?.id && coverImage) {
 +      try {
-+        await Post.attach(post.id, 'cover', coverFile)
++        await Post.attach(post.id, 'cover', coverImage)
 +      } catch (error) {
 +        await Post.delete({ id: post.id })
 +        throw error
@@ -246,7 +240,7 @@ index 8f702c5..df683a3 100644
  
      return this.inertia(pages.posts.Edit, {
 -      post: new PostResource(post).toJSON(),
-+      post: new PostResource(withCover ?? post).toJSON(),
++      post: new PostResource(withCover).toJSON(),
      })
    }
  
@@ -256,13 +250,13 @@ index 8f702c5..df683a3 100644
  
 -    const { body: data } = this.validated('posts.update')
 +    const { body: { cover, removeCover, ...data } } = this.validated('posts.update')
-+    const coverFile = await verifiedCover(cover)
++    // Checked before the update, so a rejected cover leaves the post untouched.
++    const coverImage = cover instanceof File ? await readCoverImage(cover) : null
      await Post.update({ id: post.id }, data)
  
-+    // `cover` is a single attachment, so attaching replaces the previous one
-+    // and deletes its row and stored file.
-+    if (coverFile) {
-+      await Post.attach(post.id, 'cover', coverFile)
++    // attach() on a hasOne collection replaces the old cover, row and file.
++    if (coverImage) {
++      await Post.attach(post.id, 'cover', coverImage)
 +    } else if (removeCover) {
 +      await Post.detach(post.id, 'cover')
 +    }
@@ -270,69 +264,45 @@ index 8f702c5..df683a3 100644
      return this.redirect(`/posts/${post.id}`)
    }
  
-@@ -101,8 +126,34 @@ export default class PostController extends Controller {
+@@ -101,6 +126,9 @@ export default class PostController extends Controller {
      const post = await Post.findOrFail(id)
      await this.authorize('delete', [Post, post])
  
-+    // Explicitly, before the row goes: there is no database cascade for
-+    // attachments, and model delete hooks are not a reliable purge trigger.
++    // No foreign key reaches the polymorphic attachments table, so the cover
++    // row and its file go explicitly, before the post they belong to.
 +    await Post.purgeAttachments(post.id)
      await Post.delete({ id: post.id })
  
      return this.redirect('/posts')
-   }
- }
-+
-+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
-+const JPEG_SIGNATURE = [0xff, 0xd8, 0xff]
-+
-+function startsWith(bytes: Uint8Array, signature: number[]): boolean {
-+  return signature.every((byte, index) => bytes[index] === byte)
-+}
-+
-+/**
-+ * The cover's type is decided by its bytes, not the client-reported type or
-+ * filename, and refused the same way the route schema refuses a field. The
-+ * returned file carries the detected type and a fixed name, which is what the
-+ * attachment row records and the delivery route serves it under.
-+ */
-+async function verifiedCover(cover: unknown): Promise<File | null> {
-+  if (!(cover instanceof File)) return null
-+
-+  const bytes = new Uint8Array(await cover.arrayBuffer())
-+  if (startsWith(bytes, PNG_SIGNATURE)) return new File([bytes], 'cover.png', { type: 'image/png' })
-+  if (startsWith(bytes, JPEG_SIGNATURE)) return new File([bytes], 'cover.jpg', { type: 'image/jpeg' })
-+
-+  throw ValidationException.withMessages({ cover: [COVER_TYPE_MESSAGE] })
-+}
 diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
-index 679024d..088cace 100644
+index 679024d..c546d66 100644
 --- a/app/Http/Resources/PostResource.ts
 +++ b/app/Http/Resources/PostResource.ts
-@@ -1,8 +1,10 @@
+@@ -1,9 +1,12 @@
 -import { Resource, type WithRelations } from '@guren/core'
 +import { Resource, type AttachmentData, type WithRelations } from '@guren/core'
  import { Post } from '../../Models/Post.js'
  import type { PostRecord, PostAuthorSummary } from '../../Models/Post.js'
  
  type PostWithAuthor = WithRelations<typeof Post, 'author'>
-+// What `Post.withAttachments(records, ['cover'])` adds to a record.
-+type WithCover = { cover?: AttachmentData | null }
  
++// `cover` is present once the controller ran `Post.withAttachments(..., ['cover'])`.
++type PostWithCover = (PostRecord | PostWithAuthor) & { cover?: AttachmentData | null | undefined }
++
  export interface PostResourceData extends Record<string, unknown> {
    id: number
-@@ -13,10 +15,13 @@ export interface PostResourceData extends Record<string, unknown> {
+   title: string
+@@ -13,10 +16,12 @@ export interface PostResourceData extends Record<string, unknown> {
    // Serialized here because `created_at` is a string on SQLite and a Date on
    // PostgreSQL and MySQL — pages should not have to know which.
    createdAt: string
-+  // Signed delivery-route URL of the cover, or null when the post has none (or
-+  // its covers were not loaded with Post.withAttachments).
++  // A signed delivery-route URL: covers live on the private disk, not public/.
 +  coverUrl: string | null
    author?: PostAuthorSummary
  }
  
 -export class PostResource extends Resource<PostRecord | PostWithAuthor, PostResourceData> {
-+export class PostResource extends Resource<(PostRecord | PostWithAuthor) & WithCover, PostResourceData> {
++export class PostResource extends Resource<PostWithCover, PostResourceData> {
    toArray(): PostResourceData {
      const post = this.resource
  
@@ -345,59 +315,81 @@ index 679024d..088cace 100644
          id: (post as PostWithAuthor).author?.id,
          name: (post as PostWithAuthor).author?.name,
 diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
-index 804642a..29f8558 100644
+index 804642a..26ae5ce 100644
 --- a/app/Http/Validators/PostValidator.ts
 +++ b/app/Http/Validators/PostValidator.ts
-@@ -16,10 +16,38 @@ export const PostSearchSchema = z.object({
-   limit: z.number().int().min(1).max(50).default(10),
- })
+@@ -1,3 +1,4 @@
++import { ValidationException } from '@guren/core'
+ import { z } from 'zod'
  
-+export const COVER_MAX_BYTES = 2 * 1024 * 1024
-+export const COVER_TYPE_MESSAGE = 'The cover must be a PNG or JPEG image.'
-+
-+// Types the browser may report for a PNG or JPEG. An empty type or
-+// application/octet-stream is let through here and decided by the file's
-+// bytes in the controller, which is the check that actually counts.
-+const COVER_CLIENT_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/pjpeg', '', 'application/octet-stream'])
-+
-+// A file input left empty still submits a zero-byte part, which means "no cover".
-+const coverField = z.preprocess(
-+  (value) => (value instanceof File && value.size === 0) || value === '' ? undefined : value,
-+  z
-+    .file('The cover must be a file.')
-+    .max(COVER_MAX_BYTES, 'The cover must be 2 MB or smaller.')
-+    .refine((file) => COVER_CLIENT_TYPES.has(file.type.toLowerCase()), COVER_TYPE_MESSAGE)
-+    .optional(),
-+)
-+
- export const PostPayloadSchema = z.object({
-   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
-   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
-   body: z.string().trim().min(1, 'Body is required.'),
-+  cover: coverField,
-+})
-+
-+export const PostUpdatePayloadSchema = PostPayloadSchema.extend({
-+  // A ticked checkbox submits "1"; an unticked one submits nothing.
-+  removeCover: z.preprocess(
-+    (value) => value === true || value === '1' || value === 'true' || value === 'on',
-+    z.boolean(),
-+  ),
+ export const PostIdParamSchema = z.object({
+@@ -23,3 +24,55 @@ export const PostPayloadSchema = z.object({
  })
  
  export type PostPayload = z.infer<typeof PostPayloadSchema>
-+export type PostUpdatePayload = z.infer<typeof PostUpdatePayloadSchema>
++
++export const COVER_MAX_BYTES = 2 * 1024 * 1024
++
++// A file input left empty still arrives: as an empty string from Inertia, or
++// as a nameless zero-byte part from a plain browser form. Both mean no cover.
++// The PNG/JPEG check reads the file's bytes, which a route schema (parsed
++// synchronously) cannot await, so it lives in readCoverImage() below.
++const CoverSchema = z.preprocess(
++  (value) => (value === '' || value === null || (value instanceof File && value.size === 0) ? undefined : value),
++  z
++    .file('The cover must be a file.')
++    .max(COVER_MAX_BYTES, 'The cover must be 2 MB or smaller.')
++    .optional(),
++)
++
++// A ticked checkbox posts `1` (or `on`); Inertia's JSON body sends a boolean.
++const CheckboxSchema = z.preprocess(
++  (value) => value === true || value === 'true' || value === '1' || value === 1 || value === 'on',
++  z.boolean(),
++)
++
++export const PostStoreSchema = PostPayloadSchema.extend({
++  cover: CoverSchema,
++})
++
++export const PostUpdateSchema = PostPayloadSchema.extend({
++  cover: CoverSchema,
++  removeCover: CheckboxSchema.optional(),
++})
++
++/** The content type a cover's leading bytes identify, or null for anything but PNG and JPEG. */
++function sniffCoverType(bytes: Uint8Array): 'image/png' | 'image/jpeg' | null {
++  const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
++  if (png.every((byte, index) => bytes[index] === byte)) return 'image/png'
++  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
++  return null
++}
++
++/**
++ * Checks a schema-validated cover is really a PNG or JPEG — by its bytes, not
++ * the client-declared type — and returns it typed from them. Throws the same
++ * 422 a schema failure does, with the error on `cover`.
++ */
++export async function readCoverImage(file: File): Promise<File> {
++  const bytes = new Uint8Array(await file.arrayBuffer())
++  const type = sniffCoverType(bytes)
++  if (!type) {
++    throw ValidationException.withMessages({ cover: 'The cover must be a PNG or JPEG image.' })
++  }
++  const name = file.name || `cover.${type === 'image/png' ? 'png' : 'jpg'}`
++  return new File([bytes], name, { type })
++}
 diff --git a/app/Models/Post.ts b/app/Models/Post.ts
-index ca838be..359ea71 100644
+index ca838be..59af910 100644
 --- a/app/Models/Post.ts
 +++ b/app/Models/Post.ts
 @@ -1,4 +1,4 @@
 -import { defineModel, type BelongsToRecord } from '@guren/core'
-+import { Attachable, defineModel, hasOneAttached, type BelongsToRecord } from '@guren/core'
++import { Attachable, Model, defineModel, hasOneAttached, type BelongsToRecord } from '@guren/core'
  import { posts } from '../../db/schema.js'
  import type { UserRecord } from './User.js'
  
-@@ -6,10 +6,15 @@ export type PostRecord = typeof posts.$inferSelect
+@@ -6,13 +6,21 @@ export type PostRecord = typeof posts.$inferSelect
  export type NewPostRecord = typeof posts.$inferInsert
  export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
  
@@ -405,8 +397,8 @@ index ca838be..359ea71 100644
 -  // `authorId` is set from the signed-in user, never from request input.
 -  fillable: ['title', 'excerpt', 'body'],
 -}) {
-+// The cover is stored byte-for-byte as uploaded (no image pipeline, no
-+// variants); PostController checks it is a PNG or JPEG before attaching.
++// The cover is stored as opaque bytes: PostValidator has already checked it is
++// a PNG or JPEG within the size cap, and the original is served back untouched.
 +export class Post extends Attachable(
 +  defineModel(posts, {
 +    // `authorId` is set from the signed-in user, never from request input.
@@ -417,26 +409,28 @@ index ca838be..359ea71 100644
    static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
      author: null,
    }
+ }
+ 
+ Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
++
++// Lets `attachments:prune` resolve the `attachable_type` it finds on cover rows.
++Model.morphMap = { ...Model.morphMap, Post }
 diff --git a/app/Providers/AttachmentsProvider.ts b/app/Providers/AttachmentsProvider.ts
 new file mode 100644
-index 0000000..968424c
+index 0000000..d0a89d9
 --- /dev/null
 +++ b/app/Providers/AttachmentsProvider.ts
-@@ -0,0 +1,16 @@
-+import { Model, ServiceProvider } from '@guren/core'
+@@ -0,0 +1,12 @@
++import { ServiceProvider } from '@guren/core'
 +// Loading this module is what runs configureAttachments(), at boot, in web and
 +// worker processes alike.
 +import { attachmentEngine } from '../../config/attachments'
-+import { Post } from '../Models/Post.js'
 +
 +export default class AttachmentsProvider extends ServiceProvider {
 +  // Without this app's container, the delivery route and the storage factory
 +  // both resolve on whichever app configured attachments last in the process.
 +  register(): void {
 +    attachmentEngine.bindTo(this.container)
-+    // Every model that declares attachments, so attachments:prune can verify
-+    // the records its rows point at.
-+    Model.morphMap = { ...Model.morphMap, Post }
 +  }
 +}
 diff --git a/config/attachments.ts b/config/attachments.ts
@@ -543,11 +537,11 @@ index 0000000..3547186
 +
 +  return { default: env.STORAGE_DISK, disks }
 +})
-diff --git a/db/migrations/20260925022141_boring_umar/migration.sql b/db/migrations/20260925022141_boring_umar/migration.sql
+diff --git a/db/migrations/20260929134702_closed_vin_gonzales/migration.sql b/db/migrations/20260929134702_closed_vin_gonzales/migration.sql
 new file mode 100644
 index 0000000..292f9a8
 --- /dev/null
-+++ b/db/migrations/20260925022141_boring_umar/migration.sql
++++ b/db/migrations/20260929134702_closed_vin_gonzales/migration.sql
 @@ -0,0 +1,19 @@
 +CREATE TABLE `attachments` (
 +	`id` text PRIMARY KEY,
@@ -569,16 +563,16 @@ index 0000000..292f9a8
 +--> statement-breakpoint
 +CREATE INDEX `attachments_attachable_idx` ON `attachments` (`attachable_type`,`attachable_id`,`collection`);
 \ No newline at end of file
-diff --git a/db/migrations/20260925022141_boring_umar/snapshot.json b/db/migrations/20260925022141_boring_umar/snapshot.json
+diff --git a/db/migrations/20260929134702_closed_vin_gonzales/snapshot.json b/db/migrations/20260929134702_closed_vin_gonzales/snapshot.json
 new file mode 100644
-index 0000000..2c7e7c8
+index 0000000..c2296f7
 --- /dev/null
-+++ b/db/migrations/20260925022141_boring_umar/snapshot.json
++++ b/db/migrations/20260929134702_closed_vin_gonzales/snapshot.json
 @@ -0,0 +1,376 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "516bd33b-997a-4b85-a6f2-45cb362861f8",
++  "id": "45300075-ec69-45d2-9a26-ce81a8403e08",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -986,18 +980,26 @@ index 47b96e5..f22bf0d 100644
 +  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
 +}, (t) => [index('attachments_attachable_idx').on(t.attachableType, t.attachableId, t.collection)])
 diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
-index c5f3d76..b8f7015 100644
+index c5f3d76..9a327ab 100644
 --- a/resources/js/pages/posts/Edit.tsx
 +++ b/resources/js/pages/posts/Edit.tsx
-@@ -1,12 +1,13 @@
+@@ -1,12 +1,20 @@
  import { Head, useForm } from '@inertiajs/react'
- import type { ApiRoutes } from '@/.guren/api-client.gen'
+-import type { ApiRoutes } from '@/.guren/api-client.gen'
 +import type { PostResourceData } from '@/app/Http/Resources/PostResource'
  import { route } from '@/.guren/routes.gen'
  import Layout from '../../components/Layout.js'
  
 -type PostFormData = ApiRoutes['posts.store']['body']
-+type PostFormData = Omit<ApiRoutes['posts.update']['body'], 'cover' | 'removeCover'> & { cover: File | null; removeCover: boolean }
++// Spelled out rather than taken from ApiRoutes: codegen renders the `cover`
++// file field as `unknown`, which useForm cannot hold.
++interface PostFormData {
++  title: string
++  excerpt: string
++  body: string
++  cover: File | null
++  removeCover: boolean
++}
  
  interface Props {
 -  post: PostFormData & { id: number }
@@ -1005,7 +1007,7 @@ index c5f3d76..b8f7015 100644
  }
  
  const fieldClass =
-@@ -17,6 +18,8 @@ export default function EditPost({ post }: Props) {
+@@ -17,6 +25,8 @@ export default function EditPost({ post }: Props) {
      title: post.title,
      excerpt: post.excerpt,
      body: post.body,
@@ -1014,22 +1016,22 @@ index c5f3d76..b8f7015 100644
    })
  
    return (
-@@ -32,6 +35,7 @@ export default function EditPost({ post }: Props) {
+@@ -32,6 +42,7 @@ export default function EditPost({ post }: Props) {
            className="space-y-4"
            onSubmit={(event) => {
              event.preventDefault()
-+            // Sent as multipart/form-data whenever a cover file is picked.
++            // Inertia switches to multipart/form-data when a File is present.
              form.put(route('posts.update', { id: post.id }))
            }}
          >
-@@ -68,6 +72,33 @@ export default function EditPost({ post }: Props) {
-             {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
+@@ -57,6 +68,33 @@ export default function EditPost({ post }: Props) {
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-g-danger">{form.errors.excerpt}</p> : null}
            </div>
  
-+          <div className="space-y-2">
++          <div>
 +            <label className="block text-sm font-bold text-g-heading">Cover image</label>
 +            {post.coverUrl ? (
-+              <img src={post.coverUrl} alt="" className="max-h-48 rounded-g-card border border-g-line object-cover" />
++              <img src={post.coverUrl} alt="" className="mt-1 max-h-48 rounded-g-card border border-g-line object-cover" />
 +            ) : null}
 +            <input
 +              type="file"
@@ -1037,11 +1039,11 @@ index c5f3d76..b8f7015 100644
 +              onChange={(event) => form.setData('cover', event.target.files?.[0] ?? null)}
 +              className={fieldClass}
 +            />
-+            <p className="text-xs text-g-muted">
-+              {post.coverUrl ? 'Pick a file to replace the current cover. ' : 'Optional. '}PNG or JPEG, up to 2 MB.
++            <p className="mt-1 text-sm text-g-muted">
++              {post.coverUrl ? 'Pick a file to replace the cover.' : 'Optional.'} PNG or JPEG, up to 2 MB.
 +            </p>
 +            {post.coverUrl ? (
-+              <label className="flex items-center gap-2 text-sm text-g-text-2">
++              <label className="mt-2 flex items-center gap-2 text-sm text-g-text">
 +                <input
 +                  type="checkbox"
 +                  checked={form.data.removeCover}
@@ -1050,17 +1052,17 @@ index c5f3d76..b8f7015 100644
 +                Remove cover
 +              </label>
 +            ) : null}
-+            {form.errors.cover ? <p className="text-sm text-g-danger">{form.errors.cover}</p> : null}
++            {form.errors.cover ? <p className="mt-1 text-sm text-g-danger">{form.errors.cover}</p> : null}
 +          </div>
 +
-           <button
-             type="submit"
-             disabled={form.processing}
+           <div>
+             <label className="block text-sm font-bold text-g-heading">Body</label>
+             <textarea
 diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
-index f4731cc..c78e93c 100644
+index f4731cc..fb84833 100644
 --- a/resources/js/pages/posts/Index.tsx
 +++ b/resources/js/pages/posts/Index.tsx
-@@ -98,17 +98,26 @@ export default function PostsIndex({ data, pagination }: Props) {
+@@ -98,17 +98,29 @@ export default function PostsIndex({ data, pagination }: Props) {
  
          <div className="space-y-4">
            {posts.map((post) => (
@@ -1074,12 +1076,15 @@ index f4731cc..c78e93c 100644
 -              <p className="mt-2 text-sm text-g-text-2">{post.excerpt}</p>
 -              {post.author ? (
 -                <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
-+            <article key={post.id} className="flex gap-5 rounded-g-card border border-g-line bg-g-panel p-5 shadow-g-card">
++            <article
++              key={post.id}
++              className="flex gap-4 rounded-g-card border border-g-line bg-g-panel p-5 shadow-g-card"
++            >
 +              {post.coverUrl ? (
 +                <img
 +                  src={post.coverUrl}
 +                  alt=""
-+                  className="h-24 w-32 shrink-0 rounded-g-ctl border border-g-line object-cover"
++                  className="h-20 w-28 shrink-0 rounded-g-ctl border border-g-line object-cover"
 +                />
                ) : null}
 +              <div className="min-w-0">
@@ -1098,15 +1103,24 @@ index f4731cc..c78e93c 100644
            ))}
          </div>
 diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
-index e06958d..5e46bc9 100644
+index e06958d..95d8d39 100644
 --- a/resources/js/pages/posts/New.tsx
 +++ b/resources/js/pages/posts/New.tsx
-@@ -3,13 +3,13 @@ import type { ApiRoutes } from '@/.guren/api-client.gen'
+@@ -1,15 +1,21 @@
+ import { Head, useForm } from '@inertiajs/react'
+-import type { ApiRoutes } from '@/.guren/api-client.gen'
  import { route } from '@/.guren/routes.gen'
  import Layout from '../../components/Layout.js'
  
 -type PostFormData = ApiRoutes['posts.store']['body']
-+type PostFormData = Omit<ApiRoutes['posts.store']['body'], 'cover'> & { cover: File | null }
++// Spelled out rather than taken from ApiRoutes: codegen renders the `cover`
++// file field as `unknown`, which useForm cannot hold.
++interface PostFormData {
++  title: string
++  excerpt: string
++  body: string
++  cover: File | null
++}
  
  const fieldClass =
    'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
@@ -1117,16 +1131,16 @@ index e06958d..5e46bc9 100644
  
    return (
      <Layout>
-@@ -24,6 +24,7 @@ export default function NewPost() {
+@@ -24,6 +30,7 @@ export default function NewPost() {
            className="space-y-4"
            onSubmit={(event) => {
              event.preventDefault()
-+            // Sent as multipart/form-data whenever a cover file is picked.
++            // Inertia switches to multipart/form-data when a File is present.
              form.post(route('posts.store'))
            }}
          >
-@@ -60,6 +61,18 @@ export default function NewPost() {
-             {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
+@@ -49,6 +56,18 @@ export default function NewPost() {
+             {form.errors.excerpt ? <p className="mt-1 text-sm text-g-danger">{form.errors.excerpt}</p> : null}
            </div>
  
 +          <div>
@@ -1137,15 +1151,15 @@ index e06958d..5e46bc9 100644
 +              onChange={(event) => form.setData('cover', event.target.files?.[0] ?? null)}
 +              className={fieldClass}
 +            />
-+            <p className="mt-1 text-xs text-g-muted">Optional. PNG or JPEG, up to 2 MB.</p>
++            <p className="mt-1 text-sm text-g-muted">Optional. PNG or JPEG, up to 2 MB.</p>
 +            {form.errors.cover ? <p className="mt-1 text-sm text-g-danger">{form.errors.cover}</p> : null}
 +          </div>
 +
-           <button
-             type="submit"
-             disabled={form.processing}
+           <div>
+             <label className="block text-sm font-bold text-g-heading">Body</label>
+             <textarea
 diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
-index 537c81e..b4b0934 100644
+index 537c81e..b6a42dc 100644
 --- a/resources/js/pages/posts/Show.tsx
 +++ b/resources/js/pages/posts/Show.tsx
 @@ -17,6 +17,13 @@ export default function PostShow({ post }: Props) {
@@ -1156,38 +1170,42 @@ index 537c81e..b4b0934 100644
 +          <img
 +            src={post.coverUrl}
 +            alt=""
-+            className="max-h-96 w-full rounded-g-card border border-g-line object-cover shadow-g-card"
++            className="aspect-[2/1] w-full rounded-g-card border border-g-line object-cover"
 +          />
 +        ) : null}
          <header className="space-y-2">
            <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
              <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..507a1e1 100644
+index 4c174ac..e3dfc5b 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
-@@ -1,11 +1,13 @@
--import { Router, requireAuthenticated, requireGuest } from '@guren/core'
-+import { Router, registerAttachmentRoutes, requireAuthenticated, requireGuest } from '@guren/core'
+@@ -1,11 +1,15 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
  import HomeController from '../app/Http/Controllers/HomeController.js'
  import PostController from '../app/Http/Controllers/PostController.js'
 -import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
-+import { PostPayloadSchema, PostSearchSchema, PostUpdatePayloadSchema } from '../app/Http/Validators/PostValidator.js'
++import { PostSearchSchema, PostStoreSchema, PostUpdateSchema } from '../app/Http/Validators/PostValidator.js'
  import { PostResource } from '../app/Http/Resources/PostResource.js'
  import { registerAuthRoutes } from './auth.js'
++import { registerAttachmentRoutes } from '@guren/core'
  
  export function registerWebRoutes(baseRouter: Router): void {
++  // Serves uploaded covers from the private disk through signed URLs.
 +  registerAttachmentRoutes(baseRouter)
 +
    // Named rather than inline so `guren audit` can see which routes are
    // protected — it cannot inspect a middleware passed as a call result.
    const router = baseRouter
-@@ -25,7 +27,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -24,8 +28,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+     posts.middleware('auth').group((authed) => {
        authed.get('/create', [PostController, 'create']).name('posts.create')
        authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
-       authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
+-      authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
 -      authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
-+      authed.put('/:id', { name: 'posts.update', body: PostUpdatePayloadSchema }, [PostController, 'update'])
++      // Both accept multipart/form-data too, carrying an optional `cover` file.
++      authed.post('/', { name: 'posts.store', body: PostStoreSchema }, [PostController, 'store'])
++      authed.put('/:id', { name: 'posts.update', body: PostUpdateSchema }, [PostController, 'update'])
        authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
      })
  
@@ -1218,16 +1236,16 @@ index 3789858..90c73f1 100644
    // and the request locale is detected from ?locale=, a locale cookie, or
    // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
 diff --git a/src/console.ts b/src/console.ts
-index 83594f0..91f2ade 100644
+index 83594f0..043f524 100644
 --- a/src/console.ts
 +++ b/src/console.ts
-@@ -1,4 +1,4 @@
--import { ConsoleKernel } from '@guren/core'
-+import { AttachmentsPruneCommand, ConsoleKernel } from '@guren/core'
+@@ -1,9 +1,10 @@
+ import { ConsoleKernel } from '@guren/core'
  import app from './app.js'
++import { AttachmentsPruneCommand } from '@guren/core'
  
  export const kernel = new ConsoleKernel({ container: app.container })
-@@ -6,4 +6,4 @@ export const kernel = new ConsoleKernel({ container: app.container })
+ 
  // `bunx guren make:command` adds the import and the array entry for you; the
  // empty array literal is what it edits, so keep it even while unused.
  // `bunx guren check` warns about any command class this file never registers.
@@ -1235,170 +1253,121 @@ index 83594f0..91f2ade 100644
 +kernel.registerMany([AttachmentsPruneCommand])
 diff --git a/tests/PostCover.test.ts b/tests/PostCover.test.ts
 new file mode 100644
-index 0000000..49d3319
+index 0000000..207aaec
 --- /dev/null
 +++ b/tests/PostCover.test.ts
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,114 @@
 +import { beforeAll, describe, expect, it } from 'bun:test'
-+import { readdir, readFile } from 'node:fs/promises'
-+import { join } from 'node:path'
-+import { TestApp, readInertiaResponse } from '@guren/testing'
++import { existsSync } from 'node:fs'
++import { TestApp } from '@guren/testing'
 +import app from '../src/app.js'
 +import { migrateDatabase } from '../config/database.js'
-+import { Attachment } from '../config/attachments.js'
 +import { Post } from '../app/Models/Post.js'
 +import { User, type UserRecord } from '../app/Models/User.js'
++import { Attachment } from '../config/attachments.js'
 +
-+// Minimal, valid 1x1 images: only the leading bytes are inspected, but these
-+// decode too, so they stay valid if the cover pipeline ever starts decoding.
-+const PNG = Uint8Array.from(Buffer.from(
-+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-+  'base64',
-+))
-+const JPEG = Uint8Array.from(Buffer.from(
-+  '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==',
-+  'base64',
-+))
-+const GIF = Uint8Array.from(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'))
++const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4])
++const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 5, 6, 7, 8])
++const GIF = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 9, 9])
 +
-+function postForm(fields: Record<string, string>, cover?: File): FormData {
++function postForm(title: string, extra: Record<string, string | File> = {}): FormData {
 +  const form = new FormData()
-+  for (const [key, value] of Object.entries({ title: 'A post', excerpt: 'An excerpt', body: 'A body', ...fields })) {
-+    form.append(key, value)
-+  }
-+  if (cover) form.append('cover', cover)
++  form.set('title', title)
++  form.set('excerpt', 'An excerpt')
++  form.set('body', 'A body')
++  for (const [key, value] of Object.entries(extra)) form.set(key, value)
 +  return form
 +}
 +
-+async function listFiles(dir: string): Promise<string[]> {
-+  const entries = await readdir(dir, { recursive: true, withFileTypes: true }).catch(() => [])
-+  return entries.filter((entry) => entry.isFile()).map((entry) => join(entry.parentPath, entry.name))
++async function coverRows(postId: number) {
++  return Attachment.where({ attachableType: 'Post', attachableId: String(postId) })
 +}
 +
-+async function storedCopies(bytes: Uint8Array, dir: string): Promise<number> {
-+  let count = 0
-+  for (const file of await listFiles(dir)) {
-+    if (Buffer.from(await readFile(file)).equals(Buffer.from(bytes))) count++
-+  }
-+  return count
++async function coverUrl(http: TestApp, postId: number): Promise<string | null> {
++  const response = await http.withHeader('X-Inertia', 'true').get(`/posts/${postId}`)
++  const page = (await response.json()) as { props: { post: { coverUrl: string | null } } }
++  return page.props.post.coverUrl
 +}
 +
-+async function countRows(model: typeof Post | typeof Attachment): Promise<number> {
-+  return model.newQuery().count()
++async function latestPostId(title: string): Promise<number | undefined> {
++  const posts = (await Post.where({ title })) as Array<{ id: number }>
++  return posts.at(-1)?.id
 +}
 +
 +describe('post covers', () => {
 +  let http: TestApp
-+  let author: TestApp
-+
-+  async function pageProps(path: string): Promise<Record<string, any>> {
-+    const response = await author.withHeaders({ 'X-Inertia': 'true' }).get(path).assertOk()
-+    return (await readInertiaResponse(response.raw)).payload.props as Record<string, any>
-+  }
-+
-+  async function createPost(cover?: File): Promise<number> {
-+    const response = await author.post('/posts', postForm({}, cover))
-+    expect(response.status).toBeGreaterThanOrEqual(300)
-+    expect(response.status).toBeLessThan(400)
-+    const id = Number(response.headers.get('location')?.match(/\/posts\/(\d+)/)?.[1])
-+    expect(id).toBeGreaterThan(0)
-+    return id
-+  }
-+
-+  async function coverUrl(id: number): Promise<string | null> {
-+    return (await pageProps(`/posts/${id}`)).post.coverUrl
-+  }
 +
 +  beforeAll(async () => {
 +    await migrateDatabase()
-+    http = await (await TestApp.fromApp(app)).withCsrf('/')
-+    const user = (await User.create({
-+      name: 'Cover Author',
-+      email: `cover-${crypto.randomUUID()}@example.com`,
-+      password: 'secret-password',
-+    })) as UserRecord
-+    author = http.actingAs(user)
++    const guest = await TestApp.fromApp(app)
++    await guest.get('/health')
++    const author = (await User.where({ email: 'demo@example.com' }))[0] as UserRecord
++    http = await guest.actingAs(author).withCsrf('/posts')
 +  })
 +
-+  it('creates a post without a cover as before', async () => {
-+    const id = await createPost()
-+    expect(await coverUrl(id)).toBeNull()
-+  })
++  it('stores, serves, replaces, removes and deletes a cover', async () => {
++    await http.post('/posts', postForm('Cover post', { cover: new File([PNG], 'a.png', { type: 'image/png' }) })).assertRedirect()
++    const id = (await latestPostId('Cover post'))!
 +
-+  it('stores, lists and serves an uploaded PNG cover byte for byte', async () => {
-+    const id = await createPost(new File([PNG], 'cover.png', { type: 'image/png' }))
-+    const url = await coverUrl(id)
++    const url = (await coverUrl(http, id))!
 +    expect(url).toBeString()
++    const served = await http.get(url)
++    expect(served.status).toBe(200)
++    expect(served.headers.get('content-type')).toBe('image/png')
++    expect(new Uint8Array(await served.raw.arrayBuffer())).toEqual(PNG)
++    const [first] = (await coverRows(id)) as Array<{ disk: string; path: string }>
++    expect(existsSync(`./storage/app/testing/${first!.path}`)).toBe(true)
 +
-+    const listed = (await pageProps('/posts')).data.find((post: { id: number }) => post.id === id)
-+    expect(listed.coverUrl).toBeString()
++    // Replacing
++    await http.put(`/posts/${id}`, postForm('Cover post', { cover: new File([JPEG], 'b.jpg', { type: 'image/jpeg' }) })).assertRedirect()
++    const replaced = (await coverUrl(http, id))!
++    expect((await http.get(replaced)).headers.get('content-type')).toBe('image/jpeg')
++    expect((await http.get(url)).status).not.toBe(200)
++    expect(existsSync(`./storage/app/testing/${first!.path}`)).toBe(false)
++    expect(await coverRows(id)).toHaveLength(1)
 +
-+    const served = await http.get(url!).assertOk()
-+    expect(served.headers.get('content-type')).toStartWith('image/png')
-+    expect(Buffer.from(await served.raw.arrayBuffer()).equals(Buffer.from(PNG))).toBe(true)
++    // Editing without a file keeps it
++    await http.put(`/posts/${id}`, postForm('Cover post')).assertRedirect()
++    expect(await coverRows(id)).toHaveLength(1)
 +
-+    expect(await storedCopies(PNG, 'storage')).toBeGreaterThan(0)
-+    expect(await storedCopies(PNG, 'public')).toBe(0)
++    // A rejected cover on edit keeps the old one
++    await http.json().put(`/posts/${id}`, postForm('Cover post', { cover: new File([GIF], 'c.gif', { type: 'image/gif' }) })).assertStatus(422)
++    expect(await coverRows(id)).toHaveLength(1)
++
++    // Removing
++    await http.put(`/posts/${id}`, postForm('Cover post', { removeCover: '1' })).assertRedirect()
++    expect(await coverUrl(http, id)).toBeNull()
++    expect(await coverRows(id)).toHaveLength(0)
++    expect((await http.get(replaced)).status).not.toBe(200)
++
++    // Deleted with the post
++    await http.put(`/posts/${id}`, postForm('Cover post', { cover: new File([PNG], 'a.png', { type: 'image/png' }) })).assertRedirect()
++    expect(await coverRows(id)).toHaveLength(1)
++    await http.delete(`/posts/${id}`).assertRedirect()
++    expect(await coverRows(id)).toHaveLength(0)
 +  })
 +
-+  it('refuses a GIF or an oversized file the way it refuses an empty title', async () => {
-+    const emptyTitle = await author.json().post('/posts', postForm({ title: '' }))
-+    const postsBefore = await countRows(Post)
-+    const attachmentsBefore = await countRows(Attachment)
-+
-+    const gif = await author.json().post('/posts', postForm({}, new File([GIF], 'cover.gif', { type: 'image/gif' })))
-+    expect(gif.status).toBe(emptyTitle.status)
-+    expect(await gif.json()).toMatchObject({ errors: { cover: [expect.any(String)] } })
-+
-+    // A GIF sent under a PNG name and type is still a GIF.
-+    const disguised = await author.json().post('/posts', postForm({}, new File([GIF], 'cover.png', { type: 'image/png' })))
-+    expect(disguised.status).toBe(emptyTitle.status)
-+    expect(await disguised.json()).toMatchObject({ errors: { cover: [expect.any(String)] } })
++  it('refuses a GIF or an oversized file and saves nothing', async () => {
++    await http
++      .json()
++      .post('/posts', postForm('Gif post', { cover: new File([GIF], 'c.gif', { type: 'image/gif' }) }))
++      .assertStatus(422)
++      .assertJsonPath('errors.cover', ['The cover must be a PNG or JPEG image.'])
++    expect(await latestPostId('Gif post')).toBeUndefined()
 +
 +    const big = new Uint8Array(2 * 1024 * 1024 + 1)
 +    big.set(PNG)
-+    const oversized = await author.json().post('/posts', postForm({}, new File([big], 'big.png', { type: 'image/png' })))
-+    expect(oversized.status).toBe(emptyTitle.status)
-+    expect(await oversized.json()).toMatchObject({ errors: { cover: [expect.any(String)] } })
-+
-+    expect(await countRows(Post)).toBe(postsBefore)
-+    expect(await countRows(Attachment)).toBe(attachmentsBefore)
++    await http
++      .json()
++      .post('/posts', postForm('Big post', { cover: new File([big], 'big.png', { type: 'image/png' }) }))
++      .assertStatus(422)
++      .assertJsonPath('errors.cover', ['The cover must be 2 MB or smaller.'])
++    expect(await latestPostId('Big post')).toBeUndefined()
 +  })
 +
-+  it('replaces, keeps and removes the cover on edit', async () => {
-+    const id = await createPost(new File([PNG], 'cover.png', { type: 'image/png' }))
-+    const first = (await coverUrl(id))!
-+
-+    const refused = await author.json().put(`/posts/${id}`, postForm({}, new File([GIF], 'c.gif', { type: 'image/gif' })))
-+    expect(refused.status).toBe(422)
-+    await http.get(first).assertOk()
-+
-+    await author.put(`/posts/${id}`, postForm({}, new File([JPEG], 'cover.jpg', { type: 'image/jpeg' })))
-+    const second = (await coverUrl(id))!
-+    await http.get(first).assertNotFound()
-+    const served = await http.get(second).assertOk()
-+    expect(served.headers.get('content-type')).toStartWith('image/jpeg')
-+    expect(Buffer.from(await served.raw.arrayBuffer()).equals(Buffer.from(JPEG))).toBe(true)
-+
-+    const rowsFor = () => Attachment.where({ attachableId: String(id) }).count()
-+    expect(await rowsFor()).toBe(1)
-+
-+    await author.put(`/posts/${id}`, postForm({ title: 'Renamed' }))
-+    expect(await coverUrl(id)).toBeString()
-+    expect(await rowsFor()).toBe(1)
-+
-+    await author.put(`/posts/${id}`, postForm({ removeCover: '1' }))
-+    expect(await coverUrl(id)).toBeNull()
-+    await http.get(second).assertNotFound()
-+    expect(await rowsFor()).toBe(0)
-+  })
-+
-+  it('deletes the cover with its post', async () => {
-+    const id = await createPost(new File([JPEG], 'cover.jpg', { type: 'image/jpeg' }))
-+    const url = (await coverUrl(id))!
-+
-+    await author.delete(`/posts/${id}`)
-+    await http.get(url).assertNotFound()
-+    expect(await Attachment.where({ attachableId: String(id) }).count()).toBe(0)
++  it('creates a post without a cover as before', async () => {
++    await http.post('/posts', postForm('Plain post')).assertRedirect()
++    const id = (await latestPostId('Plain post'))!
++    expect(await coverUrl(http, id)).toBeNull()
 +  })
 +})

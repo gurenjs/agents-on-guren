@@ -68,11 +68,11 @@ index 846382c..fa1acc3 100644
        'posts.search': { body: { keywords: string[]; limit: number } }
        'posts.store': { body: { title: string; excerpt: string; body: string } }
        'posts.update': { body: { title: string; excerpt: string; body: string } }
-diff --git a/db/migrations/20260925060441_newsletter_subscriptions/migration.sql b/db/migrations/20260925060441_newsletter_subscriptions/migration.sql
+diff --git a/db/migrations/20260929161812_create_newsletter_subscriptions/migration.sql b/db/migrations/20260929161812_create_newsletter_subscriptions/migration.sql
 new file mode 100644
 index 0000000..6daab0d
 --- /dev/null
-+++ b/db/migrations/20260925060441_newsletter_subscriptions/migration.sql
++++ b/db/migrations/20260929161812_create_newsletter_subscriptions/migration.sql
 @@ -0,0 +1,7 @@
 +CREATE TABLE `newsletter_subscriptions` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +81,16 @@ index 0000000..6daab0d
 +	`confirmed_at` text,
 +	`created_at` text NOT NULL
 +);
-diff --git a/db/migrations/20260925060441_newsletter_subscriptions/snapshot.json b/db/migrations/20260925060441_newsletter_subscriptions/snapshot.json
+diff --git a/db/migrations/20260929161812_create_newsletter_subscriptions/snapshot.json b/db/migrations/20260929161812_create_newsletter_subscriptions/snapshot.json
 new file mode 100644
-index 0000000..fbc907a
+index 0000000..8e8daea
 --- /dev/null
-+++ b/db/migrations/20260925060441_newsletter_subscriptions/snapshot.json
++++ b/db/migrations/20260929161812_create_newsletter_subscriptions/snapshot.json
 @@ -0,0 +1,272 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "b03cd10d-7f39-4101-b4c5-247b33bea4bb",
++  "id": "53816947-d59f-4eff-9709-457890d2c504",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -370,19 +370,66 @@ index 47b96e5..ee7c8bb 100644
  
  export const users = sqliteTable('users', {
    id: integer('id').primaryKey({ autoIncrement: true }),
+diff --git a/docs/adr/0002-newsletter-sign-up-as-a-self-contained-module.md b/docs/adr/0002-newsletter-sign-up-as-a-self-contained-module.md
+new file mode 100644
+index 0000000..40d0c42
+--- /dev/null
++++ b/docs/adr/0002-newsletter-sign-up-as-a-self-contained-module.md
+@@ -0,0 +1,46 @@
++---
++type: adr
++status: stable
++entities: [NewsletterSubscription]
++related:
++  - modules/newsletter/**
++  - guren.arch.ts
++generated: { by: "claude-fable-5-1/1.0", at: 2026-09-29T16:19:33.246Z }
++---
++
++# Newsletter sign-up as a self-contained module
++
++## Context
++
++Marketing wants a newsletter sign-up on the blog, and the same sign-up ships
++with the next product. It therefore has to be liftable into another app as
++is, and the blog must not grow a dependency on it.
++
++## Decision
++
++- Everything newsletter-specific lives under `modules/newsletter/`: routes,
++  controller, validators, model and the `newsletter_subscriptions` table
++  definition. `src/app.ts` registers it through `createApp({ modules })`.
++- The root `db/schema.ts` re-exports `modules/newsletter/db/schema.ts` so
++  drizzle-kit generates the table's migration into `db/migrations/`, which
++  `bun run db:migrate` applies.
++- `guren.arch.ts` forbids every file under `app/` and `routes/` from
++  importing anything under `modules/newsletter/`, type-only imports
++  included. The built-in module boundary alone would still allow the
++  module's `index.ts` and `db/schema.ts`.
++- A subscription is created pending, with a 64-character random token
++  issued by the server; `token` and `confirmedAt` are not mass-assignable.
++- Subscribe and unsubscribe redirect to the `Referer` page only when it is
++  on the request's own origin, and to `/` otherwise.
++
++## Consequences
++
++- `bunx guren check` fails as soon as blog code imports the module, so the
++  separation does not depend on review.
++- Blog pages cannot call the module's code; a sign-up form posts to
++  `/newsletter/subscribe` over HTTP.
++- Moving the module to another app means copying the folder, registering it
++  in that app's `src/app.ts`, re-exporting its schema and generating a
++  migration there.
++- Sending the confirmation email is not implemented; the token is only
++  stored.
 diff --git a/guren.arch.ts b/guren.arch.ts
 new file mode 100644
-index 0000000..dad3734
+index 0000000..543e8dd
 --- /dev/null
 +++ b/guren.arch.ts
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,19 @@
 +import { defineArchRules } from '@guren/cli/arch'
 +
-+// The zero-config module boundary only guards a module's internals; a module's
-+// index.ts and db/schema.ts stay importable. The newsletter module must be
-+// liftable into another app as is, so the blog (app/, routes/) may not import
-+// any of it, public surface included. src/app.ts and db/schema.ts are the only
-+// places that wire it in.
 +export default defineArchRules({
 +  layers: {
 +    blog: ['app/**', 'routes/**'],
@@ -390,50 +437,62 @@ index 0000000..dad3734
 +  },
 +  rules: [
 +    {
++      // Stricter than the built-in module boundary, which lets any file import
++      // a module's index.ts and db/schema.ts.
 +      from: 'blog',
 +      disallow: 'newsletter',
 +      includeTypeImports: true,
-+      message: 'The blog must not depend on the newsletter module; it is registered only through src/app.ts.',
++      message:
++        'The newsletter module is lifted into other apps as is, so the blog must not depend on it. Keep newsletter code under modules/newsletter/; only src/app.ts and db/schema.ts wire it in.',
 +    },
 +  ],
 +})
 diff --git a/modules/newsletter/app/Http/Controllers/NewsletterController.ts b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
 new file mode 100644
-index 0000000..cbe6c0d
+index 0000000..e0dc87d
 --- /dev/null
 +++ b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
-@@ -0,0 +1,49 @@
-+import { Controller, NotFoundHttpException, ValidationException, isSafeRedirectUrl, urlSafeToken } from '@guren/core'
+@@ -0,0 +1,63 @@
++import { randomBytes } from 'node:crypto'
++import { Controller, ValidationException, isSafeRedirectUrl } from '@guren/core'
 +import { NewsletterSubscription } from '../../Models/NewsletterSubscription.js'
-+import { NewsletterTokenParamSchema } from '../Validators/NewsletterValidator.js'
 +
-+// Long enough that guessing a token is infeasible; the contract needs 16+.
-+const CONFIRMATION_TOKEN_LENGTH = 48
++const ALREADY_SUBSCRIBED = 'This email address is already subscribed.'
 +
 +export default class NewsletterController extends Controller {
 +  async subscribe(): Promise<Response> {
 +    const { email } = this.validated('newsletter.subscribe').body
 +
-+    const existing = await NewsletterSubscription.first({ email })
-+    if (existing) {
-+      throw ValidationException.withMessages({ email: 'This address is already subscribed.' })
++    if (await NewsletterSubscription.first({ email })) {
++      throw ValidationException.withMessages({ email: ALREADY_SUBSCRIBED })
 +    }
 +
-+    // forceCreate, because `token` is deliberately absent from fillable.
-+    await NewsletterSubscription.forceCreate({ email, token: urlSafeToken(CONFIRMATION_TOKEN_LENGTH) })
++    try {
++      // forceCreate, because `token` is deliberately absent from the model's
++      // fillable: it is generated here and a request must never set it.
++      await NewsletterSubscription.forceCreate({ email, token: randomBytes(32).toString('hex') })
++    } catch (error) {
++      // Two concurrent sign-ups can both pass the lookup above; the unique
++      // index on `email` rejects the second one.
++      if (isUniqueViolation(error)) {
++        throw ValidationException.withMessages({ email: ALREADY_SUBSCRIBED })
++      }
++      throw error
++    }
 +
-+    return this.redirect(this.backUrl())
++    return this.redirect(this.previousUrl())
 +  }
 +
 +  async confirm(): Promise<Response> {
-+    const { token } = this.validateParams(NewsletterTokenParamSchema)
++    const subscription = this.model(NewsletterSubscription)
 +
-+    const subscription = await NewsletterSubscription.first({ token })
-+    if (!subscription) {
-+      throw new NotFoundHttpException('Unknown confirmation token.')
++    // A repeated visit keeps the time of the first confirmation.
++    if (!subscription.confirmedAt) {
++      await NewsletterSubscription.forceUpdate(
++        { id: subscription.id },
++        { confirmedAt: new Date().toISOString() },
++      )
 +    }
-+
-+    await NewsletterSubscription.forceUpdate({ id: subscription.id }, { confirmedAt: new Date().toISOString() })
 +
 +    return this.redirect('/')
 +  }
@@ -443,40 +502,46 @@ index 0000000..cbe6c0d
 +
 +    await NewsletterSubscription.delete({ email })
 +
-+    return this.redirect(this.backUrl())
++    return this.redirect(this.previousUrl())
 +  }
 +
-+  // The Referer is browser-controlled, so an off-site one falls back to home.
-+  private backUrl(): string {
++  // The Referer header is request input: following it to another origin would
++  // make these endpoints an open redirect.
++  private previousUrl(): string {
 +    const referer = this.request.header('referer')
 +    return referer && isSafeRedirectUrl(referer, this.request.url) ? referer : '/'
 +  }
 +}
++
++function isUniqueViolation(error: unknown): boolean {
++  return error instanceof Error && /unique constraint/i.test(`${error.message} ${String(error.cause ?? '')}`)
++}
 diff --git a/modules/newsletter/app/Http/Validators/NewsletterValidator.ts b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
 new file mode 100644
-index 0000000..699fa7b
+index 0000000..438aac2
 --- /dev/null
 +++ b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +import { z } from 'zod'
 +
-+export const NewsletterEmailSchema = z.object({
-+  email: z
-+    .string()
-+    .trim()
-+    .min(1, 'Email is required.')
-+    .toLowerCase()
-+    .pipe(z.email('The email address is badly formatted.')),
-+})
++// Lowercased so the unique index on `email` treats Reader@Example.com and
++// reader@example.com as the same subscriber.
++const email = z
++  .string()
++  .trim()
++  .min(1, 'Email is required.')
++  .toLowerCase()
++  .pipe(z.email('The email address is badly formatted.'))
 +
-+export const NewsletterTokenParamSchema = z.object({
-+  token: z.string().trim().min(1),
-+})
++export const SubscribeSchema = z.object({ email })
 +
-+export type NewsletterEmailInput = z.infer<typeof NewsletterEmailSchema>
++export const UnsubscribeSchema = z.object({ email })
++
++export type SubscribeInput = z.infer<typeof SubscribeSchema>
++export type UnsubscribeInput = z.infer<typeof UnsubscribeSchema>
 diff --git a/modules/newsletter/app/Models/NewsletterSubscription.ts b/modules/newsletter/app/Models/NewsletterSubscription.ts
 new file mode 100644
-index 0000000..1b4793e
+index 0000000..b7a4f07
 --- /dev/null
 +++ b/modules/newsletter/app/Models/NewsletterSubscription.ts
 @@ -0,0 +1,10 @@
@@ -487,21 +552,24 @@ index 0000000..1b4793e
 +export type NewNewsletterSubscriptionRecord = typeof newsletterSubscriptions.$inferInsert
 +
 +export class NewsletterSubscription extends defineModel(newsletterSubscriptions, {
-+  // `token` and `confirmedAt` are issued server-side, never from request input.
++  // `token` and `confirmedAt` are issued by the server, never by request input.
 +  fillable: ['email'],
 +}) {}
 diff --git a/modules/newsletter/db/schema.ts b/modules/newsletter/db/schema.ts
 new file mode 100644
-index 0000000..62386f2
+index 0000000..44a224e
 --- /dev/null
 +++ b/modules/newsletter/db/schema.ts
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,12 @@
++// Re-exported into the project's db/schema.ts by `guren make:module`, which is
++// how drizzle-kit sees this table when generating migrations.
 +import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
 +
 +export const newsletterSubscriptions = sqliteTable('newsletter_subscriptions', {
 +  id: integer('id').primaryKey({ autoIncrement: true }),
 +  email: text('email').notNull().unique(),
 +  token: text('token').notNull().unique(),
++  // Null until the visitor follows the confirmation link.
 +  confirmedAt: text('confirmed_at'),
 +  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
 +})
@@ -521,148 +589,222 @@ index 0000000..376aa0c
 +})
 diff --git a/modules/newsletter/routes.ts b/modules/newsletter/routes.ts
 new file mode 100644
-index 0000000..4f9757b
+index 0000000..6c685f5
 --- /dev/null
 +++ b/modules/newsletter/routes.ts
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,15 @@
 +import type { Router } from '@guren/core'
 +import NewsletterController from './app/Http/Controllers/NewsletterController.js'
-+import { NewsletterEmailSchema } from './app/Http/Validators/NewsletterValidator.js'
++import { SubscribeSchema, UnsubscribeSchema } from './app/Http/Validators/NewsletterValidator.js'
++import { NewsletterSubscription } from './app/Models/NewsletterSubscription.js'
 +
-+// Mounted under the module's `/newsletter` prefix. Every route is open to
-+// guests: a reader signs up without an account.
++// Mounted under the module's `/newsletter` prefix (see index.ts).
 +export function registerNewsletterRoutes(router: Router): void {
-+  router.post('/subscribe', { name: 'newsletter.subscribe', body: NewsletterEmailSchema }, [
-+    NewsletterController,
-+    'subscribe',
-+  ])
-+  router.get('/confirm/:token', [NewsletterController, 'confirm']).name('newsletter.confirm')
-+  router.post('/unsubscribe', { name: 'newsletter.unsubscribe', body: NewsletterEmailSchema }, [
-+    NewsletterController,
-+    'unsubscribe',
-+  ])
++  router.post('/subscribe', { name: 'newsletter.subscribe', body: SubscribeSchema }, [NewsletterController, 'subscribe'])
++  router.post('/unsubscribe', { name: 'newsletter.unsubscribe', body: UnsubscribeSchema }, [NewsletterController, 'unsubscribe'])
++  router.get(
++    '/confirm/:token',
++    { name: 'newsletter.confirm', bind: { token: [NewsletterSubscription, 'token'] } },
++    [NewsletterController, 'confirm'],
++  )
 +}
-diff --git a/modules/newsletter/tests/NewsletterController.test.ts b/modules/newsletter/tests/NewsletterController.test.ts
+diff --git a/modules/newsletter/tests/controllers/NewsletterController.test.ts b/modules/newsletter/tests/controllers/NewsletterController.test.ts
 new file mode 100644
-index 0000000..e2a20f4
+index 0000000..2e0b407
 --- /dev/null
-+++ b/modules/newsletter/tests/NewsletterController.test.ts
-@@ -0,0 +1,118 @@
-+import { beforeAll, describe, expect, it } from 'bun:test'
++++ b/modules/newsletter/tests/controllers/NewsletterController.test.ts
+@@ -0,0 +1,194 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp } from '@guren/testing'
-+import app from '../../../src/app.js'
-+import { NewsletterSubscription } from '../app/Models/NewsletterSubscription.js'
++import { resetDatabase } from '../../../../config/database.js'
++import app from '../../../../src/app.js'
++import { NewsletterSubscription } from '../../app/Models/NewsletterSubscription.js'
 +
-+// The test database persists between runs, so every address is unique per test.
-+function uniqueEmail(label: string): string {
-+  return `${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}@example.com`
-+}
++const REFERER = 'http://localhost/posts'
 +
-+describe('newsletter module', () => {
++describe('NewsletterController', () => {
 +  let http: TestApp
 +
 +  beforeAll(async () => {
 +    http = await TestApp.fromApp(app)
 +  })
 +
-+  async function guest(referer?: string): Promise<TestApp> {
++  beforeEach(async () => {
++    await resetDatabase()
++  })
++
++  async function guest(): Promise<TestApp> {
 +    const csrf = await http.withCsrf()
-+    const client = csrf.json()
-+    return referer ? client.withHeader('Referer', referer) : client
++    return csrf.withHeader('Referer', REFERER)
 +  }
 +
-+  describe('POST /newsletter/subscribe', () => {
-+    it('stores a pending subscription with a token and redirects back to the referer', async () => {
-+      const email = uniqueEmail('subscribe')
-+      const client = await guest('http://localhost/posts')
++  async function subscribe(email: string) {
++    return NewsletterSubscription.forceCreate({ email, token: `token-for-${email}` })
++  }
 +
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect('http://localhost/posts')
-+
-+      const subscription = await NewsletterSubscription.first({ email })
-+      expect(subscription).not.toBeNull()
-+      expect(subscription?.confirmedAt).toBeNull()
-+      expect(subscription?.token.length).toBeGreaterThanOrEqual(16)
-+    })
-+
-+    it('falls back to the home page without a referer', async () => {
++  describe('subscribe', () => {
++    it('stores a pending subscription and returns to the referring page', async () => {
 +      const client = await guest()
-+      await client.post('/newsletter/subscribe', { email: uniqueEmail('noref') }).assertRedirect('/')
++
++      await client.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
++
++      const rows = await NewsletterSubscription.all()
++      expect(rows).toHaveLength(1)
++      expect(rows[0].email).toBe('reader@example.com')
++      expect(rows[0].confirmedAt).toBeNull()
++      expect(rows[0].token.length).toBeGreaterThanOrEqual(16)
 +    })
 +
-+    it('ignores an off-site referer', async () => {
-+      const client = await guest('https://evil.example/phish')
-+      await client.post('/newsletter/subscribe', { email: uniqueEmail('offsite') }).assertRedirect('/')
++    it('issues a different token for every subscription', async () => {
++      const client = await guest()
++
++      await client.post('/newsletter/subscribe', { email: 'first@example.com' }).assertRedirect()
++      await client.post('/newsletter/subscribe', { email: 'second@example.com' }).assertRedirect()
++
++      const [first, second] = await NewsletterSubscription.all()
++      expect(first.token).not.toBe(second.token)
 +    })
 +
-+    it('rejects an invalid email address without storing anything', async () => {
-+      const before = await NewsletterSubscription.newQuery().count()
-+      const client = await guest('http://localhost/')
++    it('ignores a token sent with the request', async () => {
++      const client = await guest()
 +
-+      await client.post('/newsletter/subscribe', { email: '' }).assertUnprocessable()
-+      const res = await client.post('/newsletter/subscribe', { email: 'not-an-email' })
-+      res.assertUnprocessable()
-+      const body = await res.json<{ errors: Record<string, string[]> }>()
-+      expect(body.errors.email?.length).toBeGreaterThan(0)
++      await client
++        .post('/newsletter/subscribe', { email: 'reader@example.com', token: 'chosen-by-the-visitor' })
++        .assertRedirect()
 +
-+      expect(await NewsletterSubscription.newQuery().count()).toBe(before)
++      const [row] = await NewsletterSubscription.all()
++      expect(row.token).not.toBe('chosen-by-the-visitor')
++    })
++
++    it('returns to the home page without a referer', async () => {
++      const csrf = await http.withCsrf()
++
++      await csrf.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect('/')
++    })
++
++    it('does not follow a referer on another origin', async () => {
++      const csrf = await http.withCsrf()
++
++      await csrf
++        .withHeader('Referer', 'https://elsewhere.example/landing')
++        .post('/newsletter/subscribe', { email: 'reader@example.com' })
++        .assertRedirect('/')
++    })
++
++    it.each(['', 'not-an-email'])('rejects the invalid address %p', async (email) => {
++      const client = await guest()
++
++      const response = await client.post('/newsletter/subscribe', { email }).assertUnprocessable()
++
++      const body = await response.json<{ errors: Record<string, string[]> }>()
++      expect(body.errors.email.length).toBeGreaterThan(0)
++      expect(await NewsletterSubscription.all()).toHaveLength(0)
++    })
++
++    it('rejects a request without an email', async () => {
++      const client = await guest()
++
++      await client.post('/newsletter/subscribe', {}).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toHaveLength(0)
 +    })
 +
 +    it('rejects an address that is already subscribed', async () => {
-+      const email = uniqueEmail('dupe')
-+      const client = await guest('http://localhost/')
++      const existing = await subscribe('reader@example.com')
++      const client = await guest()
 +
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect()
-+      const res = await client.post('/newsletter/subscribe', { email })
-+      res.assertUnprocessable()
-+      const body = await res.json<{ errors: Record<string, string[]> }>()
-+      expect(body.errors.email?.length).toBeGreaterThan(0)
++      const response = await client
++        .post('/newsletter/subscribe', { email: 'reader@example.com' })
++        .assertUnprocessable()
 +
-+      expect(await NewsletterSubscription.where({ email }).count()).toBe(1)
++      const body = await response.json<{ errors: Record<string, string[]> }>()
++      expect(body.errors.email.length).toBeGreaterThan(0)
++      expect(await NewsletterSubscription.all()).toEqual([existing])
++    })
++
++    it('treats a differently capitalised address as the same subscriber', async () => {
++      await subscribe('reader@example.com')
++      const client = await guest()
++
++      await client.post('/newsletter/subscribe', { email: 'Reader@Example.com' }).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toHaveLength(1)
 +    })
 +  })
 +
-+  describe('GET /newsletter/confirm/:token', () => {
-+    it('confirms the subscription and redirects home', async () => {
-+      const email = uniqueEmail('confirm')
-+      const client = await guest('http://localhost/')
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect()
-+      const pending = await NewsletterSubscription.first({ email })
++  describe('confirm', () => {
++    it('confirms the subscription and goes to the home page', async () => {
++      const pending = await subscribe('reader@example.com')
++      const other = await subscribe('other@example.com')
 +
-+      await http.get(`/newsletter/confirm/${pending?.token}`).assertRedirect('/')
++      await http.get(`/newsletter/confirm/${pending.token}`).assertRedirect('/')
 +
-+      const confirmed = await NewsletterSubscription.first({ email })
-+      expect(confirmed?.confirmedAt).toBeTruthy()
++      const confirmed = await NewsletterSubscription.findOrFail(pending.id)
++      expect(confirmed.confirmedAt).not.toBeNull()
++      expect(await NewsletterSubscription.findOrFail(other.id)).toEqual(other)
++    })
++
++    it('keeps the first confirmation time on a repeated visit', async () => {
++      const pending = await subscribe('reader@example.com')
++      await http.get(`/newsletter/confirm/${pending.token}`).assertRedirect('/')
++      const confirmed = await NewsletterSubscription.findOrFail(pending.id)
++
++      await http.get(`/newsletter/confirm/${pending.token}`).assertRedirect('/')
++
++      expect(await NewsletterSubscription.findOrFail(pending.id)).toEqual(confirmed)
 +    })
 +
 +    it('answers 404 for a token that was never issued', async () => {
-+      const email = uniqueEmail('unknown-token')
-+      const client = await guest('http://localhost/')
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect()
++      const pending = await subscribe('reader@example.com')
 +
-+      await http.get('/newsletter/confirm/never-issued-token-value').assertNotFound()
++      await http.get('/newsletter/confirm/never-issued-token').assertNotFound()
 +
-+      const untouched = await NewsletterSubscription.first({ email })
-+      expect(untouched?.confirmedAt).toBeNull()
++      expect(await NewsletterSubscription.all()).toEqual([pending])
 +    })
 +  })
 +
-+  describe('POST /newsletter/unsubscribe', () => {
-+    it('deletes only that address and redirects back', async () => {
-+      const gone = uniqueEmail('gone')
-+      const kept = uniqueEmail('kept')
-+      const client = await guest('http://localhost/posts/1')
-+      await client.post('/newsletter/subscribe', { email: gone }).assertRedirect()
-+      await client.post('/newsletter/subscribe', { email: kept }).assertRedirect()
++  describe('unsubscribe', () => {
++    it('deletes the subscription and returns to the referring page', async () => {
++      await subscribe('reader@example.com')
++      const other = await subscribe('other@example.com')
++      const client = await guest()
 +
-+      await client.post('/newsletter/unsubscribe', { email: gone }).assertRedirect('http://localhost/posts/1')
++      await client.post('/newsletter/unsubscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
 +
-+      expect(await NewsletterSubscription.first({ email: gone })).toBeNull()
-+      expect(await NewsletterSubscription.first({ email: kept })).not.toBeNull()
++      expect(await NewsletterSubscription.all()).toEqual([other])
 +    })
 +
-+    it('rejects an invalid email address', async () => {
-+      const client = await guest('http://localhost/')
++    it('returns to the home page without a referer', async () => {
++      await subscribe('reader@example.com')
++      const csrf = await http.withCsrf()
++
++      await csrf.post('/newsletter/unsubscribe', { email: 'reader@example.com' }).assertRedirect('/')
++    })
++
++    it('redirects for an address that is not subscribed', async () => {
++      const existing = await subscribe('reader@example.com')
++      const client = await guest()
++
++      await client.post('/newsletter/unsubscribe', { email: 'stranger@example.com' }).assertRedirect(REFERER)
++
++      expect(await NewsletterSubscription.all()).toEqual([existing])
++    })
++
++    it('rejects an invalid address', async () => {
++      const existing = await subscribe('reader@example.com')
++      const client = await guest()
++
 +      await client.post('/newsletter/unsubscribe', { email: 'not-an-email' }).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toEqual([existing])
++    })
++
++    it('refuses a request without a CSRF token', async () => {
++      const existing = await subscribe('reader@example.com')
++
++      await http.post('/newsletter/unsubscribe', { email: 'reader@example.com' }).assertForbidden()
++
++      expect(await NewsletterSubscription.all()).toEqual([existing])
 +    })
 +  })
 +})

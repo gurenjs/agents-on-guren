@@ -1,8 +1,8 @@
 diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
-index 61e4c73..6b7f057 100644
+index 61e4c73..4074c7e 100644
 --- a/.guren/api-client.gen.ts
 +++ b/.guren/api-client.gen.ts
-@@ -14,6 +14,14 @@ import type { Data } from './data.gen'
+@@ -14,6 +14,15 @@ import type { Data } from './data.gen'
   * `path` literal, the same string the server routes on.
   */
  export interface ApiRoutes {
@@ -13,11 +13,12 @@ index 61e4c73..6b7f057 100644
 +  'api.posts.store': {
 +    method: 'POST'
 +    path: '/api/posts'
++    body: { title: string; excerpt: string; body: string }
 +  }
    'dashboard': {
      method: 'GET'
      path: '/dashboard'
-@@ -74,6 +82,14 @@ export interface ApiRoutes {
+@@ -74,6 +83,14 @@ export interface ApiRoutes {
      method: 'GET'
      path: '/profile'
    }
@@ -32,7 +33,7 @@ index 61e4c73..6b7f057 100644
    'profile.update': {
      method: 'PUT'
      path: '/profile'
-@@ -303,6 +319,8 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+@@ -303,6 +320,8 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
  }
  
  const routes: Record<string, { method: string; path: string }> = {
@@ -41,7 +42,7 @@ index 61e4c73..6b7f057 100644
    'dashboard': { method: 'GET', path: '/dashboard' },
    'home': { method: 'GET', path: '/' },
    'login': { method: 'GET', path: '/login' },
-@@ -317,6 +335,8 @@ const routes: Record<string, { method: string; path: string }> = {
+@@ -317,6 +336,8 @@ const routes: Record<string, { method: string; path: string }> = {
    'posts.store': { method: 'POST', path: '/posts' },
    'posts.update': { method: 'PUT', path: '/posts/:id' },
    'profile.edit': { method: 'GET', path: '/profile' },
@@ -51,7 +52,7 @@ index 61e4c73..6b7f057 100644
    'register': { method: 'GET', path: '/register' },
    'register.store': { method: 'POST', path: '/register' },
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..5f96989 100644
+index 846382c..d0b99f5 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -2,6 +2,8 @@
@@ -96,42 +97,59 @@ index 846382c..5f96989 100644
      update: (query?: RouteQuery) => route('profile.update', query)
    },
    register: Object.assign(
-diff --git a/app/Http/Controllers/Api/ApiPostController.ts b/app/Http/Controllers/Api/ApiPostController.ts
+@@ -147,6 +161,7 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
++      'api.posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.search': { body: { keywords: string[]; limit: number } }
+       'posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.update': { body: { title: string; excerpt: string; body: string } }
+diff --git a/app/Http/Controllers/Api/PostController.ts b/app/Http/Controllers/Api/PostController.ts
 new file mode 100644
-index 0000000..74cd165
+index 0000000..7ffa2d4
 --- /dev/null
-+++ b/app/Http/Controllers/Api/ApiPostController.ts
-@@ -0,0 +1,37 @@
-+import { Controller } from '@guren/core'
++++ b/app/Http/Controllers/Api/PostController.ts
+@@ -0,0 +1,46 @@
++import { Controller, HttpException } from '@guren/core'
 +import { Post } from '../../../Models/Post.js'
 +import { PostResource } from '../../Resources/PostResource.js'
-+import { ApiCreatePostSchema } from '../../Validators/ApiValidator.js'
++import { PostPayloadSchema } from '../../Validators/PostValidator.js'
++
++export interface ApiAuthContext {
++  tokenId: number
++  userId: number
++}
 +
 +export default class ApiPostController extends Controller {
++  private getApiAuth(): ApiAuthContext {
++    const auth = this.ctx.get('apiAuth') as ApiAuthContext | undefined
++    if (!auth) {
++      throw HttpException.unauthorized('Unauthorized')
++    }
++    return auth
++  }
++
 +  async index(): Promise<Response> {
++    this.getApiAuth()
++
 +    const posts = await Post.newQuery()
 +      .with('author')
 +      .orderBy('id', 'desc')
 +      .get()
 +
 +    return this.json({
-+      data: PostResource.collection(posts),
++      data: posts.map(post => new PostResource(post).toJSON()),
 +    })
 +  }
 +
 +  async store(): Promise<Response> {
-+    const apiToken = this.ctx.get('apiToken')
-+    if (!apiToken) {
-+      return this.json({ message: 'Unauthorized' }, { status: 401 })
-+    }
-+
-+    const { title, excerpt, body } = await this.validateBody(ApiCreatePostSchema)
++    const auth = this.getApiAuth()
++    const data = await this.validateBody(PostPayloadSchema)
 +
 +    const post = await Post.forceCreate({
-+      title,
-+      excerpt,
-+      body,
-+      authorId: apiToken.userId,
++      ...data,
++      authorId: auth.userId,
 +    })
 +
 +    return this.json({
@@ -141,40 +159,35 @@ index 0000000..74cd165
 +}
 diff --git a/app/Http/Controllers/ProfileTokenController.ts b/app/Http/Controllers/ProfileTokenController.ts
 new file mode 100644
-index 0000000..debc7c6
+index 0000000..c8eb8b0
 --- /dev/null
 +++ b/app/Http/Controllers/ProfileTokenController.ts
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,36 @@
++import { z } from 'zod'
 +import { Controller, HttpException } from '@guren/core'
-+import { ApiToken } from '../../Models/ApiToken.js'
 +import type { UserRecord } from '../../Models/User.js'
-+import { CreateTokenSchema, TokenIdParamSchema } from '../Validators/TokenValidator.js'
-+import { createToken, hashToken } from '../../Services/TokenService.js'
++import { ApiToken } from '../../Models/ApiToken.js'
++import { TokenService } from '../../Services/TokenService.js'
++import { CreateTokenSchema } from '../Validators/TokenValidator.js'
 +
 +export default class ProfileTokenController extends Controller {
 +  async store(): Promise<Response> {
 +    const user = await this.auth.userOrFail<UserRecord>()
 +    const { name } = await this.validateBody(CreateTokenSchema)
 +
-+    const plainToken = createToken()
-+    const tokenHash = await hashToken(plainToken)
-+
-+    const token = await ApiToken.create({
++    const { token, hash } = TokenService.generateToken()
++    const apiToken = await ApiToken.create({
 +      userId: user.id,
 +      name,
-+      tokenHash,
++      hashedToken: hash,
 +    })
 +
-+    return this.json({
-+      id: token.id,
-+      name: token.name,
-+      token: plainToken,
-+    }, { status: 201 })
++    return this.json({ id: apiToken.id, name, token }, { status: 201 })
 +  }
 +
 +  async destroy(): Promise<Response> {
 +    const user = await this.auth.userOrFail<UserRecord>()
-+    const { id } = this.validateParams(TokenIdParamSchema)
++    const { id } = this.validateParams(z.object({ id: z.coerce.number().int().positive() }))
 +
 +    const token = await ApiToken.find(id)
 +    if (!token || token.userId !== user.id) {
@@ -183,105 +196,62 @@ index 0000000..debc7c6
 +
 +    await ApiToken.delete({ id })
 +
-+    return this.json({}, { status: 204 })
++    return this.text('', { status: 204 })
 +  }
 +}
-diff --git a/app/Http/Middleware/BearerTokenMiddleware.ts b/app/Http/Middleware/BearerTokenMiddleware.ts
+diff --git a/app/Http/Middleware/ApiAuthMiddleware.ts b/app/Http/Middleware/ApiAuthMiddleware.ts
 new file mode 100644
-index 0000000..4215f2d
+index 0000000..c168536
 --- /dev/null
-+++ b/app/Http/Middleware/BearerTokenMiddleware.ts
-@@ -0,0 +1,23 @@
++++ b/app/Http/Middleware/ApiAuthMiddleware.ts
+@@ -0,0 +1,31 @@
 +import { defineMiddleware } from '@guren/core'
-+import { ApiToken, type ApiTokenRecord } from '../../Models/ApiToken.js'
-+import { hashToken } from '../../Services/TokenService.js'
++import type { Context } from 'hono'
++import { ApiAuthService } from '../../Services/ApiAuthService.js'
++import { RateLimitService } from '../../Services/RateLimitService.js'
 +
-+export const bearerTokenMiddleware = defineMiddleware(async (c, next) => {
++export const apiAuthMiddleware = defineMiddleware(async (c: Context, next) => {
 +  const authHeader = c.req.header('Authorization')
++  const token = ApiAuthService.extractBearerToken(authHeader)
 +
-+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
++  if (!token) {
 +    return c.json({ message: 'Unauthorized' }, 401)
 +  }
 +
-+  const plainToken = authHeader.slice(7)
-+  const tokenHash = await hashToken(plainToken)
-+
-+  const apiToken = await ApiToken.first({ tokenHash })
-+
++  const apiToken = await ApiAuthService.authenticateToken(token)
 +  if (!apiToken) {
 +    return c.json({ message: 'Unauthorized' }, 401)
 +  }
 +
-+  c.set('apiToken', apiToken as ApiTokenRecord)
++  const rateLimitCheck = RateLimitService.checkAndIncrement(apiToken.id)
++  if (!rateLimitCheck.allowed) {
++    const retryAfter = rateLimitCheck.retryAfter || 60
++    return c.json({ message: 'Too Many Requests' }, { status: 429, headers: { 'Retry-After': String(retryAfter) } })
++  }
++
++  c.set('apiAuth', {
++    tokenId: apiToken.id,
++    userId: apiToken.userId,
++  })
++
 +  return next()
 +})
-diff --git a/app/Http/Middleware/RateLimitMiddleware.ts b/app/Http/Middleware/RateLimitMiddleware.ts
-new file mode 100644
-index 0000000..8e8c0e4
---- /dev/null
-+++ b/app/Http/Middleware/RateLimitMiddleware.ts
-@@ -0,0 +1,26 @@
-+import { defineMiddleware } from '@guren/core'
-+import { checkRateLimit } from '../../Services/RateLimiter.js'
-+
-+export const rateLimitMiddleware = defineMiddleware(async (c, next) => {
-+  const apiToken = c.get('apiToken')
-+
-+  if (!apiToken) {
-+    return await next()
-+  }
-+
-+  const result = checkRateLimit(apiToken.id, 60, 60000)
-+
-+  if (!result.allowed) {
-+    return c.json(
-+      { message: 'Too many requests' },
-+      {
-+        status: 429,
-+        headers: {
-+          'Retry-After': String(result.retryAfter),
-+        },
-+      }
-+    )
-+  }
-+
-+  return await next()
-+})
-diff --git a/app/Http/Validators/ApiValidator.ts b/app/Http/Validators/ApiValidator.ts
-new file mode 100644
-index 0000000..f1c5a4b
---- /dev/null
-+++ b/app/Http/Validators/ApiValidator.ts
-@@ -0,0 +1,9 @@
-+import { z } from 'zod'
-+
-+export const ApiCreatePostSchema = z.object({
-+  title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
-+  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
-+  body: z.string().trim().min(1, 'Body is required.'),
-+})
-+
-+export type ApiCreatePost = z.infer<typeof ApiCreatePostSchema>
 diff --git a/app/Http/Validators/TokenValidator.ts b/app/Http/Validators/TokenValidator.ts
 new file mode 100644
-index 0000000..35e19a3
+index 0000000..0c52e61
 --- /dev/null
 +++ b/app/Http/Validators/TokenValidator.ts
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,7 @@
 +import { z } from 'zod'
 +
 +export const CreateTokenSchema = z.object({
-+  name: z.string().trim().min(1, 'Token name is required.').max(50, 'Token name must be 50 characters or fewer.'),
++  name: z.string().trim().min(1, 'Name is required.').max(50, 'Name must be 50 characters or fewer.'),
 +})
 +
-+export type CreateToken = z.infer<typeof CreateTokenSchema>
-+
-+export const TokenIdParamSchema = z.object({
-+  id: z.coerce.number().int().positive(),
-+})
++export type CreateTokenPayload = z.infer<typeof CreateTokenSchema>
 diff --git a/app/Models/ApiToken.ts b/app/Models/ApiToken.ts
 new file mode 100644
-index 0000000..47a96c8
+index 0000000..36a11b5
 --- /dev/null
 +++ b/app/Models/ApiToken.ts
 @@ -0,0 +1,15 @@
@@ -292,7 +262,7 @@ index 0000000..47a96c8
 +export type ApiTokenRecord = typeof apiTokens.$inferSelect
 +
 +export class ApiToken extends defineModel(apiTokens, {
-+  fillable: ['userId', 'name', 'tokenHash'],
++  fillable: ['userId', 'name', 'hashedToken'],
 +}) {
 +  static override relationTypes: { user: BelongsToRecord<UserRecord> } = {
 +    user: null,
@@ -300,101 +270,146 @@ index 0000000..47a96c8
 +}
 +
 +ApiToken.belongsTo('user', () => import('./User.js').then((module) => module.User), 'userId', 'id')
-diff --git a/app/Services/RateLimiter.ts b/app/Services/RateLimiter.ts
+diff --git a/app/Services/ApiAuthService.ts b/app/Services/ApiAuthService.ts
 new file mode 100644
-index 0000000..5c58481
+index 0000000..3b8f502
 --- /dev/null
-+++ b/app/Services/RateLimiter.ts
-@@ -0,0 +1,39 @@
++++ b/app/Services/ApiAuthService.ts
+@@ -0,0 +1,36 @@
++import { ApiToken } from '../Models/ApiToken.js'
++import { TokenService } from './TokenService.js'
++
++export interface AuthenticatedApiToken {
++  id: number
++  userId: number
++  name: string
++}
++
++export class ApiAuthService {
++  static async authenticateToken(token: string): Promise<AuthenticatedApiToken | null> {
++    const tokens = await ApiToken.newQuery()
++      .where('hashedToken', TokenService.hashToken(token))
++      .get()
++
++    if (tokens.length === 0) {
++      return null
++    }
++
++    const apiToken = tokens[0]
++    return {
++      id: apiToken.id,
++      userId: apiToken.userId,
++      name: apiToken.name,
++    }
++  }
++
++  static extractBearerToken(authHeader: string | undefined): string | null {
++    if (!authHeader) return null
++    const parts = authHeader.split(' ')
++    if (parts.length !== 2 || parts[0].toLowerCase() !== 'bearer') {
++      return null
++    }
++    return parts[1]
++  }
++}
+diff --git a/app/Services/RateLimitService.ts b/app/Services/RateLimitService.ts
+new file mode 100644
+index 0000000..b41a839
+--- /dev/null
++++ b/app/Services/RateLimitService.ts
+@@ -0,0 +1,40 @@
 +interface RateLimitBucket {
 +  count: number
 +  resetAt: number
 +}
 +
-+const buckets = new Map<number, RateLimitBucket>()
++const buckets: Map<number, RateLimitBucket> = new Map()
 +
-+export function checkRateLimit(tokenId: number, limit: number = 60, windowMs: number = 60000): { allowed: boolean; retryAfter?: number } {
-+  const now = Date.now()
-+  let bucket = buckets.get(tokenId)
++const MAX_REQUESTS = 60
++const WINDOW_MS = 60 * 1000
 +
-+  if (!bucket || now >= bucket.resetAt) {
-+    bucket = { count: 0, resetAt: now + windowMs }
-+    buckets.set(tokenId, bucket)
-+  }
++export class RateLimitService {
++  static checkAndIncrement(tokenId: number): { allowed: boolean; retryAfter?: number } {
++    const now = Date.now()
++    const bucket = buckets.get(tokenId)
 +
-+  if (bucket.count >= limit) {
++    if (!bucket || bucket.resetAt <= now) {
++      buckets.set(tokenId, { count: 1, resetAt: now + WINDOW_MS })
++      return { allowed: true }
++    }
++
++    if (bucket.count < MAX_REQUESTS) {
++      bucket.count++
++      return { allowed: true }
++    }
++
 +    const retryAfter = Math.ceil((bucket.resetAt - now) / 1000)
 +    return { allowed: false, retryAfter }
 +  }
 +
-+  bucket.count++
-+  return { allowed: true }
++  static cleanup(): void {
++    const now = Date.now()
++    for (const [key, bucket] of buckets.entries()) {
++      if (bucket.resetAt <= now) {
++        buckets.delete(key)
++      }
++    }
++  }
 +}
 +
-+export function getRateLimitRetryAfter(tokenId: number, _windowMs: number = 60000): number | null {
-+  const now = Date.now()
-+  const bucket = buckets.get(tokenId)
-+
-+  if (!bucket || now >= bucket.resetAt) {
-+    return null
-+  }
-+
-+  if (bucket.count < 60) {
-+    return null
-+  }
-+
-+  return Math.ceil((bucket.resetAt - now) / 1000)
-+}
++setInterval(() => RateLimitService.cleanup(), 30000)
 diff --git a/app/Services/TokenService.ts b/app/Services/TokenService.ts
 new file mode 100644
-index 0000000..86a7888
+index 0000000..62aae4f
 --- /dev/null
 +++ b/app/Services/TokenService.ts
-@@ -0,0 +1,20 @@
-+import { randomBytes } from 'crypto'
+@@ -0,0 +1,22 @@
++import { createHash, randomBytes } from 'crypto'
 +
-+export function createToken(): string {
-+  // Generate a 32-byte random token (256 bits) = 43 characters in base64
-+  const randomPart = randomBytes(32).toString('base64url')
-+  const publicPart = randomBytes(4).toString('hex')
-+  return `${publicPart}|${randomPart}`
++export interface GeneratedToken {
++  token: string
++  hash: string
 +}
 +
-+export async function hashToken(token: string): Promise<string> {
-+  const encoder = new TextEncoder()
-+  const data = encoder.encode(token)
-+  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-+  return Buffer.from(hashBuffer).toString('hex')
-+}
++export class TokenService {
++  static generateToken(): GeneratedToken {
++    const token = randomBytes(24).toString('base64url')
++    const hash = createHash('sha256').update(token).digest('hex')
++    return { token, hash }
++  }
 +
-+export async function verifyToken(plainToken: string, hash: string): Promise<boolean> {
-+  const tokenHash = await hashToken(plainToken)
-+  return tokenHash === hash
++  static hashToken(token: string): string {
++    return createHash('sha256').update(token).digest('hex')
++  }
++
++  static verifyToken(token: string, hash: string): boolean {
++    return createHash('sha256').update(token).digest('hex') === hash
++  }
 +}
-diff --git a/db/migrations/20260925021744_create_api_tokens_table/migration.sql b/db/migrations/20260925021744_create_api_tokens_table/migration.sql
+diff --git a/db/migrations/20260929160618_create_api_tokens_table/migration.sql b/db/migrations/20260929160618_create_api_tokens_table/migration.sql
 new file mode 100644
-index 0000000..6cdb439
+index 0000000..4090763
 --- /dev/null
-+++ b/db/migrations/20260925021744_create_api_tokens_table/migration.sql
++++ b/db/migrations/20260929160618_create_api_tokens_table/migration.sql
 @@ -0,0 +1,8 @@
 +CREATE TABLE `api_tokens` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
 +	`user_id` integer NOT NULL,
 +	`name` text NOT NULL,
-+	`token_hash` text NOT NULL UNIQUE,
++	`hashed_token` text NOT NULL,
 +	`created_at` text NOT NULL,
 +	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
 +);
-diff --git a/db/migrations/20260925021744_create_api_tokens_table/snapshot.json b/db/migrations/20260925021744_create_api_tokens_table/snapshot.json
+diff --git a/db/migrations/20260929160618_create_api_tokens_table/snapshot.json b/db/migrations/20260929160618_create_api_tokens_table/snapshot.json
 new file mode 100644
-index 0000000..4307bf1
+index 0000000..8e5149b
 --- /dev/null
-+++ b/db/migrations/20260925021744_create_api_tokens_table/snapshot.json
-@@ -0,0 +1,278 @@
++++ b/db/migrations/20260929160618_create_api_tokens_table/snapshot.json
+@@ -0,0 +1,269 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "8ae96c77-59a5-48cf-9f4b-50939d3d1a8d",
++  "id": "3c239794-4743-4728-ad0a-089d988f44f9",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -447,7 +462,7 @@ index 0000000..4307bf1
 +      "autoincrement": false,
 +      "default": null,
 +      "generated": null,
-+      "name": "token_hash",
++      "name": "hashed_token",
 +      "entityType": "columns",
 +      "table": "api_tokens"
 +    },
@@ -650,15 +665,6 @@ index 0000000..4307bf1
 +    },
 +    {
 +      "columns": [
-+        "token_hash"
-+      ],
-+      "nameExplicit": false,
-+      "name": "api_tokens_token_hash_unique",
-+      "entityType": "uniques",
-+      "table": "api_tokens"
-+    },
-+    {
-+      "columns": [
 +        "email"
 +      ],
 +      "nameExplicit": false,
@@ -671,7 +677,7 @@ index 0000000..4307bf1
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..81715c3 100644
+index 47b96e5..425a0e6 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
 @@ -20,3 +20,13 @@ export const posts = sqliteTable('posts', {
@@ -685,28 +691,24 @@ index 47b96e5..81715c3 100644
 +    .notNull()
 +    .references(() => users.id),
 +  name: text('name').notNull(),
-+  tokenHash: text('token_hash').notNull().unique(),
++  hashedToken: text('hashed_token').notNull(),
 +  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
 +})
 diff --git a/routes/api.ts b/routes/api.ts
 new file mode 100644
-index 0000000..731c2c7
+index 0000000..4a53c96
 --- /dev/null
 +++ b/routes/api.ts
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,11 @@
 +import type { Router } from '@guren/core'
-+import { bearerTokenMiddleware } from '../app/Http/Middleware/BearerTokenMiddleware.js'
-+import { rateLimitMiddleware } from '../app/Http/Middleware/RateLimitMiddleware.js'
-+import ApiPostController from '../app/Http/Controllers/Api/ApiPostController.js'
++import ApiPostController from '../app/Http/Controllers/Api/PostController.js'
++import { PostPayloadSchema } from '../app/Http/Validators/PostValidator.js'
++import { apiAuthMiddleware } from '../app/Http/Middleware/ApiAuthMiddleware.js'
 +
-+export function registerApiRoutes(baseRouter: Router): void {
-+  baseRouter.group('/api', (router) => {
-+    router.get('/posts', {
-+      middlewares: [bearerTokenMiddleware, rateLimitMiddleware],
-+    }, [ApiPostController, 'index']).name('api.posts.index')
-+    router.post('/posts', {
-+      middlewares: [bearerTokenMiddleware, rateLimitMiddleware],
-+    }, [ApiPostController, 'store']).name('api.posts.store')
++export function registerApiRoutes(router: Router): void {
++  router.middleware(apiAuthMiddleware).group((api) => {
++    api.get('/posts', [ApiPostController, 'index']).name('api.posts.index')
++    api.post('/posts', { name: 'api.posts.store', body: PostPayloadSchema }, [ApiPostController, 'store'])
 +  })
 +}
 diff --git a/routes/auth.ts b/routes/auth.ts
@@ -730,7 +732,7 @@ index c559cad..e074bef 100644
    })
  }
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..8e6bca2 100644
+index 4c174ac..3226356 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
 @@ -4,6 +4,7 @@ import PostController from '../app/Http/Controllers/PostController.js'
@@ -745,221 +747,360 @@ index 4c174ac..8e6bca2 100644
    router.get('/health', (c) => c.json({ status: 'ok' }))
  
    registerAuthRoutes(router)
-+  registerApiRoutes(router)
++  router.group('/api', registerApiRoutes as any)
  
    router.group('/posts', (posts) => {
      // Registered before '/:id', or "create" is read as a post id.
-diff --git a/tests/ApiTokens.test.ts b/tests/ApiTokens.test.ts
+diff --git a/tests/ApiPostController.test.ts b/tests/ApiPostController.test.ts
 new file mode 100644
-index 0000000..28ea8d0
+index 0000000..cd763f4
 --- /dev/null
-+++ b/tests/ApiTokens.test.ts
-@@ -0,0 +1,208 @@
++++ b/tests/ApiPostController.test.ts
+@@ -0,0 +1,128 @@
 +import { describe, test, expect, beforeAll } from 'bun:test'
 +import app from '../src/app.js'
 +import { TestApp } from '@guren/testing'
 +import { User, type UserRecord } from '../app/Models/User.js'
++import { Post } from '../app/Models/Post.js'
 +import { ApiToken, type ApiTokenRecord } from '../app/Models/ApiToken.js'
-+import { resetDatabase } from '../config/database.js'
-+import { createToken, hashToken } from '../app/Services/TokenService.js'
++import { TokenService } from '../app/Services/TokenService.js'
 +
-+describe('API Tokens', () => {
++describe('ApiPostController', () => {
++  let http: TestApp
++  let user: UserRecord
++  let token: string
++  let _apiToken: ApiTokenRecord
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    user = await User.create({
++      name: 'Test User',
++      email: `api-post-${Date.now()}@example.com`,
++      password: 'password123',
++    })
++
++    const { token: plainToken, hash } = TokenService.generateToken()
++    token = plainToken
++    _apiToken = await ApiToken.create({
++      userId: user.id,
++      name: 'Test Token',
++      hashedToken: hash,
++    })
++
++    await Post.forceCreate({
++      title: 'First Post',
++      excerpt: 'First excerpt',
++      body: 'First body',
++      authorId: user.id,
++    })
++
++    await Post.forceCreate({
++      title: 'Second Post',
++      excerpt: 'Second excerpt',
++      body: 'Second body',
++      authorId: user.id,
++    })
++  })
++
++  test('GET /api/posts lists posts', async () => {
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .get('/api/posts')
++
++    expect(res.status).toBe(200)
++    const body = await res.json<{ data: any[] }>()
++    expect(body.data).toBeDefined()
++    expect(body.data.length).toBeGreaterThanOrEqual(2)
++    expect(body.data[0].title).toBeDefined()
++    expect(body.data[0].excerpt).toBeDefined()
++    expect(body.data[0].authorId).toBeDefined()
++    expect(body.data[0].createdAt).toBeDefined()
++  })
++
++  test('GET /api/posts returns 401 without token', async () => {
++    const res = await http.json().get('/api/posts')
++    expect(res.status).toBe(401)
++  })
++
++  test('GET /api/posts returns 401 with invalid token', async () => {
++    const res = await http
++      .withHeader('Authorization', 'Bearer invalid-token')
++      .json()
++      .get('/api/posts')
++
++    expect(res.status).toBe(401)
++  })
++
++  test('POST /api/posts creates post for token owner', async () => {
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .post('/api/posts', {
++        title: 'New Post',
++        excerpt: 'New excerpt',
++        body: 'New body',
++      })
++
++    expect(res.status).toBe(201)
++    const body = await res.json<{ data: any }>()
++    expect(body.data.title).toBe('New Post')
++    expect(body.data.excerpt).toBe('New excerpt')
++    expect(body.data.body).toBe('New body')
++    expect(body.data.authorId).toBe(user.id)
++  })
++
++  test('POST /api/posts returns 422 for invalid input', async () => {
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .post('/api/posts', {
++        title: '',
++        excerpt: 'New excerpt',
++        body: 'New body',
++      })
++
++    expect(res.status).toBe(422)
++  })
++
++  test('POST /api/posts ignores authorId in request', async () => {
++    const otherUser = await User.create({
++      name: 'Other User',
++      email: `api-other-${Date.now()}@example.com`,
++      password: 'password123',
++    })
++
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .post('/api/posts', {
++        title: 'Token Post',
++        excerpt: 'Token excerpt',
++        body: 'Token body',
++        authorId: otherUser.id,
++      })
++
++    expect(res.status).toBe(201)
++    const body = await res.json<{ data: any }>()
++    expect(body.data.authorId).toBe(user.id)
++  })
++})
+diff --git a/tests/ProfileTokenController.test.ts b/tests/ProfileTokenController.test.ts
+new file mode 100644
+index 0000000..b2ae9a6
+--- /dev/null
++++ b/tests/ProfileTokenController.test.ts
+@@ -0,0 +1,95 @@
++import { describe, test, expect, beforeAll } from 'bun:test'
++import app from '../src/app.js'
++import { TestApp } from '@guren/testing'
++import { User, type UserRecord } from '../app/Models/User.js'
++import { ApiToken } from '../app/Models/ApiToken.js'
++
++describe('ProfileTokenController', () => {
 +  let http: TestApp
 +  let user: UserRecord
 +
 +  beforeAll(async () => {
 +    http = await TestApp.fromApp(app)
-+    await resetDatabase()
-+
-+    user = (await User.create({
++    user = await User.create({
 +      name: 'Test User',
-+      email: 'test@example.com',
-+      password: 'password',
-+    })) as UserRecord
-+  })
-+
-+  describe('POST /profile/tokens', () => {
-+    test('creates token for authenticated user', async () => {
-+      const csrf = await http.actingAs(user).withCsrf()
-+      const response = await csrf.json().post('/profile/tokens', {
-+        name: 'Test Token',
-+      })
-+
-+      expect(response.status).toBe(201)
-+      const json = await response.json<{ id: number; name: string; token: string }>()
-+      expect(json.id).toBeDefined()
-+      expect(json.name).toBe('Test Token')
-+      expect(json.token).toBeDefined()
-+      expect(json.token).toMatch(/^[a-f0-9]{8}\|/)
-+    })
-+
-+    test('rejects empty name', async () => {
-+      const csrf = await http.actingAs(user).withCsrf()
-+      const response = await csrf.json().post('/profile/tokens', {
-+        name: '',
-+      })
-+
-+      expect(response.status).toBe(422)
-+    })
-+
-+    test('rejects name over 50 characters', async () => {
-+      const csrf = await http.actingAs(user).withCsrf()
-+      const response = await csrf.json().post('/profile/tokens', {
-+        name: 'a'.repeat(51),
-+      })
-+
-+      expect(response.status).toBe(422)
-+    })
-+
-+    test('rejects unauthenticated request', async () => {
-+      const response = await http.json().post('/profile/tokens', {
-+        name: 'Test Token',
-+      })
-+
-+      expect([403]).toContain(response.status)
++      email: `token-controller-${Date.now()}@example.com`,
++      password: 'password123',
 +    })
 +  })
 +
-+  describe('DELETE /profile/tokens/:id', () => {
-+    test('deletes own token', async () => {
-+      const plainToken = createToken()
-+      const tokenHash = await hashToken(plainToken)
++  test('POST /profile/tokens creates a token for authenticated user', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    const res = await csrf
++      .json()
++      .post('/profile/tokens', { name: 'My Token' })
 +
-+      const token = (await ApiToken.create({
-+        userId: user.id,
-+        name: 'Token to Delete',
-+        tokenHash,
-+      })) as ApiTokenRecord
++    expect(res.status).toBe(201)
++    const body = await res.json<{ id: number; name: string; token: string }>()
++    expect(body.name).toBe('My Token')
++    expect(body.token).toBeDefined()
++    expect(body.token.length).toBeGreaterThanOrEqual(16)
 +
-+      const csrf = await http.actingAs(user).withCsrf()
-+      const response = await csrf.json().delete(`/profile/tokens/${token.id}`)
-+
-+      expect(response.status).toBe(204)
-+
-+      const deleted = await ApiToken.find(token.id)
-+      expect(deleted).toBeNull()
-+    })
-+
-+    test('rejects delete of another user token', async () => {
-+      const otherUser = (await User.create({
-+        name: 'Other User',
-+        email: 'other@example.com',
-+        password: 'password',
-+      })) as UserRecord
-+
-+      const plainToken = createToken()
-+      const tokenHash = await hashToken(plainToken)
-+
-+      const token = (await ApiToken.create({
-+        userId: otherUser.id,
-+        name: 'Other Token',
-+        tokenHash,
-+      })) as ApiTokenRecord
-+
-+      const csrf = await http.actingAs(user).withCsrf()
-+      const response = await csrf.json().delete(`/profile/tokens/${token.id}`)
-+
-+      expect(response.status).toBe(404)
-+
-+      const stillExists = await ApiToken.find(token.id)
-+      expect(stillExists).toBeDefined()
-+    })
-+
-+    test('rejects unauthenticated delete', async () => {
-+      const response = await http.json().delete('/profile/tokens/1')
-+      expect([403]).toContain(response.status)
-+    })
++    const token = await ApiToken.find(body.id)
++    expect(token).toBeDefined()
++    expect(token?.name).toBe('My Token')
++    expect(token?.userId).toBe(user.id)
++    expect(token?.hashedToken).not.toBe(body.token)
 +  })
 +
-+  describe('GET /api/posts', () => {
-+    test('returns posts with valid bearer token', async () => {
-+      const plainToken = createToken()
-+      const tokenHash = await hashToken(plainToken)
++  test('POST /profile/tokens returns 422 for empty name', async () => {
++    const csrf = await http.actingAs(user).withCsrf()
++    const res = await csrf
++      .json()
++      .post('/profile/tokens', { name: '' })
 +
-+      await ApiToken.create({
-+        userId: user.id,
-+        name: 'API Token',
-+        tokenHash,
-+      })
++    expect(res.status).toBe(422)
++  })
 +
-+      const response = await http
-+        .withHeader('Authorization', `Bearer ${plainToken}`)
++  test('POST /profile/tokens returns 422 for name too long', async () => {
++    const longName = 'x'.repeat(51)
++    const csrf = await http.actingAs(user).withCsrf()
++    const res = await csrf
++      .json()
++      .post('/profile/tokens', { name: longName })
++
++    expect(res.status).toBe(422)
++  })
++
++  test('DELETE /profile/tokens/:id deletes token', async () => {
++    const token = await ApiToken.create({
++      userId: user.id,
++      name: 'Token to Delete',
++      hashedToken: 'somehash',
++    })
++
++    const csrf = await http.actingAs(user).withCsrf()
++    const res = await csrf.delete(`/profile/tokens/${token.id}`)
++
++    expect(res.status).toBe(204)
++
++    const deleted = await ApiToken.find(token.id)
++    expect(deleted).toBeNull()
++  })
++
++  test('DELETE /profile/tokens/:id returns 404 for other users token', async () => {
++    const otherUser = await User.create({
++      name: 'Other User',
++      email: `other-${Date.now()}@example.com`,
++      password: 'password123',
++    })
++
++    const token = await ApiToken.create({
++      userId: otherUser.id,
++      name: 'Other Token',
++      hashedToken: 'somehash',
++    })
++
++    const csrf = await http.actingAs(user).withCsrf()
++    const res = await csrf.delete(`/profile/tokens/${token.id}`)
++
++    expect(res.status).toBe(404)
++
++    const exists = await ApiToken.find(token.id)
++    expect(exists).toBeDefined()
++  })
++})
+diff --git a/tests/RateLimiting.test.ts b/tests/RateLimiting.test.ts
+new file mode 100644
+index 0000000..902a13b
+--- /dev/null
++++ b/tests/RateLimiting.test.ts
+@@ -0,0 +1,112 @@
++import { describe, test, expect, beforeAll, beforeEach } from 'bun:test'
++import app from '../src/app.js'
++import { TestApp } from '@guren/testing'
++import { User, type UserRecord } from '../app/Models/User.js'
++import { ApiToken } from '../app/Models/ApiToken.js'
++import { TokenService } from '../app/Services/TokenService.js'
++import { RateLimitService } from '../app/Services/RateLimitService.js'
++
++describe('Rate Limiting', () => {
++  let http: TestApp
++  let user: UserRecord
++  let token: string
++  let _tokenId: number
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++    user = await User.create({
++      name: 'Test User',
++      email: `rate-limit-${Date.now()}@example.com`,
++      password: 'password123',
++    })
++
++    const { token: plainToken, hash } = TokenService.generateToken()
++    token = plainToken
++    const apiToken = await ApiToken.create({
++      userId: user.id,
++      name: 'Test Token',
++      hashedToken: hash,
++    })
++    _tokenId = apiToken.id
++  })
++
++  beforeEach(async () => {
++    RateLimitService.cleanup()
++  })
++
++  test('allows 60 requests per minute', async () => {
++    for (let i = 0; i < 60; i++) {
++      const res = await http
++        .withHeader('Authorization', `Bearer ${token}`)
 +        .json()
 +        .get('/api/posts')
-+
-+      expect(response.status).toBe(200)
-+      const json = await response.json<{ data: unknown[] }>()
-+      expect(json.data).toBeInstanceOf(Array)
-+    })
-+
-+    test('returns 401 without bearer token', async () => {
-+      const response = await http.json().get('/api/posts')
-+      expect(response.status).toBe(401)
-+    })
-+
-+    test('returns 401 with invalid bearer token', async () => {
-+      const response = await http
-+        .withHeader('Authorization', 'Bearer invalid_token')
-+        .json()
-+        .get('/api/posts')
-+
-+      expect(response.status).toBe(401)
-+    })
++      expect(res.status).toBe(200)
++    }
 +  })
 +
-+  describe('POST /api/posts', () => {
-+    test('creates post with valid bearer token', async () => {
-+      const plainToken = createToken()
-+      const tokenHash = await hashToken(plainToken)
-+
-+      await ApiToken.create({
-+        userId: user.id,
-+        name: 'API Token 2',
-+        tokenHash,
-+      })
-+
-+      const response = await http
-+        .withHeader('Authorization', `Bearer ${plainToken}`)
++  test('returns 429 on 61st request', async () => {
++    for (let i = 0; i < 60; i++) {
++      await http
++        .withHeader('Authorization', `Bearer ${token}`)
 +        .json()
-+        .post('/api/posts', {
-+          title: 'Test Post',
-+          excerpt: 'Test excerpt',
-+          body: 'Test body',
-+        })
++        .get('/api/posts')
++    }
 +
-+      expect(response.status as number).toBe(201)
-+    })
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .get('/api/posts')
 +
-+    test('rejects invalid post data', async () => {
-+      const plainToken = createToken()
-+      const tokenHash = await hashToken(plainToken)
++    expect(res.status).toBe(429)
++  })
 +
-+      await ApiToken.create({
-+        userId: user.id,
-+        name: 'API Token 3',
-+        tokenHash,
-+      })
-+
-+      const response = await http
-+        .withHeader('Authorization', `Bearer ${plainToken}`)
++  test('includes Retry-After header on rate limit', async () => {
++    for (let i = 0; i < 60; i++) {
++      await http
++        .withHeader('Authorization', `Bearer ${token}`)
 +        .json()
-+        .post('/api/posts', {
-+          title: '',
-+          excerpt: 'Test excerpt',
-+          body: 'Test body',
-+        })
++        .get('/api/posts')
++    }
 +
-+      expect(response.status as number).toBe(422)
++    const res = await http
++      .withHeader('Authorization', `Bearer ${token}`)
++      .json()
++      .get('/api/posts')
++
++    expect(res.status).toBe(429)
++    const retryAfter = res.headers.get('Retry-After')
++    expect(retryAfter).toBeDefined()
++    const seconds = parseInt(retryAfter || '0', 10)
++    expect(seconds).toBeGreaterThan(0)
++    expect(seconds).toBeLessThanOrEqual(60)
++  })
++
++  test('rate limits are per token, not per user', async () => {
++    const otherUser = await User.create({
++      name: 'Other User',
++      email: `rate-other-${Date.now()}@example.com`,
++      password: 'password123',
 +    })
 +
-+    test('returns 403 without bearer token (CSRF protection)', async () => {
-+      const response = await http.json().post('/api/posts', {
-+        title: 'Test Post',
-+        excerpt: 'Test excerpt',
-+        body: 'Test body',
-+      })
-+
-+      expect(response.status).toBe(403)
++    const { token: otherToken, hash: otherHash } = TokenService.generateToken()
++    await ApiToken.create({
++      userId: otherUser.id,
++      name: 'Other Token',
++      hashedToken: otherHash,
 +    })
++
++    for (let i = 0; i < 60; i++) {
++      await http
++        .withHeader('Authorization', `Bearer ${token}`)
++        .json()
++        .get('/api/posts')
++    }
++
++    const res = await http
++      .withHeader('Authorization', `Bearer ${otherToken}`)
++      .json()
++      .get('/api/posts')
++
++    expect(res.status).toBe(200)
 +  })
 +})

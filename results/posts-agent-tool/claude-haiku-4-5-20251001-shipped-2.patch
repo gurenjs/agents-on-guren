@@ -1,6 +1,6 @@
 diff --git a/.guren/agents.gen.ts b/.guren/agents.gen.ts
 new file mode 100644
-index 0000000..798af81
+index 0000000..0a28c0d
 --- /dev/null
 +++ b/.guren/agents.gen.ts
 @@ -0,0 +1,132 @@
@@ -81,7 +81,7 @@ index 0000000..798af81
 +    routeName: "posts.store",
 +    method: "POST",
 +    path: "/posts",
-+    description: "Create a new post\n\nReturns: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}",
++    description: "Create a new blog post\n\nReturns: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}",
 +    inputSchema: {
 +      "type": "object",
 +      "properties": {
@@ -137,10 +137,22 @@ index 0000000..798af81
 +  'posts_store': Data.Post
 +}
 diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
-index 61e4c73..1034c76 100644
+index 61e4c73..089eeb4 100644
 --- a/.guren/api-client.gen.ts
 +++ b/.guren/api-client.gen.ts
-@@ -64,6 +64,7 @@ export interface ApiRoutes {
+@@ -34,6 +34,11 @@ export interface ApiRoutes {
+     method: 'POST'
+     path: '/logout'
+   }
++  'mcp.handle': {
++    method: 'POST'
++    path: '/mcp'
++    body: { jsonrpc: "2.0"; id?: string | number; method: string; params?: Record<string, unknown> }
++  }
+   'posts.create': {
+     method: 'GET'
+     path: '/posts/create'
+@@ -64,6 +69,7 @@ export interface ApiRoutes {
      method: 'POST'
      path: '/posts'
      body: { title: string; excerpt: string; body: string }
@@ -148,26 +160,300 @@ index 61e4c73..1034c76 100644
    }
    'posts.update': {
      method: 'PUT'
+@@ -308,6 +314,7 @@ const routes: Record<string, { method: string; path: string }> = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
++  'mcp.handle': { method: 'POST', path: '/mcp' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
+index 846382c..2b79994 100644
+--- a/.guren/routes.gen.ts
++++ b/.guren/routes.gen.ts
+@@ -7,6 +7,7 @@ export const routeManifest = {
+   'login': { method: 'GET', path: '/login' },
+   'login.store': { method: 'POST', path: '/login' },
+   'logout': { method: 'POST', path: '/logout' },
++  'mcp.handle': { method: 'POST', path: '/mcp' },
+   'posts.create': { method: 'GET', path: '/posts/create' },
+   'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
+   'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
+@@ -76,6 +77,9 @@ export const routes = {
+   }
+   ),
+   logout: (query?: RouteQuery) => route('logout', query),
++  mcp: {
++    handle: (query?: RouteQuery) => route('mcp.handle', query)
++  },
+   posts: {
+     create: (query?: RouteQuery) => route('posts.create', query),
+     destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
+@@ -147,6 +151,7 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
++      'mcp.handle': { body: { jsonrpc: "2.0"; id?: string | number; method: string; params?: Record<string, unknown> } }
+       'posts.search': { body: { keywords: string[]; limit: number } }
+       'posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.update': { body: { title: string; excerpt: string; body: string } }
+diff --git a/app/Http/Controllers/McpController.ts b/app/Http/Controllers/McpController.ts
+new file mode 100644
+index 0000000..0fcf1e6
+--- /dev/null
++++ b/app/Http/Controllers/McpController.ts
+@@ -0,0 +1,36 @@
++import { Controller, readBearerToken, verifyApiToken, HttpException, getRequestContainer } from '@guren/core'
++import { McpHandler } from '../../Mcp/McpHandler.js'
++
++export default class McpController extends Controller {
++  async handle(): Promise<Response> {
++    // Get authorization header
++    const authHeader = this.request.header('authorization')
++    const token = readBearerToken(authHeader)
++    if (!token) {
++      throw HttpException.unauthorized('Missing bearer token')
++    }
++
++    // Get container from context
++    const container = getRequestContainer(this.ctx)
++    if (!container) {
++      throw HttpException.internal('Container not available')
++    }
++
++    // Verify API token with configured store
++    try {
++      const store = container.make('api-token-store') as any
++      await verifyApiToken(token, store)
++    } catch {
++      throw HttpException.unauthorized('Invalid bearer token')
++    }
++
++    // Request body is already validated by route contract
++    const { body } = this.validated('mcp.handle')
++
++    // Handle MCP request
++    const handler = new McpHandler(container)
++    const response = await handler.handle(body as any, this.ctx)
++
++    return this.json(response)
++  }
++}
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..c716da1 100644
+index 8f702c5..f02daaf 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -71,8 +71,9 @@ export default class PostController extends Controller {
-     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+@@ -1,4 +1,4 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, paginate, type PaginatedPageProps, getApiToken } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+@@ -72,6 +72,11 @@ export default class PostController extends Controller {
      // it comes from the session, and a request must never be able to set it.
      const post = await Post.forceCreate({ ...data, authorId: author.id })
-+    const postWithAuthor = await Post.findWithOrFail(post!.id, 'author')
  
--    return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
-+    return this.json(new PostResource(postWithAuthor).toJSON(), { status: 201 })
++    // For API token (MCP agent) calls, return JSON; for web forms, redirect
++    const isApiCall = getApiToken(this.ctx) !== null
++    if (isApiCall) {
++      return this.json({ data: new PostResource(post).toJSON() }, { status: 201 })
++    }
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
    }
  
-   async edit(): Promise<Response> {
+diff --git a/app/Http/Validators/McpValidator.ts b/app/Http/Validators/McpValidator.ts
+new file mode 100644
+index 0000000..f6b7449
+--- /dev/null
++++ b/app/Http/Validators/McpValidator.ts
+@@ -0,0 +1,8 @@
++import { z } from 'zod'
++
++export const McpRequestSchema = z.object({
++  jsonrpc: z.literal('2.0'),
++  id: z.union([z.string(), z.number()]).optional(),
++  method: z.string(),
++  params: z.record(z.string(), z.unknown()).optional(),
++})
+diff --git a/app/Mcp/McpHandler.ts b/app/Mcp/McpHandler.ts
+new file mode 100644
+index 0000000..ca80a5e
+--- /dev/null
++++ b/app/Mcp/McpHandler.ts
+@@ -0,0 +1,147 @@
++import type { Context } from '@guren/core'
++import type { ContainerLike } from '@guren/core'
++import { agentTools, type AgentToolName } from '@/.guren/agents.gen'
++
++export interface McpRequest {
++  jsonrpc: '2.0'
++  id?: string | number
++  method: string
++  params?: Record<string, unknown>
++}
++
++export interface McpResponse {
++  jsonrpc: '2.0'
++  id?: string | number
++  result?: unknown
++  error?: { code: number; message: string }
++}
++
++export class McpHandler {
++  constructor(private container: ContainerLike) {}
++
++  async handle(request: McpRequest, _context: Context): Promise<McpResponse> {
++    try {
++      if (request.method === 'tools/list') {
++        return this.handleListTools()
++      }
++      if (request.method === 'tools/call') {
++        return await this.handleCallTool(request.params as any)
++      }
++      return {
++        jsonrpc: '2.0',
++        id: request.id,
++        error: { code: -32601, message: 'Method not found' },
++      }
++    } catch (error) {
++      return {
++        jsonrpc: '2.0',
++        id: request.id,
++        error: {
++          code: -32603,
++          message: error instanceof Error ? error.message : 'Internal error',
++        },
++      }
++    }
++  }
++
++  private handleListTools(): McpResponse {
++    const tools = Object.values(agentTools).map((tool) => ({
++      name: tool.toolName,
++      description: tool.description,
++      inputSchema: tool.inputSchema,
++      annotations: {
++        readOnly: tool.annotations.readOnlyHint ?? false,
++      },
++    }))
++
++    return {
++      jsonrpc: '2.0',
++      result: { tools },
++    }
++  }
++
++  private async handleCallTool(
++    params: { name: string; arguments: Record<string, unknown> }
++  ): Promise<McpResponse> {
++    const toolName = params.name as AgentToolName
++    const tool = agentTools[toolName]
++    if (!tool) {
++      return {
++        jsonrpc: '2.0',
++        error: { code: -32602, message: `Tool not found: ${params.name}` },
++      }
++    }
++
++    try {
++      // Build HTTP request from tool definition
++      const urlObj = new URL(tool.path, 'http://localhost')
++
++      // Prepare body for methods that accept body
++      let body: string | undefined
++      const bodyData: Record<string, unknown> = {}
++
++      Object.entries(params.arguments).forEach(([key, value]) => {
++        const source = tool.inputSources[key as keyof typeof tool.inputSources]
++        if (source === 'body') {
++          bodyData[key] = value
++        } else if (source === 'query') {
++          urlObj.searchParams.set(key, String(value))
++        }
++      })
++
++      if (Object.keys(bodyData).length > 0) {
++        body = JSON.stringify(bodyData)
++      }
++
++      // Create and dispatch request
++      const request = new Request(urlObj.toString(), {
++        method: tool.method,
++        headers: {
++          'Content-Type': 'application/json',
++        },
++        body,
++      })
++
++      const app = this.container.make('app') as any
++      const response = await app.fetch(request)
++      const responseData = await response.json()
++
++      // Format response
++      const isError = response.status >= 400
++      if (isError) {
++        return {
++          jsonrpc: '2.0',
++          result: {
++            isError: true,
++            content: [
++              {
++                type: 'text',
++                text: JSON.stringify(responseData),
++              },
++            ],
++          },
++        }
++      } else {
++        return {
++          jsonrpc: '2.0',
++          result: {
++            content: [
++              {
++                type: 'text',
++                text: JSON.stringify(responseData),
++              },
++            ],
++          },
++        }
++      }
++    } catch (error) {
++      return {
++        jsonrpc: '2.0',
++        error: {
++          code: -32603,
++          message: error instanceof Error ? error.message : 'Tool call failed',
++        },
++      }
++    }
++  }
++}
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..8034dac 100644
+index 4c174ac..20a4bb7 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
-@@ -24,7 +24,15 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -1,7 +1,9 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import McpController from '../app/Http/Controllers/McpController.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import { McpRequestSchema } from '../app/Http/Validators/McpValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+ 
+@@ -17,6 +19,9 @@ export function registerWebRoutes(baseRouter: Router): void {
+   // Health check endpoint for load balancers and uptime monitors
+   router.get('/health', (c) => c.json({ status: 'ok' }))
+ 
++  // MCP endpoint for AI agents
++  router.post('/mcp', { name: 'mcp.handle', body: McpRequestSchema }, [McpController, 'handle'])
++
+   registerAuthRoutes(router)
+ 
+   router.group('/posts', (posts) => {
+@@ -24,7 +29,15 @@ export function registerWebRoutes(baseRouter: Router): void {
      posts.middleware('auth').group((authed) => {
        authed.get('/create', [PostController, 'create']).name('posts.create')
        authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
@@ -178,20 +464,112 @@ index 4c174ac..8034dac 100644
 +        resource: PostResource,
 +        agent: {
 +          toolName: 'posts_store',
-+          description: 'Create a new post',
++          description: 'Create a new blog post',
 +        },
 +      }, [PostController, 'store'])
        authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
        authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
      })
-@@ -42,6 +50,10 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -42,6 +55,11 @@ export function registerWebRoutes(baseRouter: Router): void {
        // the client's json() comes back typed — no runtime validation, just the
        // type codegen already extracts from the Resource.
        resource: { data: [PostResource] },
 +      agent: {
 +        toolName: 'posts_search',
 +        description: 'Search posts by keywords',
++        readOnlyHint: true,
 +      },
      }, [PostController, 'search'])
    })
  }
+diff --git a/src/app.ts b/src/app.ts
+index 3789858..0759136 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -5,7 +5,7 @@
+ // on invalid input, refinements/transforms can run twice (fast path, then
+ // fallback), so keep .refine()/.transform() free of side effects.
+ import 'zod/compile'
+-import { createApp } from '@guren/core'
++import { createApp, MemoryApiTokenStore } from '@guren/core'
+ import AuthProvider from '../app/Providers/AuthProvider.js'
+ import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
+ import database from '../config/database.js'
+@@ -32,4 +32,7 @@ const app = createApp({
+   i18n: { supported: ['en'] },
+ })
+ 
++// Register API token store for MCP endpoint authentication
++app.container.singleton('api-token-store', () => new MemoryApiTokenStore())
++
+ export default app
+diff --git a/tests/McpController.test.ts b/tests/McpController.test.ts
+new file mode 100644
+index 0000000..5cb12a6
+--- /dev/null
++++ b/tests/McpController.test.ts
+@@ -0,0 +1,64 @@
++import { beforeAll, describe, it, expect } from 'bun:test'
++import { TestApp } from '@guren/testing'
++import { createApiToken, MemoryApiTokenStore } from '@guren/core'
++import app from '../src/app.js'
++
++describe('MCP endpoint', () => {
++  let http: TestApp
++  let bearerToken: string
++
++  beforeAll(async () => {
++    http = await TestApp.fromApp(app)
++
++    // Create a test API token
++    const tokenStore = app.container.make('api-token-store') as MemoryApiTokenStore
++    const result = await createApiToken(tokenStore, {
++      name: 'test-mcp-token',
++      userId: 1,
++      abilities: ['*'],
++    })
++    bearerToken = result.plainTextToken
++  })
++
++  it('lists available tools with valid bearer token', async () => {
++    const response = await http.withHeader('Authorization', `Bearer ${bearerToken}`)
++      .json()
++      .post('/mcp', {
++        jsonrpc: '2.0',
++        id: 1,
++        method: 'tools/list',
++      })
++
++    const data = (await response.json()) as any
++    expect(data.result.tools).toHaveLength(2)
++
++    const toolNames = data.result.tools.map((t: any) => t.name)
++    expect(toolNames).toContain('posts_search')
++    expect(toolNames).toContain('posts_store')
++
++    // Check annotations
++    const searchTool = data.result.tools.find((t: any) => t.name === 'posts_search')
++    expect(searchTool.annotations.readOnly).toBe(true)
++
++    const storeTool = data.result.tools.find((t: any) => t.name === 'posts_store')
++    expect(storeTool.annotations.readOnly).toBe(false)
++  })
++
++  it('returns error for unknown tool', async () => {
++    const response = await http.withHeader('Authorization', `Bearer ${bearerToken}`)
++      .json()
++      .post('/mcp', {
++        jsonrpc: '2.0',
++        id: 1,
++        method: 'tools/call',
++        params: {
++          name: 'unknown_tool',
++          arguments: {},
++        },
++      })
++
++    const data = (await response.json()) as any
++    expect(data.error).toBeDefined()
++    expect(data.error.code).toBe(-32602)
++  })
++})

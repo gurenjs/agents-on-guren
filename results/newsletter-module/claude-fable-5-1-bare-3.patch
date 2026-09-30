@@ -34,7 +34,7 @@ index 61e4c73..84a5ae4 100644
    'posts.destroy': { method: 'DELETE', path: '/posts/:id' },
    'posts.edit': { method: 'GET', path: '/posts/:id/edit' },
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..fa1acc3 100644
+index 846382c..409a4f7 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -7,6 +7,9 @@ export const routeManifest = {
@@ -59,20 +59,21 @@ index 846382c..fa1acc3 100644
    posts: {
      create: (query?: RouteQuery) => route('posts.create', query),
      destroy: (params: RouteParams<'posts.destroy'>, query?: RouteQuery) => route('posts.destroy', params, query),
-@@ -147,6 +155,8 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+@@ -147,6 +155,9 @@ function appendQueryString(path: string, query?: RouteQuery): string {
  declare module '@guren/core' {
    interface GurenRouteContracts {
      routes: {
++      'newsletter.confirm': { params: { token: string } }
 +      'newsletter.subscribe': { body: { email: string } }
 +      'newsletter.unsubscribe': { body: { email: string } }
        'posts.search': { body: { keywords: string[]; limit: number } }
        'posts.store': { body: { title: string; excerpt: string; body: string } }
        'posts.update': { body: { title: string; excerpt: string; body: string } }
-diff --git a/db/migrations/20260925064150_newsletter_subscriptions/migration.sql b/db/migrations/20260925064150_newsletter_subscriptions/migration.sql
+diff --git a/db/migrations/20260929173303_add_newsletter_subscriptions_table/migration.sql b/db/migrations/20260929173303_add_newsletter_subscriptions_table/migration.sql
 new file mode 100644
 index 0000000..6daab0d
 --- /dev/null
-+++ b/db/migrations/20260925064150_newsletter_subscriptions/migration.sql
++++ b/db/migrations/20260929173303_add_newsletter_subscriptions_table/migration.sql
 @@ -0,0 +1,7 @@
 +CREATE TABLE `newsletter_subscriptions` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +82,16 @@ index 0000000..6daab0d
 +	`confirmed_at` text,
 +	`created_at` text NOT NULL
 +);
-diff --git a/db/migrations/20260925064150_newsletter_subscriptions/snapshot.json b/db/migrations/20260925064150_newsletter_subscriptions/snapshot.json
+diff --git a/db/migrations/20260929173303_add_newsletter_subscriptions_table/snapshot.json b/db/migrations/20260929173303_add_newsletter_subscriptions_table/snapshot.json
 new file mode 100644
-index 0000000..4e85369
+index 0000000..63ddbc0
 --- /dev/null
-+++ b/db/migrations/20260925064150_newsletter_subscriptions/snapshot.json
++++ b/db/migrations/20260929173303_add_newsletter_subscriptions_table/snapshot.json
 @@ -0,0 +1,272 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "238f2d88-3494-4280-bc95-a5552e403aea",
++  "id": "cb72508e-4347-46dc-bb20-d9ac25e5093d",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -370,18 +371,70 @@ index 47b96e5..ee7c8bb 100644
  
  export const users = sqliteTable('users', {
    id: integer('id').primaryKey({ autoIncrement: true }),
+diff --git a/docs/adr/0002-keep-the-newsletter-as-a-self-contained-module.md b/docs/adr/0002-keep-the-newsletter-as-a-self-contained-module.md
+new file mode 100644
+index 0000000..99a8b59
+--- /dev/null
++++ b/docs/adr/0002-keep-the-newsletter-as-a-self-contained-module.md
+@@ -0,0 +1,45 @@
++---
++type: adr
++status: stable
++entities: [NewsletterSubscription]
++related: [guren.arch.ts, modules/newsletter/index.ts, modules/newsletter/db/schema.ts]
++generated: { by: "claude/fable-5.1", at: 2026-09-29T17:36:17.101Z }
++---
++
++# Keep the newsletter as a self-contained module
++
++## Context
++
++Readers can sign up for a newsletter, confirm the address through a
++tokenised link, and unsubscribe. The same sign-up ships with the next
++product, so it has to be lifted out of this application as is. Anything
++the blog imports from it would have to be untangled first.
++
++## Decision
++
++Everything newsletter-specific lives under `modules/newsletter/`: routes,
++controller, validators, model, table definition and tests. The
++application only *registers* it:
++
++- `src/app.ts` lists `newsletterModule` in `createApp({ modules })`, which
++  mounts its routes under `/newsletter`.
++- `db/schema.ts` re-exports `modules/newsletter/db/schema.ts`, so
++  `bun run db:make` and `bun run db:migrate` cover the module's table with
++  the project's one migrations folder.
++
++Nothing under `app/` or `routes/` may import from `modules/newsletter/`.
++The built-in module boundary of `guren check` still allows importing a
++module's `index.ts` and `db/schema.ts`, so `guren.arch.ts` adds a rule
++that disallows every import, type-only ones included. `bunx guren check`
++and `bunx guren check --arch` fail on a violation.
++
++## Consequences
++
++- Moving the newsletter to another Guren application is copying the
++  folder, registering the module, re-exporting its schema and generating
++  a migration there.
++- The blog cannot reuse newsletter code directly. Behaviour both need
++  belongs in shared code outside the module, or the blog reacts to events
++  the module dispatches.
++- The module's tests boot the host's `src/app.ts`, so they exercise the
++  host's real session and CSRF middleware rather than a copy of it.
 diff --git a/guren.arch.ts b/guren.arch.ts
 new file mode 100644
-index 0000000..88da4cc
+index 0000000..fde3e74
 --- /dev/null
 +++ b/guren.arch.ts
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,24 @@
 +import { defineArchRules } from '@guren/cli/arch'
 +
-+// Checked by `guren check --arch` (and so `guren gate`). The zero-config
-+// module boundary only guards a module's internals; these rules keep the
-+// blog itself from depending on modules at all, so a module can be lifted
-+// into another app as is.
++// Checked by `bunx guren check` (and `--arch` alone). The built-in module
++// boundary still lets outside code import a module's index.ts and
++// db/schema.ts; the rule below closes that for the blog, which must not
++// depend on the newsletter module at all. src/app.ts registers the module and
++// db/schema.ts re-exports its tables for migrations — neither is in `blog`.
 +export default defineArchRules({
 +  layers: {
 +    blog: ['app/**', 'routes/**'],
@@ -391,106 +444,108 @@ index 0000000..88da4cc
 +    {
 +      from: 'blog',
 +      disallow: 'newsletter',
++      // A type-only import is still a dependency that breaks when the module
++      // is lifted out, so it counts as a crossing too.
 +      includeTypeImports: true,
 +      message:
-+        'The blog must not know the newsletter module exists. Wire modules only through src/app.ts.',
++        'The newsletter module is self-contained: nothing under app/ or routes/ may import from modules/newsletter/. Register it in src/app.ts instead.',
 +    },
 +  ],
 +})
 diff --git a/modules/newsletter/app/Http/Controllers/NewsletterController.ts b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
 new file mode 100644
-index 0000000..6a7972e
+index 0000000..b343233
 --- /dev/null
 +++ b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
-@@ -0,0 +1,65 @@
-+import { Controller, ValidationException, abort, isSafeRedirectUrl, urlSafeToken } from '@guren/core'
+@@ -0,0 +1,54 @@
++import { Controller, ValidationException, isSafeRedirectUrl, urlSafeToken } from '@guren/core'
 +import { NewsletterSubscription } from '../../Models/NewsletterSubscription.js'
-+import { NewsletterTokenParamSchema } from '../Validators/NewsletterValidator.js'
 +
-+const CONFIRMATION_TOKEN_LENGTH = 40
++const TOKEN_LENGTH = 48
 +
 +export default class NewsletterController extends Controller {
 +  async subscribe(): Promise<Response> {
-+    const { body } = this.validated('newsletter.subscribe')
-+    const email = normalizeEmail(body.email)
++    const { email } = this.validated('newsletter.subscribe').body
 +
 +    const existing = await NewsletterSubscription.first({ email })
 +    if (existing) {
 +      throw ValidationException.withMessages({ email: 'This email address is already subscribed.' })
 +    }
 +
-+    // forceCreate, because `token` is deliberately absent from fillable: the
-+    // server issues it and a request must never be able to choose it.
-+    await NewsletterSubscription.forceCreate({
-+      email,
-+      token: urlSafeToken(CONFIRMATION_TOKEN_LENGTH),
-+    })
++    // forceCreate, because `token` is deliberately absent from
++    // NewsletterSubscription.fillable: a request must never be able to set it.
++    await NewsletterSubscription.forceCreate({ email, token: urlSafeToken(TOKEN_LENGTH) })
 +
 +    return this.redirectBack()
 +  }
 +
 +  async confirm(): Promise<Response> {
-+    const { token } = this.validateParams(NewsletterTokenParamSchema)
++    const { token } = this.validated('newsletter.confirm').params
++    const subscription = await NewsletterSubscription.findOrFail(token, 'token')
 +
-+    const subscription = await NewsletterSubscription.first({ token })
-+    if (!subscription) {
-+      abort(404, 'Unknown confirmation token.')
-+    }
-+
++    // Following the link again keeps the original confirmation time.
 +    if (!subscription.confirmedAt) {
-+      await NewsletterSubscription.forceUpdate({ id: subscription.id }, {
-+        confirmedAt: new Date().toISOString(),
-+      })
++      await NewsletterSubscription.forceUpdate(
++        { id: subscription.id },
++        { confirmedAt: new Date().toISOString() },
++      )
 +    }
 +
 +    return this.redirect('/')
 +  }
 +
 +  async unsubscribe(): Promise<Response> {
-+    const { body } = this.validated('newsletter.unsubscribe')
-+    const email = normalizeEmail(body.email)
-+
++    const { email } = this.validated('newsletter.unsubscribe').body
 +    await NewsletterSubscription.delete({ email })
 +
 +    return this.redirectBack()
 +  }
 +
-+  // Sends the visitor back to the page the form was on, or home when the
-+  // Referer is missing or points off-site.
++  // The Referer header is client-controlled, so only a page of this site is
++  // followed; anything else falls back to the home page.
 +  private redirectBack(): Response {
-+    const referer = this.request.header('referer')
-+    const target = referer && isSafeRedirectUrl(referer, this.request.url) ? referer : '/'
++    const referer = this.request.header('Referer')
++    if (!referer || !isSafeRedirectUrl(referer, this.request.url)) {
++      return this.redirect('/')
++    }
 +
-+    return this.redirect(target)
++    return this.redirect(referer)
 +  }
-+}
-+
-+function normalizeEmail(email: string): string {
-+  return email.trim().toLowerCase()
 +}
 diff --git a/modules/newsletter/app/Http/Validators/NewsletterValidator.ts b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
 new file mode 100644
-index 0000000..82f4f2b
+index 0000000..d55cdb1
 --- /dev/null
 +++ b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,22 @@
 +import { z } from 'zod'
 +
-+export const NewsletterEmailSchema = z.object({
-+  email: z.email('Enter a valid email address.').max(255, 'Email must be 255 characters or fewer.'),
-+})
++// Lowercased so one address cannot subscribe twice under different spellings,
++// and so unsubscribing finds the row whichever spelling the visitor types.
++const email = z
++  .string()
++  .trim()
++  .min(1, 'Email is required.')
++  .max(254, 'Email must be 254 characters or fewer.')
++  .toLowerCase()
++  .pipe(z.email('The email address is badly formatted.'))
 +
-+export type NewsletterEmailPayload = z.infer<typeof NewsletterEmailSchema>
++export const NewsletterSubscribeSchema = z.object({ email })
++
++export const NewsletterUnsubscribeSchema = z.object({ email })
 +
 +export const NewsletterTokenParamSchema = z.object({
-+  token: z.string().trim().min(1),
++  token: z.string().min(1),
 +})
++
++export type NewsletterSubscribeInput = z.infer<typeof NewsletterSubscribeSchema>
++export type NewsletterUnsubscribeInput = z.infer<typeof NewsletterUnsubscribeSchema>
 diff --git a/modules/newsletter/app/Models/NewsletterSubscription.ts b/modules/newsletter/app/Models/NewsletterSubscription.ts
 new file mode 100644
-index 0000000..e4e8ecc
+index 0000000..328c145
 --- /dev/null
 +++ b/modules/newsletter/app/Models/NewsletterSubscription.ts
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,13 @@
 +import { defineModel } from '@guren/core'
 +import { newsletterSubscriptions } from '../../db/schema.js'
 +
@@ -498,23 +553,23 @@ index 0000000..e4e8ecc
 +export type NewNewsletterSubscriptionRecord = typeof newsletterSubscriptions.$inferInsert
 +
 +export class NewsletterSubscription extends defineModel(newsletterSubscriptions, {
-+  // `token` and `confirmedAt` are set by the server, never from request input.
++  // `token` and `confirmedAt` are set by the module, never from request input.
 +  fillable: ['email'],
-+}) {}
++  // The token is the only proof of owning the address, so it never serializes.
++  hidden: ['token'],
++}) {
++}
 diff --git a/modules/newsletter/db/schema.ts b/modules/newsletter/db/schema.ts
 new file mode 100644
-index 0000000..8c76165
+index 0000000..6f4e5d8
 --- /dev/null
 +++ b/modules/newsletter/db/schema.ts
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,10 @@
 +import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
 +
-+// Owned by the newsletter module. Re-exported from the root db/schema.ts so
-+// drizzle-kit and `guren make:migration` see it alongside the app's tables.
 +export const newsletterSubscriptions = sqliteTable('newsletter_subscriptions', {
 +  id: integer('id').primaryKey({ autoIncrement: true }),
 +  email: text('email').notNull().unique(),
-+  // Random, unguessable confirmation token; the confirm link carries it.
 +  token: text('token').notNull().unique(),
 +  // Null until the visitor follows the confirmation link.
 +  confirmedAt: text('confirmed_at'),
@@ -536,150 +591,228 @@ index 0000000..376aa0c
 +})
 diff --git a/modules/newsletter/routes.ts b/modules/newsletter/routes.ts
 new file mode 100644
-index 0000000..f65cad9
+index 0000000..814b186
 --- /dev/null
 +++ b/modules/newsletter/routes.ts
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,16 @@
 +import type { Router } from '@guren/core'
 +import NewsletterController from './app/Http/Controllers/NewsletterController.js'
-+import { NewsletterEmailSchema } from './app/Http/Validators/NewsletterValidator.js'
++import {
++  NewsletterSubscribeSchema,
++  NewsletterTokenParamSchema,
++  NewsletterUnsubscribeSchema,
++} from './app/Http/Validators/NewsletterValidator.js'
 +
-+// Mounted under the module prefix (/newsletter). Every route is open to
-+// guests: a reader does not need an account to subscribe or unsubscribe.
++// Mounted under the module's `/newsletter` prefix. Open to guests and
++// signed-in visitors alike, so no auth middleware is applied.
 +export function registerNewsletterRoutes(router: Router): void {
-+  router.post('/subscribe', { name: 'newsletter.subscribe', body: NewsletterEmailSchema }, [NewsletterController, 'subscribe'])
-+  router.get('/confirm/:token', [NewsletterController, 'confirm']).name('newsletter.confirm')
-+  router.post('/unsubscribe', { name: 'newsletter.unsubscribe', body: NewsletterEmailSchema }, [NewsletterController, 'unsubscribe'])
++  router.post('/subscribe', { name: 'newsletter.subscribe', body: NewsletterSubscribeSchema }, [NewsletterController, 'subscribe'])
++  router.post('/unsubscribe', { name: 'newsletter.unsubscribe', body: NewsletterUnsubscribeSchema }, [NewsletterController, 'unsubscribe'])
++  // A GET that changes state, because it is followed from a link in an email.
++  router.get('/confirm/:token', { name: 'newsletter.confirm', params: NewsletterTokenParamSchema }, [NewsletterController, 'confirm'])
 +}
-diff --git a/modules/newsletter/tests/NewsletterController.test.ts b/modules/newsletter/tests/NewsletterController.test.ts
+diff --git a/modules/newsletter/tests/controllers/NewsletterController.test.ts b/modules/newsletter/tests/controllers/NewsletterController.test.ts
 new file mode 100644
-index 0000000..8c2b69c
+index 0000000..8b24ab5
 --- /dev/null
-+++ b/modules/newsletter/tests/NewsletterController.test.ts
-@@ -0,0 +1,99 @@
-+import { beforeAll, describe, expect, it } from 'bun:test'
++++ b/modules/newsletter/tests/controllers/NewsletterController.test.ts
+@@ -0,0 +1,165 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp } from '@guren/testing'
-+import app from '../../../src/app.js'
-+import { NewsletterSubscription } from '../app/Models/NewsletterSubscription.js'
++import app from '../../../../src/app.js'
++import { NewsletterSubscription } from '../../app/Models/NewsletterSubscription.js'
 +
-+// The test database persists between runs, so every address is unique per run.
-+const run = Date.now()
-+const address = (label: string): string => `${label}-${run}@example.com`
++const REFERER = 'http://localhost/posts?page=2'
 +
-+describe('newsletter', () => {
++// Boots the host application, so the module is exercised the way it is
++// mounted in production: behind the site's session and CSRF middleware.
++// `bun test` runs against the separate test database (see config/database.ts),
++// which booting the application migrates.
++describe('NewsletterController', () => {
 +  let http: TestApp
 +
 +  beforeAll(async () => {
-+    http = await TestApp.fromApp(app)
++    const guest = await TestApp.fromApp(app)
++    http = (await guest.withCsrf('/health')).withHeader('Referer', REFERER)
 +  })
 +
-+  // Mutating routes need the CSRF cookie a browser would carry; withCsrf primes it.
-+  async function guest(referer?: string) {
-+    const client = (await http.withCsrf()).json()
-+    return referer ? client.withHeader('Referer', referer) : client
++  beforeEach(async () => {
++    for (const subscription of await NewsletterSubscription.all()) {
++      await NewsletterSubscription.delete({ id: subscription.id })
++    }
++  })
++
++  async function subscribe(email: string): Promise<{ id: number; token: string }> {
++    await http.post('/newsletter/subscribe', { email }).assertRedirect(REFERER)
++    const subscription = await NewsletterSubscription.first({ email })
++    if (!subscription) {
++      throw new Error(`Expected a subscription for ${email}.`)
++    }
++    return subscription
 +  }
 +
-+  describe('POST /newsletter/subscribe', () => {
-+    it('stores a pending subscription with a token and redirects back', async () => {
-+      const email = address('subscribe')
-+      const client = await guest('http://localhost/posts')
++  describe('subscribe', () => {
++    it('stores a pending subscription and returns to the referring page', async () => {
++      await http.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
 +
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect('http://localhost/posts')
-+
-+      const subscription = await NewsletterSubscription.first({ email })
-+      expect(subscription).not.toBeNull()
-+      expect(subscription?.confirmedAt).toBeNull()
-+      expect(subscription?.token.length).toBeGreaterThanOrEqual(16)
++      const subscriptions = await NewsletterSubscription.all()
++      expect(subscriptions).toHaveLength(1)
++      expect(subscriptions[0]?.email).toBe('reader@example.com')
++      expect(subscriptions[0]?.confirmedAt).toBeNull()
++      expect(subscriptions[0]?.createdAt).toBeTruthy()
++      expect(subscriptions[0]?.token.length).toBeGreaterThanOrEqual(16)
 +    })
 +
-+    it('falls back to the home page without a Referer', async () => {
-+      const client = await guest()
++    it('issues a different token for every subscription', async () => {
++      const first = await subscribe('first@example.com')
++      const second = await subscribe('second@example.com')
 +
-+      await client.post('/newsletter/subscribe', { email: address('no-referer') }).assertRedirect('/')
++      expect(first.token).not.toBe(second.token)
 +    })
 +
-+    it('rejects an invalid email with a 422 under email', async () => {
-+      const client = await guest('http://localhost/')
-+      const before = await NewsletterSubscription.newQuery().count()
++    it('returns to the home page without a referring page', async () => {
++      const guest = await (await TestApp.fromApp(app)).withCsrf('/health')
 +
-+      const response = await client.post('/newsletter/subscribe', { email: 'not-an-email' }).assertStatus(422)
-+      const payload = (await response.raw.json()) as { errors: Record<string, string[]> }
-+      expect(payload.errors.email).toBeDefined()
++      await guest.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect('/')
++    })
 +
-+      await client.post('/newsletter/subscribe', { email: '' }).assertStatus(422)
-+      expect(await NewsletterSubscription.newQuery().count()).toBe(before)
++    it('does not follow a referring page on another site', async () => {
++      await http
++        .withHeader('Referer', 'https://evil.example/phish')
++        .post('/newsletter/subscribe', { email: 'reader@example.com' })
++        .assertRedirect('/')
++    })
++
++    it.each(['', 'not-an-email'])('rejects the invalid address %p', async (email) => {
++      const response = await http.post('/newsletter/subscribe', { email }).assertUnprocessable()
++
++      const body = await response.json<{ errors: Record<string, unknown> }>()
++      expect(body.errors).toHaveProperty('email')
++      expect(await NewsletterSubscription.all()).toHaveLength(0)
++    })
++
++    it('rejects a missing address', async () => {
++      await http.post('/newsletter/subscribe', {}).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toHaveLength(0)
 +    })
 +
 +    it('rejects an address that is already subscribed', async () => {
-+      const email = address('duplicate')
-+      const client = await guest('http://localhost/')
++      const existing = await subscribe('reader@example.com')
 +
-+      await client.post('/newsletter/subscribe', { email }).assertRedirect('http://localhost/')
-+      const response = await client.post('/newsletter/subscribe', { email }).assertStatus(422)
-+      const payload = (await response.raw.json()) as { errors: Record<string, string[]> }
-+      expect(payload.errors.email).toBeDefined()
++      const response = await http.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertUnprocessable()
 +
-+      expect(await NewsletterSubscription.where({ email }).count()).toBe(1)
++      const body = await response.json<{ errors: Record<string, unknown> }>()
++      expect(body.errors).toHaveProperty('email')
++      const subscriptions = await NewsletterSubscription.all()
++      expect(subscriptions).toHaveLength(1)
++      expect(subscriptions[0]?.token).toBe(existing.token)
++    })
++
++    it('treats a differently capitalised address as the same subscription', async () => {
++      await subscribe('reader@example.com')
++
++      await http.post('/newsletter/subscribe', { email: 'Reader@Example.com' }).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toHaveLength(1)
 +    })
 +  })
 +
-+  describe('GET /newsletter/confirm/:token', () => {
-+    it('marks the subscription confirmed and redirects home', async () => {
-+      const email = address('confirm')
-+      const client = await guest('http://localhost/')
-+      await client.post('/newsletter/subscribe', { email })
++  describe('confirm', () => {
++    it('confirms the subscription and goes to the home page', async () => {
++      const { id, token } = await subscribe('reader@example.com')
 +
-+      const pending = await NewsletterSubscription.first({ email })
-+      await http.get(`/newsletter/confirm/${pending!.token}`).assertRedirect('/')
++      await http.get(`/newsletter/confirm/${token}`).assertRedirect('/')
 +
-+      const confirmed = await NewsletterSubscription.first({ email })
-+      expect(confirmed?.confirmedAt).not.toBeNull()
++      const confirmed = await NewsletterSubscription.find(id)
++      expect(confirmed?.confirmedAt).toBeTruthy()
 +    })
 +
-+    it('answers 404 for a token that was never issued', async () => {
-+      await http.get('/newsletter/confirm/this-token-was-never-issued').assertStatus(404)
++    it('leaves other subscriptions pending', async () => {
++      const { token } = await subscribe('reader@example.com')
++      const other = await subscribe('other@example.com')
++
++      await http.get(`/newsletter/confirm/${token}`).assertRedirect('/')
++
++      expect((await NewsletterSubscription.find(other.id))?.confirmedAt).toBeNull()
++    })
++
++    it('answers 404 to a token that was never issued', async () => {
++      const { id } = await subscribe('reader@example.com')
++
++      await http.get('/newsletter/confirm/never-issued-token').assertNotFound()
++
++      expect((await NewsletterSubscription.find(id))?.confirmedAt).toBeNull()
 +    })
 +  })
 +
-+  describe('POST /newsletter/unsubscribe', () => {
-+    it('deletes only that subscription and redirects back', async () => {
-+      const leaving = address('leaving')
-+      const staying = address('staying')
-+      const client = await guest('http://localhost/posts')
-+      await client.post('/newsletter/subscribe', { email: leaving })
-+      await client.post('/newsletter/subscribe', { email: staying })
++  describe('unsubscribe', () => {
++    it('deletes the subscription and returns to the referring page', async () => {
++      await subscribe('reader@example.com')
++      await subscribe('other@example.com')
 +
-+      await client.post('/newsletter/unsubscribe', { email: leaving }).assertRedirect('http://localhost/posts')
++      await http.post('/newsletter/unsubscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
 +
-+      expect(await NewsletterSubscription.first({ email: leaving })).toBeNull()
-+      expect(await NewsletterSubscription.first({ email: staying })).not.toBeNull()
++      const remaining = await NewsletterSubscription.all()
++      expect(remaining.map((subscription) => subscription.email)).toEqual(['other@example.com'])
 +    })
++
++    it('returns to the referring page for an address that is not subscribed', async () => {
++      await subscribe('other@example.com')
++
++      await http.post('/newsletter/unsubscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
++
++      expect(await NewsletterSubscription.all()).toHaveLength(1)
++    })
++
++    it('rejects an invalid address', async () => {
++      await subscribe('other@example.com')
++
++      await http.post('/newsletter/unsubscribe', { email: 'not-an-email' }).assertUnprocessable()
++
++      expect(await NewsletterSubscription.all()).toHaveLength(1)
++    })
++  })
++
++  it('rejects a request without the CSRF token', async () => {
++    const guest = await TestApp.fromApp(app)
++
++    await guest.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertForbidden()
++
++    expect(await NewsletterSubscription.all()).toHaveLength(0)
 +  })
 +})
 diff --git a/src/app.ts b/src/app.ts
-index 3789858..acc9d30 100644
+index 3789858..845bd57 100644
 --- a/src/app.ts
 +++ b/src/app.ts
-@@ -12,8 +12,10 @@ import database from '../config/database.js'
+@@ -12,6 +12,7 @@ import database from '../config/database.js'
  import env from '../config/env.js'
  import http from '../config/http.js'
  import { registerWebRoutes } from '../routes/web.js'
-+import { newsletterModule } from '../modules/newsletter'
++import { newsletterModule } from '../modules/newsletter/index.js'
  
  const app = createApp({
-+  modules: [newsletterModule],
    // Rendered into every server-rendered document. Replace public/favicon.svg
-   // with your own artwork, or add more tags here (Open Graph, apple-touch-icon).
-   inertia: {
+@@ -25,6 +26,9 @@ const app = createApp({
+   config: [database, http],
+   auth: {},
+   routes: registerWebRoutes,
++  // Self-contained features under modules/<name>/, mounted after `routes`.
++  // Application code never imports from them — guren.arch.ts enforces it.
++  modules: [newsletterModule],
+   providers: [AuthProvider, AuthorizationProvider],
+   // Translations live in lang/<locale>/*.json. Add locales to `supported`
+   // and the request locale is detected from ?locale=, a locale cookie, or
 diff --git a/tsconfig.json b/tsconfig.json
-index a3264dc..325d33a 100644
+index a3264dc..cc7e5c4 100644
 --- a/tsconfig.json
 +++ b/tsconfig.json
-@@ -25,6 +25,7 @@
-     ".guren/**/*",
-     "src/**/*",
-     "app/**/*",
-+    "modules/**/*",
+@@ -28,6 +28,7 @@
      "config/**/*",
      "db/**/*",
      "routes/**/*",
++    "modules/**/*",
+     "resources/js/**/*",
+     "types/**/*",
+     "bin/**/*",

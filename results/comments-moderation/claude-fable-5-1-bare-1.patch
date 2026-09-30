@@ -33,14 +33,14 @@ index 61e4c73..0899dc4 100644
    'home': { method: 'GET', path: '/' },
    'login': { method: 'GET', path: '/login' },
 diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
-index 392ad58..12dd30a 100644
+index 392ad58..fa59f9f 100644
 --- a/.guren/data.gen.ts
 +++ b/.guren/data.gen.ts
 @@ -1,6 +1,7 @@
  // Generated from app/Http/Resources (and modules/*/app/Http/Resources) — DO NOT EDIT
  // Run `guren codegen` to regenerate.
  
-+import type { CommentRecord, CommentAuthorSummary } from '../app/Models/Comment.js'
++import type { CommentAuthorSummary } from '../app/Models/Comment.js'
  import type { PostRecord, PostAuthorSummary } from '../app/Models/Post.js'
  import type { WithRelations } from '@guren/core'
  
@@ -52,8 +52,8 @@ index 392ad58..12dd30a 100644
 +  id: number
 +  body: string
 +  author: CommentAuthorSummary
-+  // Serialized here because `created_at` is a string on SQLite and a Date on
-+  // PostgreSQL and MySQL — pages should not have to know which.
++  // Serialized for the same reason as PostResource: pages should not have to
++  // know how the database stores `created_at`.
 +  createdAt: string
 +}
 +
@@ -116,10 +116,10 @@ index 846382c..5a9e9a9 100644
        'posts.update': { body: { title: string; excerpt: string; body: string } }
 diff --git a/app/Http/Controllers/CommentController.ts b/app/Http/Controllers/CommentController.ts
 new file mode 100644
-index 0000000..ab28bbe
+index 0000000..c5c1df7
 --- /dev/null
 +++ b/app/Http/Controllers/CommentController.ts
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,59 @@
 +import { Controller } from '@guren/core'
 +import { Comment } from '../../Models/Comment.js'
 +import { CommentReport } from '../../Models/CommentReport.js'
@@ -130,15 +130,13 @@ index 0000000..ab28bbe
 +
 +export default class CommentController extends Controller {
 +  async store(): Promise<Response> {
++    await this.authorize('create', Comment)
 +    const { id } = this.validateParams(PostIdParamSchema)
 +    const post = await Post.findOrFail(id)
-+    await this.authorize('create', Comment)
 +    const author = await this.auth.userOrFail<UserRecord>()
 +    const { body: data } = this.validated('comments.store')
-+
 +    // forceCreate, because `postId` and `userId` are deliberately absent from
-+    // Comment.fillable: they come from the route and the session, never from
-+    // request input.
++    // Comment.fillable: they come from the route and the session.
 +    await Comment.forceCreate({ ...data, postId: post.id, userId: author.id })
 +
 +    return this.redirect(`/posts/${post.id}`)
@@ -146,15 +144,15 @@ index 0000000..ab28bbe
 +
 +  async destroy(): Promise<Response> {
 +    const { id } = this.validateParams(CommentIdParamSchema)
-+    // The post is loaded up front so CommentPolicy can let its author delete
-+    // comments left under it.
 +    const comment = await Comment.findWithOrFail(id, 'post')
 +    await this.authorize('delete', [Comment, comment])
 +
-+    // Reports go first: the schema cascades them, but SQLite only honours that
-+    // when foreign keys are enforced on the connection.
-+    await CommentReport.delete({ commentId: comment.id })
-+    await Comment.delete({ id: comment.id })
++    // Reports first: the foreign key cascade only runs on connections that
++    // enforce foreign keys, which SQLite leaves off by default.
++    await Comment.transaction(async (trx) => {
++      await CommentReport.inTransaction(trx).delete({ commentId: comment.id })
++      await Comment.inTransaction(trx).delete({ id: comment.id })
++    })
 +
 +    return this.redirect(`/posts/${comment.postId}`)
 +  }
@@ -165,24 +163,31 @@ index 0000000..ab28bbe
 +    await this.authorize('report', [Comment, comment])
 +    const reporter = await this.auth.userOrFail<UserRecord>()
 +
-+    // One row per reporter: a second report by the same user is a no-op, so
-+    // the count of rows is the count of distinct reporters.
-+    const alreadyReported = await CommentReport.where({ commentId: comment.id, userId: reporter.id }).exists()
-+    if (!alreadyReported) {
-+      await CommentReport.forceCreate({ commentId: comment.id, userId: reporter.id })
++    const report = { commentId: comment.id, userId: reporter.id }
++    if (!(await CommentReport.where(report).exists())) {
++      try {
++        await CommentReport.forceCreate(report)
++      } catch (error) {
++        // Two requests from the same user can both pass the check above; the
++        // unique index then rejects the second, which is still one report.
++        if (!(await CommentReport.where(report).exists())) {
++          throw error
++        }
++      }
 +    }
 +
 +    return this.noContent()
 +  }
 +}
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..4679ef1 100644
+index 8f702c5..1045947 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -1,7 +1,10 @@
- import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
+@@ -1,11 +1,15 @@
+-import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
++import { Controller, paginate, type PaginatedPageProps, type WithRelations } from '@guren/core'
  import { pages } from '@/.guren/pages.gen'
-+import { Comment, COMMENT_HIDE_THRESHOLD } from '../../Models/Comment.js'
++import { Comment } from '../../Models/Comment.js'
 +import { CommentReport } from '../../Models/CommentReport.js'
  import { Post } from '../../Models/Post.js'
  import type { UserRecord } from '../../Models/User.js'
@@ -190,59 +195,60 @@ index 8f702c5..4679ef1 100644
  import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
  import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
  
-@@ -53,9 +56,28 @@ export default class PostController extends Controller {
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
++type CommentWithAuthorAndReports = WithRelations<typeof Comment, ['author', 'reports']>
+ 
+ export default class PostController extends Controller {
+   async index(): Promise<Response> {
+@@ -53,9 +57,19 @@ export default class PostController extends Controller {
    async show(): Promise<Response> {
      const { id } = this.validateParams(PostIdParamSchema)
      const post = await Post.findWithOrFail(id, 'author')
 +    const comments = await Comment.newQuery()
-+      .with('author')
 +      .where('postId', post.id)
++      .with('author', 'reports')
 +      .orderBy('createdAt', 'asc')
++      // Comments written within the same millisecond keep their insert order.
 +      .orderBy('id', 'asc')
-+      .get()
-+
-+    // Reports are one row per distinct reporter (unique pair in the schema),
-+    // so a plain row count per comment is the reporter count. Hidden comments
-+    // stay in the table for later review; they just leave the page.
-+    const reportCounts = new Map<number, number>()
-+    if (comments.length > 0) {
-+      const reports = await CommentReport.whereIn('commentId', comments.map((comment) => comment.id)).get()
-+      for (const report of reports) {
-+        reportCounts.set(report.commentId, (reportCounts.get(report.commentId) ?? 0) + 1)
-+      }
-+    }
-+    const visible = comments.filter((comment) => (reportCounts.get(comment.id) ?? 0) < COMMENT_HIDE_THRESHOLD)
++      .get() as CommentWithAuthorAndReports[]
  
      return this.inertia(pages.posts.Show, {
        post: new PostResource(post).toJSON(),
-+      comments: visible.map((comment) => new CommentResource(comment).toJSON()),
++      comments: comments
++        .filter((comment) => !Comment.isHidden(comment.reports))
++        .map((comment) => new CommentResource(comment).toJSON()),
      })
    }
  
-@@ -101,6 +123,14 @@ export default class PostController extends Controller {
+@@ -101,7 +115,18 @@ export default class PostController extends Controller {
      const post = await Post.findOrFail(id)
      await this.authorize('delete', [Post, post])
  
-+    // Comments (and their reports) go with the post. The schema cascades both,
-+    // but SQLite only honours that when foreign keys are enforced on the
-+    // connection, so the rows are removed explicitly, children first.
-+    const commentIds = (await Comment.where({ postId: post.id }).select('id').get()).map((comment) => comment.id)
-+    if (commentIds.length > 0) {
-+      await CommentReport.whereIn('commentId', commentIds).delete()
-+      await Comment.delete({ postId: post.id })
-+    }
-     await Post.delete({ id: post.id })
+-    await Post.delete({ id: post.id })
++    // A post takes its comments, and their reports, with it. Deleted by hand
++    // rather than left to the foreign key cascade, which only runs on
++    // connections that enforce foreign keys — SQLite leaves that off by default.
++    await Post.transaction(async (trx) => {
++      const comments = await Comment.inTransaction(trx).where({ postId: post.id }).select('id').get()
++      await CommentReport.inTransaction(trx)
++        .newQuery()
++        .whereIn('commentId', comments.map((comment) => comment.id))
++        .delete()
++      await Comment.inTransaction(trx).delete({ postId: post.id })
++      await Post.inTransaction(trx).delete({ id: post.id })
++    })
  
      return this.redirect('/posts')
+   }
 diff --git a/app/Http/Resources/CommentResource.ts b/app/Http/Resources/CommentResource.ts
 new file mode 100644
-index 0000000..03d934e
+index 0000000..4f85b6a
 --- /dev/null
 +++ b/app/Http/Resources/CommentResource.ts
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,30 @@
 +import { Resource, type WithRelations } from '@guren/core'
 +import { Comment } from '../../Models/Comment.js'
-+import type { CommentRecord, CommentAuthorSummary } from '../../Models/Comment.js'
++import type { CommentAuthorSummary } from '../../Models/Comment.js'
 +
 +type CommentWithAuthor = WithRelations<typeof Comment, 'author'>
 +
@@ -250,24 +256,21 @@ index 0000000..03d934e
 +  id: number
 +  body: string
 +  author: CommentAuthorSummary
-+  // Serialized here because `created_at` is a string on SQLite and a Date on
-+  // PostgreSQL and MySQL — pages should not have to know which.
++  // Serialized for the same reason as PostResource: pages should not have to
++  // know how the database stores `created_at`.
 +  createdAt: string
 +}
 +
-+export class CommentResource extends Resource<CommentRecord | CommentWithAuthor, CommentResourceData> {
++export class CommentResource extends Resource<CommentWithAuthor, CommentResourceData> {
 +  toArray(): CommentResourceData {
 +    const comment = this.resource
-+    // The controller always eager-loads `author`; the record type alone cannot
-+    // say so, hence the cast.
-+    const author = (comment as CommentWithAuthor).author
 +
 +    return {
 +      id: comment.id,
 +      body: comment.body,
 +      author: {
-+        id: author?.id ?? comment.userId,
-+        name: author?.name ?? '',
++        id: comment.author?.id ?? comment.userId,
++        name: comment.author?.name ?? '',
 +      },
 +      createdAt: new Date(comment.createdAt).toISOString(),
 +    }
@@ -292,104 +295,91 @@ index 0000000..d7ef802
 +export type CommentPayload = z.infer<typeof CommentPayloadSchema>
 diff --git a/app/Models/Comment.ts b/app/Models/Comment.ts
 new file mode 100644
-index 0000000..63570c1
+index 0000000..f460d63
 --- /dev/null
 +++ b/app/Models/Comment.ts
-@@ -0,0 +1,28 @@
-+import { defineModel, type BelongsToRecord } from '@guren/core'
+@@ -0,0 +1,40 @@
++import { defineModel, type BelongsToRecord, type HasManyRecord } from '@guren/core'
 +import { comments } from '../../db/schema.js'
++import type { CommentReportRecord } from './CommentReport.js'
 +import type { PostRecord } from './Post.js'
 +import type { UserRecord } from './User.js'
 +
 +export type CommentRecord = typeof comments.$inferSelect
-+export type NewCommentRecord = typeof comments.$inferInsert
 +export type CommentAuthorSummary = Pick<UserRecord, 'id' | 'name'>
 +
-+/** Reports from this many distinct users hide a comment from the post page. */
-+export const COMMENT_HIDE_THRESHOLD = 3
++/** A comment reported by this many different users is hidden from the post page. */
++export const REPORTS_TO_HIDE = 3
 +
 +export class Comment extends defineModel(comments, {
-+  // `postId` comes from the route and `userId` from the session, never from
-+  // request input.
++  // `postId` comes from the route and `userId` from the signed-in user, never
++  // from request input.
 +  fillable: ['body'],
 +}) {
 +  static override relationTypes: {
 +    author: BelongsToRecord<CommentAuthorSummary>
 +    post: BelongsToRecord<PostRecord>
++    reports: HasManyRecord<CommentReportRecord>
 +  } = {
 +    author: null,
 +    post: null,
++    reports: [],
++  }
++
++  /**
++   * Whether enough different users reported the comment to hide it. Counts
++   * users rather than rows, so the rule holds even for rows written past the
++   * unique index on (`comment_id`, `user_id`).
++   */
++  static isHidden(reports: ReadonlyArray<Pick<CommentReportRecord, 'userId'>>): boolean {
++    return new Set(reports.map((report) => report.userId)).size >= REPORTS_TO_HIDE
 +  }
 +}
 +
 +Comment.belongsTo('author', () => import('./User.js').then((module) => module.User), 'userId', 'id')
 +Comment.belongsTo('post', () => import('./Post.js').then((module) => module.Post), 'postId', 'id')
++Comment.hasMany('reports', () => import('./CommentReport.js').then((module) => module.CommentReport), 'commentId', 'id')
 diff --git a/app/Models/CommentReport.ts b/app/Models/CommentReport.ts
 new file mode 100644
-index 0000000..37c891a
+index 0000000..df53334
 --- /dev/null
 +++ b/app/Models/CommentReport.ts
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,9 @@
 +import { defineModel } from '@guren/core'
 +import { commentReports } from '../../db/schema.js'
 +
 +export type CommentReportRecord = typeof commentReports.$inferSelect
 +
 +export class CommentReport extends defineModel(commentReports, {
-+  // Both columns come from the route and the session, so nothing here is
-+  // mass-assignable from request input.
++  // Both columns come from the route and the session, never from request input.
 +  fillable: [],
 +}) {}
-diff --git a/app/Models/Post.ts b/app/Models/Post.ts
-index ca838be..69d80ff 100644
---- a/app/Models/Post.ts
-+++ b/app/Models/Post.ts
-@@ -1,5 +1,6 @@
--import { defineModel, type BelongsToRecord } from '@guren/core'
-+import { defineModel, type BelongsToRecord, type HasManyRecord } from '@guren/core'
- import { posts } from '../../db/schema.js'
-+import type { CommentRecord } from './Comment.js'
- import type { UserRecord } from './User.js'
- 
- export type PostRecord = typeof posts.$inferSelect
-@@ -10,9 +11,14 @@ export class Post extends defineModel(posts, {
-   // `authorId` is set from the signed-in user, never from request input.
-   fillable: ['title', 'excerpt', 'body'],
- }) {
--  static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
-+  static override relationTypes: {
-+    author: BelongsToRecord<PostAuthorSummary>
-+    comments: HasManyRecord<CommentRecord>
-+  } = {
-     author: null,
-+    comments: [],
-   }
- }
- 
- Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
-+Post.hasMany('comments', () => import('./Comment.js').then((module) => module.Comment), 'postId', 'id')
 diff --git a/app/Policies/CommentPolicy.ts b/app/Policies/CommentPolicy.ts
 new file mode 100644
-index 0000000..8a6217d
+index 0000000..33c3151
 --- /dev/null
 +++ b/app/Policies/CommentPolicy.ts
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,32 @@
 +import { Policy, type AuthUser } from '@guren/core'
 +
 +interface CommentLike {
 +  userId: number
-+  // Loaded by the controller before authorizing, so the post's author can be
-+  // checked without a second policy call.
++  // The post the comment is on. Left unloaded, only the comment's own author
++  // passes `delete`.
 +  post?: { authorId: number } | null
 +}
 +
 +/**
 + * Bound to the Comment model in app/Providers/AuthorizationProvider.ts.
-+ * Any signed-in user can comment on or report a comment; only the comment's
-+ * author or the author of the post it sits on can delete it.
++ * Any signed-in user can comment and report; a comment can be deleted by
++ * whoever wrote it or by the author of the post it is on.
 + */
 +export class CommentPolicy extends Policy {
 +  create(user: AuthUser | null): boolean {
++    return user !== null
++  }
++
++  report(user: AuthUser | null, _comment: CommentLike): boolean {
 +    return user !== null
 +  }
 +
@@ -397,19 +387,16 @@ index 0000000..8a6217d
 +    if (user === null) {
 +      return false
 +    }
++
 +    const userId = Number(user.id)
 +    return userId === comment.userId || userId === comment.post?.authorId
 +  }
-+
-+  report(user: AuthUser | null, _comment: CommentLike): boolean {
-+    return user !== null
-+  }
 +}
 diff --git a/app/Providers/AuthorizationProvider.ts b/app/Providers/AuthorizationProvider.ts
-index 4f2bba9..764decf 100644
+index 4f2bba9..a4880fa 100644
 --- a/app/Providers/AuthorizationProvider.ts
 +++ b/app/Providers/AuthorizationProvider.ts
-@@ -1,5 +1,7 @@
+@@ -1,11 +1,13 @@
  import { ServiceProvider } from '@guren/core'
 +import { Comment } from '../Models/Comment.js'
  import { Post } from '../Models/Post.js'
@@ -417,30 +404,36 @@ index 4f2bba9..764decf 100644
  import { PostPolicy } from '../Policies/PostPolicy.js'
  
  /**
-@@ -13,6 +15,8 @@ export default class AuthorizationProvider extends ServiceProvider {
+- * Maps models to their policies. `PostController` calls `this.authorize()` in
+- * every mutating action, and without a registered policy the gate has nothing
+- * to consult and denies them all.
++ * Maps models to their policies. `PostController` and `CommentController` call
++ * `this.authorize()` in every mutating action, and without a registered policy
++ * the gate has nothing to consult and denies them all.
+  */
+ export default class AuthorizationProvider extends ServiceProvider {
+   register(): void {}
+@@ -13,6 +15,6 @@ export default class AuthorizationProvider extends ServiceProvider {
    // The framework's own provider binds the gate during registration, so this
    // runs in boot() — make('gate') throws before that.
    boot(): void {
 -    this.container.make('gate').policy(Post, PostPolicy)
-+    const gate = this.container.make('gate')
-+    gate.policy(Post, PostPolicy)
-+    gate.policy(Comment, CommentPolicy)
++    this.container.make('gate').policy(Post, PostPolicy).policy(Comment, CommentPolicy)
    }
  }
-diff --git a/db/migrations/20260925035236_add_comments/migration.sql b/db/migrations/20260925035236_add_comments/migration.sql
+diff --git a/db/migrations/20260929134330_add_comments/migration.sql b/db/migrations/20260929134330_add_comments/migration.sql
 new file mode 100644
-index 0000000..07fe947
+index 0000000..f0ee72a
 --- /dev/null
-+++ b/db/migrations/20260925035236_add_comments/migration.sql
-@@ -0,0 +1,19 @@
++++ b/db/migrations/20260929134330_add_comments/migration.sql
+@@ -0,0 +1,21 @@
 +CREATE TABLE `comment_reports` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
 +	`comment_id` integer NOT NULL,
 +	`user_id` integer NOT NULL,
-+	`created_at` text NOT NULL,
++	`created_at` text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,
 +	CONSTRAINT `fk_comment_reports_comment_id_comments_id_fk` FOREIGN KEY (`comment_id`) REFERENCES `comments`(`id`) ON DELETE CASCADE,
-+	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`),
-+	CONSTRAINT `comment_reports_comment_id_user_id_unique` UNIQUE(`comment_id`,`user_id`)
++	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
 +);
 +--> statement-breakpoint
 +CREATE TABLE `comments` (
@@ -448,20 +441,24 @@ index 0000000..07fe947
 +	`post_id` integer NOT NULL,
 +	`user_id` integer NOT NULL,
 +	`body` text NOT NULL,
-+	`created_at` text NOT NULL,
++	`created_at` text DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) NOT NULL,
 +	CONSTRAINT `fk_comments_post_id_posts_id_fk` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`) ON DELETE CASCADE,
 +	CONSTRAINT `fk_comments_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
 +);
-diff --git a/db/migrations/20260925035236_add_comments/snapshot.json b/db/migrations/20260925035236_add_comments/snapshot.json
++--> statement-breakpoint
++CREATE UNIQUE INDEX `comment_reports_comment_id_user_id_unique` ON `comment_reports` (`comment_id`,`user_id`);--> statement-breakpoint
++CREATE INDEX `comments_post_id_idx` ON `comments` (`post_id`);
+\ No newline at end of file
+diff --git a/db/migrations/20260929134330_add_comments/snapshot.json b/db/migrations/20260929134330_add_comments/snapshot.json
 new file mode 100644
-index 0000000..1e480b0
+index 0000000..3cb9fa6
 --- /dev/null
-+++ b/db/migrations/20260925035236_add_comments/snapshot.json
-@@ -0,0 +1,377 @@
++++ b/db/migrations/20260929134330_add_comments/snapshot.json
+@@ -0,0 +1,399 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "8a30795b-f43b-458c-99ff-1db09543deb9",
++  "id": "2aa43c04-1f70-4179-988e-6b903cd8a381",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -516,7 +513,7 @@ index 0000000..1e480b0
 +      "type": "text",
 +      "notNull": true,
 +      "autoincrement": false,
-+      "default": null,
++      "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
 +      "generated": null,
 +      "name": "created_at",
 +      "entityType": "columns",
@@ -566,7 +563,7 @@ index 0000000..1e480b0
 +      "type": "text",
 +      "notNull": true,
 +      "autoincrement": false,
-+      "default": null,
++      "default": "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
 +      "generated": null,
 +      "name": "created_at",
 +      "entityType": "columns",
@@ -815,13 +812,35 @@ index 0000000..1e480b0
 +    },
 +    {
 +      "columns": [
-+        "comment_id",
-+        "user_id"
++        {
++          "value": "comment_id",
++          "isExpression": false
++        },
++        {
++          "value": "user_id",
++          "isExpression": false
++        }
 +      ],
-+      "nameExplicit": true,
++      "isUnique": true,
++      "where": null,
++      "origin": "manual",
 +      "name": "comment_reports_comment_id_user_id_unique",
-+      "entityType": "uniques",
++      "entityType": "indexes",
 +      "table": "comment_reports"
++    },
++    {
++      "columns": [
++        {
++          "value": "post_id",
++          "isExpression": false
++        }
++      ],
++      "isUnique": false,
++      "where": null,
++      "origin": "manual",
++      "name": "comments_post_id_idx",
++      "entityType": "indexes",
++      "table": "comments"
 +    },
 +    {
 +      "columns": [
@@ -837,16 +856,20 @@ index 0000000..1e480b0
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..039d621 100644
+index 47b96e5..80bfe76 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
-@@ -1,4 +1,4 @@
+@@ -1,4 +1,8 @@
 -import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
-+import { sqliteTable, integer, text, unique } from '@guren/orm/drizzle/sqlite'
++import { sqliteTable, integer, text, uniqueIndex, index, sql } from '@guren/orm/drizzle/sqlite'
++
++// Same ISO 8601 shape the `$defaultFn` columns above write, but as a column
++// default: the review tooling reads and writes these tables without the ORM.
++const isoNow = sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`
  
  export const users = sqliteTable('users', {
    id: integer('id').primaryKey({ autoIncrement: true }),
-@@ -20,3 +20,32 @@ export const posts = sqliteTable('posts', {
+@@ -20,3 +24,31 @@ export const posts = sqliteTable('posts', {
      .references(() => users.id),
    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
  })
@@ -860,37 +883,95 @@ index 47b96e5..039d621 100644
 +    .notNull()
 +    .references(() => users.id),
 +  body: text('body').notNull(),
-+  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
-+})
++  createdAt: text('created_at').notNull().default(isoNow),
++}, (table) => [
++  index('comments_post_id_idx').on(table.postId),
++])
 +
-+// One row per (comment, reporter): the unique pair is what makes a repeated
-+// report by the same user count once.
-+export const commentReports = sqliteTable(
-+  'comment_reports',
-+  {
-+    id: integer('id').primaryKey({ autoIncrement: true }),
-+    commentId: integer('comment_id')
-+      .notNull()
-+      .references(() => comments.id, { onDelete: 'cascade' }),
-+    userId: integer('user_id')
-+      .notNull()
-+      .references(() => users.id),
-+    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
-+  },
-+  (table) => [unique('comment_reports_comment_id_user_id_unique').on(table.commentId, table.userId)],
-+)
++export const commentReports = sqliteTable('comment_reports', {
++  id: integer('id').primaryKey({ autoIncrement: true }),
++  commentId: integer('comment_id')
++    .notNull()
++    .references(() => comments.id, { onDelete: 'cascade' }),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id),
++  createdAt: text('created_at').notNull().default(isoNow),
++}, (table) => [
++  // One report per user per comment: a repeated report is a no-op.
++  uniqueIndex('comment_reports_comment_id_user_id_unique').on(table.commentId, table.userId),
++])
+diff --git a/docs/adr/0002-hide-reported-comments-and-delete-them-with-their-post.md b/docs/adr/0002-hide-reported-comments-and-delete-them-with-their-post.md
+new file mode 100644
+index 0000000..bb21295
+--- /dev/null
++++ b/docs/adr/0002-hide-reported-comments-and-delete-them-with-their-post.md
+@@ -0,0 +1,53 @@
++---
++type: adr
++status: draft
++entities: [Comment, CommentReport]
++related:
++  - app/Http/Controllers/CommentController.ts
++  - app/Http/Controllers/PostController.ts
++  - app/Http/Resources/CommentResource.ts
++  - app/Policies/CommentPolicy.ts
++  - db/schema.ts
++generated: { by: "claude-code/claude-fable-5-1", at: 2026-09-29T13:47:59.141Z }
++---
++
++# Hide reported comments and delete them with their post
++
++## Context
++
++Readers can comment on posts, and nobody moderates them: the community has
++to keep the comments clean. Reported comments must stay in the database for
++a review screen that does not exist yet, and the tooling for it reads the
++`comments` and `comment_reports` tables directly, without the ORM.
++
++## Decision
++
++- **Hiding is derived, not stored.** A comment is hidden once
++  `REPORTS_TO_HIDE` (3) different users reported it (`Comment.isHidden()`).
++  `PostController.show` leaves hidden comments out for every viewer, the
++  comment's author and the post's author included. There is no `hidden`
++  column to fall out of step with the reports.
++- **One report per user per comment**, held by the unique index on
++  (`comment_id`, `user_id`). Reporting again answers 204 and writes nothing.
++  Anyone signed in can report, the comment's own author included.
++- **Deleting is a hard delete**, allowed to the comment's author and the
++  author of the post it is on (`CommentPolicy.delete`). Being hidden does not
++  change who may delete a comment.
++- **Rows that go with a post or a comment are deleted by hand**, in one
++  transaction, children first. The foreign keys declare `ON DELETE CASCADE`
++  as well, but SQLite only enforces foreign keys on a connection that turned
++  them on, and the app's connection does not.
++- **`created_at` is a column default** on the two tables (the same ISO 8601
++  shape the other tables get from `$defaultFn`), so a row written without
++  the ORM is still complete.
++
++## Consequences
++
++- The post page loads the reports of every comment on it to decide what to
++  show. That is bounded by comments × reporters; if it grows, move the rule
++  into the query as a grouped count.
++- A comment's author can delete their comment after it was hidden, which
++  takes it away from the later review. Blocking that is a product decision
++  this ticket did not make.
++- Changing the threshold is a one-line change to `REPORTS_TO_HIDE` and
++  applies to existing comments at once, in both directions.
 diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
-index 537c81e..e00c98d 100644
+index 537c81e..c0ddb53 100644
 --- a/resources/js/pages/posts/Show.tsx
 +++ b/resources/js/pages/posts/Show.tsx
-@@ -1,17 +1,31 @@
+@@ -1,17 +1,52 @@
 -import { Head, Link, usePage } from '@inertiajs/react'
 +import { useState } from 'react'
 +import { Head, Link, router, useForm, usePage } from '@inertiajs/react'
 +import type { CommentResourceData } from '@/app/Http/Resources/CommentResource'
  import type { PostResourceData } from '@/app/Http/Resources/PostResource'
-+import { createApiClient, type ApiRoutes } from '@/.guren/api-client.gen'
  import { route } from '@/.guren/routes.gen'
++import { createApiClient, type ApiRoutes } from '@/.guren/api-client.gen'
  import Layout from '../../components/Layout.js'
  
  interface Props {
@@ -901,53 +982,132 @@ index 537c81e..e00c98d 100644
 -export default function PostShow({ post }: Props) {
 +type CommentFormData = ApiRoutes['comments.store']['body']
 +
++// comments.report answers 204 with no content, which is not an Inertia
++// response — the page calls it through the generated typed client instead.
++const api = createApiClient<ApiRoutes>({ baseUrl: '' })
++
 +const fieldClass =
 +  'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
-+
-+// comments.report answers 204 with no page to render, so it goes through the
-+// typed client rather than an Inertia visit; the client carries the CSRF token.
-+const api = createApiClient<ApiRoutes>({ baseUrl: '' })
 +
 +export default function PostShow({ post, comments }: Props) {
    const { props } = usePage<{ auth?: { user?: { id?: number } } }>()
 +  const viewerId = props.auth?.user?.id
++  const signedIn = viewerId !== undefined
    // Mirrors PostPolicy — the server rejects it either way, this only keeps
    // controls the viewer cannot use off the page.
 -  const canManage = props.auth?.user?.id === post.authorId
-+  const canManage = viewerId === post.authorId
++  const canManage = signedIn && viewerId === post.authorId
++
++  const form = useForm<CommentFormData>({ body: '' })
++  const [reported, setReported] = useState<number[]>([])
++  const [reportError, setReportError] = useState<string | null>(null)
++
++  async function report(commentId: number) {
++    setReportError(null)
++    try {
++      const response = await api.request('comments.report', { params: { id: commentId } })
++      if (!response.ok) {
++        setReportError('Could not report the comment — try again.')
++        return
++      }
++      setReported((ids) => [...ids, commentId])
++      // The report may have been the one that hides the comment.
++      router.reload({ only: ['comments'] })
++    } catch {
++      setReportError('Could not report the comment — check your connection and try again.')
++    }
++  }
  
    return (
      <Layout>
-@@ -53,6 +67,139 @@ export default function PostShow({ post }: Props) {
+@@ -53,6 +88,97 @@ export default function PostShow({ post }: Props) {
            ) : null}
          </footer>
        </article>
 +
-+      <section className="mt-12 space-y-6">
++      <section className="mt-10 space-y-6">
 +        <h2 className="text-xl font-bold text-g-heading">
-+          {comments.length === 0 ? 'Comments' : `Comments (${comments.length})`}
++          {comments.length} {comments.length === 1 ? 'comment' : 'comments'}
 +        </h2>
 +
-+        {comments.length === 0 ? (
-+          <p className="text-sm text-g-muted">No comments yet.</p>
-+        ) : (
-+          <ul className="space-y-4">
-+            {comments.map((comment) => (
-+              <CommentItem
-+                key={comment.id}
-+                comment={comment}
-+                viewerId={viewerId}
-+                // Mirrors CommentPolicy: the comment's author or the post's author.
-+                canDelete={viewerId !== undefined && (viewerId === comment.author.id || viewerId === post.authorId)}
-+              />
-+            ))}
-+          </ul>
-+        )}
++        {reportError !== null && <p className="text-sm text-g-danger">{reportError}</p>}
 +
-+        {viewerId !== undefined ? (
-+          <CommentForm postId={post.id} />
++        <div className="space-y-4">
++          {comments.map((comment) => {
++            // Mirrors CommentPolicy: the comment's author or the post's author.
++            const canDelete = signedIn && (viewerId === comment.author.id || viewerId === post.authorId)
++
++            return (
++              <article key={comment.id} className="rounded-g-card border border-g-line bg-g-panel p-5 shadow-g-card">
++                <p className="text-sm text-g-muted">
++                  {comment.author.name} · {new Date(comment.createdAt).toLocaleString()}
++                </p>
++                <div className="mt-2 whitespace-pre-wrap text-g-text">{comment.body}</div>
++                {signedIn ? (
++                  <div className="mt-3 flex items-center gap-4 text-sm">
++                    {reported.includes(comment.id) ? (
++                      <span className="text-g-muted">Reported</span>
++                    ) : (
++                      <button
++                        type="button"
++                        onClick={() => report(comment.id)}
++                        className="text-g-text-2 transition hover:text-g-heading"
++                      >
++                        Report
++                      </button>
++                    )}
++                    {canDelete ? (
++                      <Link
++                        href={route('comments.destroy', { id: comment.id })}
++                        method="delete"
++                        as="button"
++                        preserveScroll
++                        onBefore={() => window.confirm('Delete this comment?')}
++                        className="font-bold text-g-danger transition hover:underline"
++                      >
++                        Delete
++                      </Link>
++                    ) : null}
++                  </div>
++                ) : null}
++              </article>
++            )
++          })}
++        </div>
++
++        {signedIn ? (
++          <form
++            className="space-y-4"
++            onSubmit={(event) => {
++              event.preventDefault()
++              form.post(route('comments.store', { id: post.id }), {
++                preserveScroll: true,
++                onSuccess: () => form.reset(),
++              })
++            }}
++          >
++            <div>
++              <label className="block text-sm font-bold text-g-heading">Add a comment</label>
++              <textarea
++                rows={4}
++                maxLength={2000}
++                value={form.data.body}
++                onChange={(event) => form.setData('body', event.target.value)}
++                className={fieldClass}
++              />
++              {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
++            </div>
++
++            <button
++              type="submit"
++              disabled={form.processing}
++              className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
++            >
++              Comment
++            </button>
++          </form>
 +        ) : (
-+          <p className="text-sm text-g-muted">
++          <p className="text-sm text-g-text-2">
 +            <Link href={route('login')} className="text-g-accent-text transition hover:underline">
 +              Sign in
 +            </Link>{' '}
@@ -958,114 +1118,14 @@ index 537c81e..e00c98d 100644
      </Layout>
    )
  }
-+
-+function CommentForm({ postId }: { postId: number }) {
-+  const form = useForm<CommentFormData>({ body: '' })
-+
-+  return (
-+    <form
-+      className="space-y-3"
-+      onSubmit={(event) => {
-+        event.preventDefault()
-+        form.post(route('comments.store', { id: postId }), {
-+          preserveScroll: true,
-+          onSuccess: () => form.reset(),
-+        })
-+      }}
-+    >
-+      <div>
-+        <label className="block text-sm font-bold text-g-heading">Leave a comment</label>
-+        <textarea
-+          rows={4}
-+          maxLength={2000}
-+          value={form.data.body}
-+          onChange={(event) => form.setData('body', event.target.value)}
-+          className={fieldClass}
-+        />
-+        {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
-+      </div>
-+      <button
-+        type="submit"
-+        disabled={form.processing}
-+        className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
-+      >
-+        Post comment
-+      </button>
-+    </form>
-+  )
-+}
-+
-+interface CommentItemProps {
-+  comment: CommentResourceData
-+  viewerId: number | undefined
-+  canDelete: boolean
-+}
-+
-+function CommentItem({ comment, viewerId, canDelete }: CommentItemProps) {
-+  const [reported, setReported] = useState(false)
-+  const [reportError, setReportError] = useState<string | null>(null)
-+
-+  async function report() {
-+    setReportError(null)
-+    try {
-+      const response = await api.request('comments.report', { params: { id: comment.id } })
-+      if (!response.ok) {
-+        setReportError('Could not report this comment.')
-+        return
-+      }
-+      setReported(true)
-+      // Three reports hide the comment, so refresh the list in case this was
-+      // the one that tipped it.
-+      router.reload({ only: ['comments'] })
-+    } catch {
-+      setReportError('Could not report this comment.')
-+    }
-+  }
-+
-+  return (
-+    <li className="space-y-2 rounded-g-ctl border border-g-line bg-g-panel px-4 py-3">
-+      <p className="text-sm text-g-muted">
-+        <span className="font-bold text-g-heading">{comment.author.name}</span>
-+        {' · '}
-+        <time dateTime={comment.createdAt}>{new Date(comment.createdAt).toLocaleString()}</time>
-+      </p>
-+      <p className="whitespace-pre-wrap text-g-text">{comment.body}</p>
-+      {viewerId !== undefined ? (
-+        <div className="flex items-center gap-3 text-sm">
-+          {canDelete ? (
-+            <Link
-+              href={route('comments.destroy', { id: comment.id })}
-+              method="delete"
-+              as="button"
-+              preserveScroll
-+              onBefore={() => window.confirm('Delete this comment?')}
-+              className="text-g-danger transition hover:underline"
-+            >
-+              Delete
-+            </Link>
-+          ) : null}
-+          <button
-+            type="button"
-+            onClick={report}
-+            disabled={reported}
-+            className="text-g-text-2 transition hover:text-g-heading disabled:cursor-not-allowed disabled:opacity-45"
-+          >
-+            {reported ? 'Reported' : 'Report'}
-+          </button>
-+          {reportError ? <span className="text-g-danger">{reportError}</span> : null}
-+        </div>
-+      ) : null}
-+    </li>
-+  )
-+}
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..96e9b72 100644
+index 4c174ac..fdc2581 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
 @@ -1,6 +1,8 @@
  import { Router, requireAuthenticated, requireGuest } from '@guren/core'
- import HomeController from '../app/Http/Controllers/HomeController.js'
 +import CommentController from '../app/Http/Controllers/CommentController.js'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
  import PostController from '../app/Http/Controllers/PostController.js'
 +import { CommentPayloadSchema } from '../app/Http/Validators/CommentValidator.js'
  import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
@@ -1079,7 +1139,7 @@ index 4c174ac..96e9b72 100644
      })
  
      posts.get('/', [PostController, 'index']).name('posts.index')
-@@ -44,4 +47,12 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -44,4 +47,11 @@ export function registerWebRoutes(baseRouter: Router): void {
        resource: { data: [PostResource] },
      }, [PostController, 'search'])
    })
@@ -1087,133 +1147,327 @@ index 4c174ac..96e9b72 100644
 +  router.group('/comments', (comments) => {
 +    comments.middleware('auth').group((authed) => {
 +      authed.delete('/:id', { name: 'comments.destroy' }, [CommentController, 'destroy'])
-+      // Answers 204 every time: a repeat report by the same user counts once.
 +      authed.post('/:id/report', { name: 'comments.report' }, [CommentController, 'report'])
 +    })
 +  })
  }
 diff --git a/tests/CommentController.test.ts b/tests/CommentController.test.ts
 new file mode 100644
-index 0000000..0a991b5
+index 0000000..df232fd
 --- /dev/null
 +++ b/tests/CommentController.test.ts
-@@ -0,0 +1,119 @@
-+import { beforeAll, describe, expect, it } from 'bun:test'
+@@ -0,0 +1,314 @@
++import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp, readInertiaResponse } from '@guren/testing'
++import { sql } from 'drizzle-orm'
 +import app from '../src/app.js'
++import { getDatabase, resetDatabase } from '../config/database.js'
 +import { Comment } from '../app/Models/Comment.js'
 +import { CommentReport } from '../app/Models/CommentReport.js'
-+import { Post } from '../app/Models/Post.js'
++import { Post, type PostRecord } from '../app/Models/Post.js'
 +import { User, type UserRecord } from '../app/Models/User.js'
++import type { CommentResourceData } from '../app/Http/Resources/CommentResource.js'
 +
-+// Boots the real src/app.ts, which migrates the test database on boot, so
-+// these run against real tables. Fixtures carry a per-run suffix because the
-+// test database persists between runs.
-+const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-+
-+async function makeUser(label: string): Promise<UserRecord> {
-+  return User.create({ name: label, email: `${label}-${runId}@example.com`, password: 'secret' })
-+}
-+
-+async function makePost(author: UserRecord) {
-+  return Post.forceCreate({ title: `Post ${runId}`, excerpt: 'excerpt', body: 'body', authorId: author.id })
-+}
-+
-+async function pageComments(http: TestApp, postId: number) {
-+  const response = await http.get(`/posts/${postId}`).assertOk()
-+  const { payload } = await readInertiaResponse(response.raw)
-+  return payload.props.comments as Array<{ id: number; body: string; author: { id: number; name: string }; createdAt: string }>
-+}
-+
++// Feature tests against the real src/app.ts and the test database
++// (./data/guren.test.db), rebuilt from the migrations before every test.
 +describe('comments', () => {
 +  let http: TestApp
 +  let author: UserRecord
 +  let reader: UserRecord
 +  let stranger: UserRecord
++  let post: PostRecord
++
++  async function createUser(name: string): Promise<UserRecord> {
++    return User.create({ name, email: `${name.toLowerCase()}@example.com`, password: 'secret-password' })
++  }
++
++  async function createComment(user: UserRecord, body: string, createdAt?: string): Promise<number> {
++    const comment = await Comment.forceCreate({
++      postId: post.id,
++      userId: user.id,
++      body,
++      ...(createdAt ? { createdAt } : {}),
++    })
++    return comment.id
++  }
++
++  // Every mutating request needs a primed CSRF token, tied to that user's session.
++  async function as(user: UserRecord): Promise<TestApp> {
++    return http.actingAs(user).withCsrf()
++  }
++
++  async function commentsOnPage(client: TestApp = http): Promise<CommentResourceData[]> {
++    const response = await client.get(`/posts/${post.id}`)
++    response.assertOk()
++    const { payload } = await readInertiaResponse(response.raw)
++    expect(payload.component).toBe('posts/Show')
++    return payload.props.comments as CommentResourceData[]
++  }
 +
 +  beforeAll(async () => {
-+    // Mutating requests pass CSRF like a browser: the session and XSRF cookies
-+    // captured here ride along on every request below, whoever it acts as.
-+    http = await (await TestApp.fromApp(app)).withCsrf('/login')
-+    author = await makeUser('author')
-+    reader = await makeUser('reader')
-+    stranger = await makeUser('stranger')
++    http = await TestApp.fromApp(app)
 +  })
 +
-+  it('sends a guest to the login page and stores nothing', async () => {
-+    const post = await makePost(author)
-+    await http.post(`/posts/${post.id}/comments`, { body: 'hello' }).assertRedirect('/login')
-+    expect(await Comment.where({ postId: post.id }).count()).toBe(0)
++  beforeEach(async () => {
++    await resetDatabase()
++    author = await createUser('Author')
++    reader = await createUser('Reader')
++    stranger = await createUser('Stranger')
++    post = await Post.forceCreate({ title: 'A post', excerpt: 'An excerpt', body: 'A body', authorId: author.id })
 +  })
 +
-+  it('stores a signed-in user\'s comment and lists it oldest first with its author', async () => {
-+    const post = await makePost(author)
-+    await http.actingAs(reader).post(`/posts/${post.id}/comments`, { body: 'first' }).assertRedirect(`/posts/${post.id}`)
-+    await http.actingAs(author).post(`/posts/${post.id}/comments`, { body: 'second' }).assertRedirect(`/posts/${post.id}`)
++  describe('POST /posts/:id/comments', () => {
++    it('sends a guest to the login page and stores nothing', async () => {
++      const guest = await http.withCsrf()
 +
-+    const comments = await pageComments(http, post.id)
-+    expect(comments.map((comment) => comment.body)).toEqual(['first', 'second'])
-+    expect(comments[0]?.author).toEqual({ id: reader.id, name: reader.name })
-+    expect(new Date(comments[0]?.createdAt ?? '').toISOString()).toBe(comments[0]?.createdAt)
++      await guest.post(`/posts/${post.id}/comments`, { body: 'Hello' }).assertRedirect('/login')
 +
-+    const stored = await Comment.where({ postId: post.id }).orderBy('id', 'asc').get()
-+    expect(stored.map((comment) => comment.userId)).toEqual([reader.id, author.id])
++      expect(await Comment.all()).toHaveLength(0)
++    })
++
++    it('stores the comment for the signed-in user and redirects to the post', async () => {
++      const client = await as(reader)
++
++      await client.post(`/posts/${post.id}/comments`, { body: 'Nice post' }).assertRedirect(`/posts/${post.id}`)
++
++      const stored = await Comment.all()
++      expect(stored).toHaveLength(1)
++      expect(stored[0]).toMatchObject({ postId: post.id, userId: reader.id, body: 'Nice post' })
++    })
++
++    it('lets the author comment on their own post', async () => {
++      const client = await as(author)
++
++      await client.post(`/posts/${post.id}/comments`, { body: 'Thanks for reading' }).assertRedirect(`/posts/${post.id}`)
++
++      expect(await Comment.where({ userId: author.id }).count()).toBe(1)
++    })
++
++    it('ignores an author sent in the request', async () => {
++      const client = await as(reader)
++
++      await client.json().post(`/posts/${post.id}/comments`, { body: 'Mine', userId: stranger.id, postId: 999 })
++
++      const stored = await Comment.all()
++      for (const comment of stored) {
++        expect(comment).toMatchObject({ postId: post.id, userId: reader.id })
++      }
++    })
++
++    it('rejects an empty, blank or overlong body and stores nothing', async () => {
++      const client = (await as(reader)).json()
++
++      await client.post(`/posts/${post.id}/comments`, {}).assertUnprocessable()
++      await client.post(`/posts/${post.id}/comments`, { body: '' }).assertUnprocessable()
++      await client.post(`/posts/${post.id}/comments`, { body: '   ' }).assertUnprocessable()
++      await client.post(`/posts/${post.id}/comments`, { body: 'x'.repeat(2001) }).assertUnprocessable()
++
++      expect(await Comment.all()).toHaveLength(0)
++    })
++
++    it('accepts a body of exactly 2000 characters', async () => {
++      const client = await as(reader)
++
++      await client.post(`/posts/${post.id}/comments`, { body: 'x'.repeat(2000) }).assertRedirect(`/posts/${post.id}`)
++
++      expect(await Comment.all()).toHaveLength(1)
++    })
++
++    it('answers 404 for a post that does not exist', async () => {
++      const client = await as(reader)
++
++      await client.post('/posts/999/comments', { body: 'Hello' }).assertNotFound()
++
++      expect(await Comment.all()).toHaveLength(0)
++    })
 +  })
 +
-+  it('rejects an empty or oversized body the way an invalid post does', async () => {
-+    const post = await makePost(author)
-+    await http.actingAs(reader).json().post(`/posts/${post.id}/comments`, { body: '' }).assertStatus(422)
-+    await http.actingAs(reader).json().post(`/posts/${post.id}/comments`, { body: 'x'.repeat(2001) }).assertStatus(422)
-+    expect(await Comment.where({ postId: post.id }).count()).toBe(0)
++  describe('GET /posts/:id', () => {
++    it('lists the comments oldest first, each with its author', async () => {
++      await createComment(reader, 'Second', '2026-01-02T00:00:00.000Z')
++      const first = await createComment(stranger, 'First', '2026-01-01T00:00:00.000Z')
++
++      const comments = await commentsOnPage()
++
++      expect(comments.map((comment) => comment.body)).toEqual(['First', 'Second'])
++      expect(comments[0]).toEqual({
++        id: first,
++        body: 'First',
++        author: { id: stranger.id, name: 'Stranger' },
++        createdAt: '2026-01-01T00:00:00.000Z',
++      })
++    })
++
++    it('leaves out the comments of other posts', async () => {
++      const other = await Post.forceCreate({ title: 'Other', excerpt: 'Other', body: 'Other', authorId: author.id })
++      await Comment.forceCreate({ postId: other.id, userId: reader.id, body: 'Elsewhere' })
++
++      expect(await commentsOnPage()).toEqual([])
++    })
 +  })
 +
-+  it('lets the comment author or the post author delete, and nobody else', async () => {
-+    const post = await makePost(author)
-+    const mine = await Comment.forceCreate({ postId: post.id, userId: reader.id, body: 'mine' })
-+    const theirs = await Comment.forceCreate({ postId: post.id, userId: reader.id, body: 'theirs' })
++  describe('DELETE /comments/:id', () => {
++    it('sends a guest to the login page and keeps the comment', async () => {
++      const id = await createComment(reader, 'Hello')
++      const guest = await http.withCsrf()
 +
-+    await http.actingAs(stranger).delete(`/comments/${mine.id}`).assertStatus(403)
-+    expect(await Comment.find(mine.id)).not.toBeNull()
++      await guest.delete(`/comments/${id}`).assertRedirect('/login')
 +
-+    await http.actingAs(reader).delete(`/comments/${mine.id}`).assertRedirect(`/posts/${post.id}`)
-+    expect(await Comment.find(mine.id)).toBeNull()
++      expect(await Comment.find(id)).not.toBeNull()
++    })
 +
-+    await http.actingAs(author).delete(`/comments/${theirs.id}`).assertRedirect(`/posts/${post.id}`)
-+    expect(await Comment.find(theirs.id)).toBeNull()
++    it('lets the comment author delete it', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(reader)
++
++      await client.delete(`/comments/${id}`).assertRedirect(`/posts/${post.id}`)
++
++      expect(await Comment.find(id)).toBeNull()
++    })
++
++    it('lets the post author delete it', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(author)
++
++      await client.delete(`/comments/${id}`).assertRedirect(`/posts/${post.id}`)
++
++      expect(await Comment.find(id)).toBeNull()
++    })
++
++    it('answers 403 to anyone else and keeps the comment', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(stranger)
++
++      await client.delete(`/comments/${id}`).assertForbidden()
++
++      expect(await Comment.find(id)).not.toBeNull()
++    })
++
++    it('answers 404 for a comment that does not exist', async () => {
++      const client = await as(reader)
++
++      await client.delete('/comments/999').assertNotFound()
++    })
 +  })
 +
-+  it('answers 204 to every report and counts each user once', async () => {
-+    const post = await makePost(author)
-+    const comment = await Comment.forceCreate({ postId: post.id, userId: reader.id, body: 'spam?' })
++  describe('POST /comments/:id/report', () => {
++    it('sends a guest to the login page and stores nothing', async () => {
++      const id = await createComment(reader, 'Hello')
++      const guest = await http.withCsrf()
 +
-+    await http.actingAs(stranger).post(`/comments/${comment.id}/report`).assertNoContent()
-+    await http.actingAs(stranger).post(`/comments/${comment.id}/report`).assertNoContent()
-+    expect(await CommentReport.where({ commentId: comment.id }).count()).toBe(1)
-+    await http.post(`/comments/${comment.id}/report`).assertRedirect('/login')
++      await guest.post(`/comments/${id}/report`).assertRedirect('/login')
++
++      expect(await CommentReport.all()).toHaveLength(0)
++    })
++
++    it('answers 204 with no content and stores the report', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(stranger)
++
++      const response = await client.post(`/comments/${id}/report`)
++
++      response.assertNoContent()
++      expect(await response.text()).toBe('')
++      expect(await CommentReport.all()).toMatchObject([{ commentId: id, userId: stranger.id }])
++    })
++
++    it('counts a repeated report by the same user once', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(stranger)
++
++      await client.post(`/comments/${id}/report`).assertNoContent()
++      await client.post(`/comments/${id}/report`).assertNoContent()
++
++      expect(await CommentReport.where({ commentId: id }).count()).toBe(1)
++    })
++
++    it('keeps a comment visible when one user reports it three times', async () => {
++      const id = await createComment(reader, 'Hello')
++      const client = await as(stranger)
++
++      for (let attempt = 0; attempt < 3; attempt++) {
++        await client.post(`/comments/${id}/report`).assertNoContent()
++      }
++
++      expect((await commentsOnPage()).map((comment) => comment.id)).toEqual([id])
++    })
++
++    it('keeps a comment visible below three reporters', async () => {
++      const id = await createComment(reader, 'Hello')
++
++      for (const reporter of [author, stranger]) {
++        await (await as(reporter)).post(`/comments/${id}/report`).assertNoContent()
++      }
++
++      expect((await commentsOnPage()).map((comment) => comment.id)).toEqual([id])
++    })
++
++    it('hides a comment from everyone once three different users reported it', async () => {
++      const kept = await createComment(stranger, 'Fine')
++      const id = await createComment(reader, 'Spam')
++
++      for (const reporter of [author, reader, stranger]) {
++        await (await as(reporter)).post(`/comments/${id}/report`).assertNoContent()
++      }
++
++      for (const viewer of [http, http.actingAs(reader), http.actingAs(author)]) {
++        expect((await commentsOnPage(viewer)).map((comment) => comment.id)).toEqual([kept])
++      }
++      // Hidden, not deleted: the row stays for review.
++      expect(await Comment.find(id)).not.toBeNull()
++    })
++
++    it('answers 404 for a comment that does not exist', async () => {
++      const client = await as(reader)
++
++      await client.post('/comments/999/report').assertNotFound()
++    })
 +  })
 +
-+  it('hides a comment from the page after three distinct reporters but keeps the row', async () => {
-+    const post = await makePost(author)
-+    const comment = await Comment.forceCreate({ postId: post.id, userId: reader.id, body: 'reported' })
-+    const fourth = await makeUser('fourth')
++  // resetDatabase() leaves foreign keys enforced, while a connection the app
++  // opens itself keeps SQLite's default and enforces none — so the rows that
++  // go with a post or a comment are checked both ways.
++  describe.each(['ON', 'OFF'])('cascading deletes with foreign keys %s', (foreignKeys) => {
++    beforeEach(async () => {
++      const db = (await getDatabase()) as { run(query: unknown): unknown }
++      db.run(sql.raw(`PRAGMA foreign_keys = ${foreignKeys}`))
++    })
 +
-+    await http.actingAs(author).post(`/comments/${comment.id}/report`).assertNoContent()
-+    await http.actingAs(stranger).post(`/comments/${comment.id}/report`).assertNoContent()
-+    expect((await pageComments(http.actingAs(reader), post.id)).map((c) => c.id)).toEqual([comment.id])
++    it('deletes the reports of a comment with it', async () => {
++      const kept = await createComment(stranger, 'Hi')
++      await CommentReport.forceCreate({ commentId: kept, userId: reader.id })
++      const id = await createComment(reader, 'Hello')
++      await CommentReport.forceCreate({ commentId: id, userId: stranger.id })
++      const client = await as(reader)
 +
-+    await http.actingAs(fourth).post(`/comments/${comment.id}/report`).assertNoContent()
-+    expect(await pageComments(http.actingAs(reader), post.id)).toEqual([])
-+    expect(await pageComments(http.actingAs(author), post.id)).toEqual([])
-+    expect(await Comment.find(comment.id)).not.toBeNull()
-+  })
++      await client.delete(`/comments/${id}`).assertRedirect(`/posts/${post.id}`)
 +
-+  it('removes a post\'s comments and their reports with the post', async () => {
-+    const post = await makePost(author)
-+    const comment = await Comment.forceCreate({ postId: post.id, userId: reader.id, body: 'gone soon' })
-+    await http.actingAs(stranger).post(`/comments/${comment.id}/report`).assertNoContent()
++      expect(await Comment.all()).toMatchObject([{ id: kept }])
++      expect(await CommentReport.all()).toMatchObject([{ commentId: kept }])
++    })
 +
-+    await http.actingAs(author).delete(`/posts/${post.id}`).assertRedirect('/posts')
-+    expect(await Comment.where({ postId: post.id }).count()).toBe(0)
-+    expect(await CommentReport.where({ commentId: comment.id }).count()).toBe(0)
++    it('deletes the comments of a post, and their reports, with it', async () => {
++      const other = await Post.forceCreate({ title: 'Other', excerpt: 'Other', body: 'Other', authorId: author.id })
++      const elsewhere = await Comment.forceCreate({ postId: other.id, userId: reader.id, body: 'Elsewhere' })
++      await CommentReport.forceCreate({ commentId: elsewhere.id, userId: stranger.id })
++      const id = await createComment(reader, 'Hello')
++      await createComment(stranger, 'Hi')
++      await CommentReport.forceCreate({ commentId: id, userId: stranger.id })
++      const client = await as(author)
++
++      await client.delete(`/posts/${post.id}`).assertRedirect('/posts')
++
++      expect(await Post.find(post.id)).toBeNull()
++      expect(await Comment.all()).toMatchObject([{ id: elsewhere.id }])
++      expect(await CommentReport.all()).toMatchObject([{ commentId: elsewhere.id }])
++    })
++
++    it('still deletes a post without comments', async () => {
++      const client = await as(author)
++
++      await client.delete(`/posts/${post.id}`).assertRedirect('/posts')
++
++      expect(await Post.find(post.id)).toBeNull()
++    })
 +  })
 +})

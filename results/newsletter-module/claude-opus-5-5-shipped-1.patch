@@ -68,11 +68,11 @@ index 846382c..fa1acc3 100644
        'posts.search': { body: { keywords: string[]; limit: number } }
        'posts.store': { body: { title: string; excerpt: string; body: string } }
        'posts.update': { body: { title: string; excerpt: string; body: string } }
-diff --git a/db/migrations/20260925021305_add_newsletter_subscriptions/migration.sql b/db/migrations/20260925021305_add_newsletter_subscriptions/migration.sql
+diff --git a/db/migrations/20260929141518_create_newsletter_subscriptions/migration.sql b/db/migrations/20260929141518_create_newsletter_subscriptions/migration.sql
 new file mode 100644
 index 0000000..6daab0d
 --- /dev/null
-+++ b/db/migrations/20260925021305_add_newsletter_subscriptions/migration.sql
++++ b/db/migrations/20260929141518_create_newsletter_subscriptions/migration.sql
 @@ -0,0 +1,7 @@
 +CREATE TABLE `newsletter_subscriptions` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
@@ -81,16 +81,16 @@ index 0000000..6daab0d
 +	`confirmed_at` text,
 +	`created_at` text NOT NULL
 +);
-diff --git a/db/migrations/20260925021305_add_newsletter_subscriptions/snapshot.json b/db/migrations/20260925021305_add_newsletter_subscriptions/snapshot.json
+diff --git a/db/migrations/20260929141518_create_newsletter_subscriptions/snapshot.json b/db/migrations/20260929141518_create_newsletter_subscriptions/snapshot.json
 new file mode 100644
-index 0000000..55b0bd2
+index 0000000..a7a2a9a
 --- /dev/null
-+++ b/db/migrations/20260925021305_add_newsletter_subscriptions/snapshot.json
++++ b/db/migrations/20260929141518_create_newsletter_subscriptions/snapshot.json
 @@ -0,0 +1,272 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "a9208d6f-0283-400d-a006-0702e9ba72f0",
++  "id": "e352860f-1256-4254-b4af-cbf520562d8c",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -372,38 +372,38 @@ index 47b96e5..ee7c8bb 100644
    id: integer('id').primaryKey({ autoIncrement: true }),
 diff --git a/guren.arch.ts b/guren.arch.ts
 new file mode 100644
-index 0000000..58b87ae
+index 0000000..b915b60
 --- /dev/null
 +++ b/guren.arch.ts
 @@ -0,0 +1,17 @@
 +import { defineArchRules } from '@guren/cli/arch'
 +
++// The newsletter module ships to other apps as is, so the blog must never depend on it.
 +export default defineArchRules({
 +  layers: {
 +    blog: ['app/**', 'routes/**'],
 +    newsletter: 'modules/newsletter/**',
 +  },
-+  includeTypeImports: true,
 +  rules: [
 +    {
 +      from: 'blog',
 +      disallow: 'newsletter',
-+      message:
-+        'The newsletter module is self-contained and ships to other apps; the blog (app/, routes/) must not import from modules/newsletter/.',
++      includeTypeImports: true,
++      message: 'The blog must not import from modules/newsletter/; the module is loaded only via src/app.ts.',
 +    },
 +  ],
 +})
-diff --git a/modules/newsletter/app/Http/Controllers/NewsletterController.ts b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
+diff --git a/modules/newsletter/app/Http/Controllers/NewsletterSubscriptionController.ts b/modules/newsletter/app/Http/Controllers/NewsletterSubscriptionController.ts
 new file mode 100644
-index 0000000..92a6c9b
+index 0000000..2a4db44
 --- /dev/null
-+++ b/modules/newsletter/app/Http/Controllers/NewsletterController.ts
-@@ -0,0 +1,50 @@
++++ b/modules/newsletter/app/Http/Controllers/NewsletterSubscriptionController.ts
+@@ -0,0 +1,45 @@
 +import { randomBytes } from 'node:crypto'
-+import { Controller, ValidationException, isSafeRedirectUrl } from '@guren/core'
++import { Controller, isSafeRedirectUrl, ValidationException } from '@guren/core'
 +import { NewsletterSubscription } from '../../Models/NewsletterSubscription.js'
 +
-+export default class NewsletterController extends Controller {
++export default class NewsletterSubscriptionController extends Controller {
 +  async subscribe(): Promise<Response> {
 +    const { email } = this.validated('newsletter.subscribe').body
 +
@@ -411,23 +411,17 @@ index 0000000..92a6c9b
 +      throw ValidationException.withMessages({ email: 'This email address is already subscribed.' })
 +    }
 +
-+    // 32 random bytes → 64 hex chars; the confirmation link is the only proof of ownership.
-+    const token = randomBytes(32).toString('hex')
-+    try {
-+      await NewsletterSubscription.create({ email, token })
-+    } catch {
-+      // A concurrent sign-up for the same address won the unique index.
-+      throw ValidationException.withMessages({ email: 'This email address is already subscribed.' })
-+    }
++    // 32 random bytes → 64 hex characters; the unique index backs up the check above.
++    await NewsletterSubscription.create({ email, token: randomBytes(32).toString('hex') })
 +
-+    return this.redirectBack()
++    return this.redirect(this.previousUrl())
 +  }
 +
 +  async confirm(): Promise<Response> {
 +    const subscription = this.model(NewsletterSubscription)
 +
 +    if (subscription.confirmedAt === null) {
-+      await NewsletterSubscription.update(
++      await NewsletterSubscription.forceUpdate(
 +        { id: subscription.id },
 +        { confirmedAt: new Date().toISOString() },
 +      )
@@ -438,23 +432,24 @@ index 0000000..92a6c9b
 +
 +  async unsubscribe(): Promise<Response> {
 +    const { email } = this.validated('newsletter.unsubscribe').body
++
 +    await NewsletterSubscription.delete({ email })
 +
-+    return this.redirectBack()
++    return this.redirect(this.previousUrl())
 +  }
 +
-+  private redirectBack(): Response {
++  // Only a same-origin Referer is followed, so the header cannot become an open redirect.
++  private previousUrl(): string {
 +    const referer = this.request.header('referer')
-+    const target = referer && isSafeRedirectUrl(referer, this.request.url) ? referer : '/'
-+    return this.redirect(target)
++    return referer && isSafeRedirectUrl(referer, this.request.url) ? referer : '/'
 +  }
 +}
 diff --git a/modules/newsletter/app/Http/Validators/NewsletterValidator.ts b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
 new file mode 100644
-index 0000000..6cae310
+index 0000000..70ae5d1
 --- /dev/null
 +++ b/modules/newsletter/app/Http/Validators/NewsletterValidator.ts
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,13 @@
 +import { z } from 'zod'
 +
 +export const NewsletterEmailSchema = z.object({
@@ -466,9 +461,11 @@ index 0000000..6cae310
 +    .max(255, 'Email must be 255 characters or fewer.')
 +    .email('Enter a valid email address.'),
 +})
++
++export type NewsletterEmailPayload = z.infer<typeof NewsletterEmailSchema>
 diff --git a/modules/newsletter/app/Models/NewsletterSubscription.ts b/modules/newsletter/app/Models/NewsletterSubscription.ts
 new file mode 100644
-index 0000000..19c89fd
+index 0000000..5ad7872
 --- /dev/null
 +++ b/modules/newsletter/app/Models/NewsletterSubscription.ts
 @@ -0,0 +1,10 @@
@@ -479,16 +476,16 @@ index 0000000..19c89fd
 +export type NewNewsletterSubscriptionRecord = typeof newsletterSubscriptions.$inferInsert
 +
 +export class NewsletterSubscription extends defineModel(newsletterSubscriptions, {
-+  fillable: ['email', 'token', 'confirmedAt'],
-+  hidden: ['token'],
++  // `confirmedAt` is only ever set by following the confirmation link.
++  fillable: ['email', 'token'],
 +}) {}
 diff --git a/modules/newsletter/db/schema.ts b/modules/newsletter/db/schema.ts
 new file mode 100644
-index 0000000..417eab7
+index 0000000..76a97f5
 --- /dev/null
 +++ b/modules/newsletter/db/schema.ts
 @@ -0,0 +1,10 @@
-+// Re-exported into the project's db/schema.ts by `guren make:module`.
++// Re-exported into the project's db/schema.ts so drizzle-kit sees this table.
 +import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
 +
 +export const newsletterSubscriptions = sqliteTable('newsletter_subscriptions', {
@@ -514,37 +511,48 @@ index 0000000..376aa0c
 +})
 diff --git a/modules/newsletter/routes.ts b/modules/newsletter/routes.ts
 new file mode 100644
-index 0000000..f45e0b3
+index 0000000..3d0293a
 --- /dev/null
 +++ b/modules/newsletter/routes.ts
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,23 @@
 +import type { Router } from '@guren/core'
-+import NewsletterController from './app/Http/Controllers/NewsletterController.js'
-+import { NewsletterSubscription } from './app/Models/NewsletterSubscription.js'
++import NewsletterSubscriptionController from './app/Http/Controllers/NewsletterSubscriptionController.js'
 +import { NewsletterEmailSchema } from './app/Http/Validators/NewsletterValidator.js'
++import { NewsletterSubscription } from './app/Models/NewsletterSubscription.js'
 +
-+// Mounted under the module's `/newsletter` prefix (see index.ts).
++// Paths are relative to the module prefix, `/newsletter`.
 +export function registerNewsletterRoutes(router: Router): void {
-+  router.post('/subscribe', { name: 'newsletter.subscribe', body: NewsletterEmailSchema }, [NewsletterController, 'subscribe'])
-+  router.get('/confirm/:token', {
-+    name: 'newsletter.confirm',
-+    bind: { token: [NewsletterSubscription, 'token'] },
-+  }, [NewsletterController, 'confirm'])
-+  router.post('/unsubscribe', { name: 'newsletter.unsubscribe', body: NewsletterEmailSchema }, [NewsletterController, 'unsubscribe'])
++  router.post(
++    '/subscribe',
++    { name: 'newsletter.subscribe', body: NewsletterEmailSchema },
++    [NewsletterSubscriptionController, 'subscribe'],
++  )
++  router.get(
++    '/confirm/:token',
++    { name: 'newsletter.confirm', bind: { token: [NewsletterSubscription, 'token'] } },
++    [NewsletterSubscriptionController, 'confirm'],
++  )
++  router.post(
++    '/unsubscribe',
++    { name: 'newsletter.unsubscribe', body: NewsletterEmailSchema },
++    [NewsletterSubscriptionController, 'unsubscribe'],
++  )
 +}
-diff --git a/modules/newsletter/tests/NewsletterController.test.ts b/modules/newsletter/tests/NewsletterController.test.ts
+diff --git a/modules/newsletter/tests/NewsletterSubscriptionController.test.ts b/modules/newsletter/tests/NewsletterSubscriptionController.test.ts
 new file mode 100644
-index 0000000..747eae7
+index 0000000..26071ec
 --- /dev/null
-+++ b/modules/newsletter/tests/NewsletterController.test.ts
-@@ -0,0 +1,64 @@
++++ b/modules/newsletter/tests/NewsletterSubscriptionController.test.ts
+@@ -0,0 +1,68 @@
 +import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp } from '@guren/testing'
 +import app from '../../../src/app.js'
 +import { resetDatabase } from '../../../config/database.js'
 +import { NewsletterSubscription } from '../app/Models/NewsletterSubscription.js'
 +
-+describe('NewsletterController', () => {
++const REFERER = 'http://localhost/posts'
++
++describe('newsletter subscriptions', () => {
 +  let http: TestApp
 +
 +  beforeAll(async () => {
@@ -555,51 +563,53 @@ index 0000000..747eae7
 +    await resetDatabase()
 +  })
 +
-+  const client = async () => (await http.withHeader('Referer', 'http://localhost/posts').withCsrf()).json()
++  async function client(): Promise<TestApp> {
++    return (await http.withCsrf()).json().withHeader('Referer', REFERER)
++  }
 +
-+  it('stores a pending subscription and redirects back', async () => {
-+    await (await client()).post('/newsletter/subscribe', { email: 'reader@example.com' })
-+      .assertRedirect('http://localhost/posts')
++  it('stores a pending subscription with a random token and redirects back', async () => {
++    const csrf = await client()
++    await csrf.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect(REFERER)
 +
 +    const rows = await NewsletterSubscription.all()
 +    expect(rows).toHaveLength(1)
-+    expect(rows[0]!.email).toBe('reader@example.com')
-+    expect(rows[0]!.confirmedAt).toBeNull()
-+    expect(rows[0]!.token.length).toBeGreaterThanOrEqual(16)
++    expect(rows[0]?.confirmedAt).toBeNull()
++    expect(rows[0]?.token.length).toBeGreaterThanOrEqual(16)
 +  })
 +
-+  it('rejects invalid and duplicate addresses with 422 under email', async () => {
++  it('rejects invalid and duplicate addresses without touching the table', async () => {
 +    const csrf = await client()
-+    await csrf.post('/newsletter/subscribe', { email: 'not-an-email' }).assertUnprocessable()
 +    await csrf.post('/newsletter/subscribe', { email: '' }).assertUnprocessable()
-+    await csrf.post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect()
-+    const dup = await csrf.post('/newsletter/subscribe', { email: 'reader@example.com' })
-+    dup.assertUnprocessable()
-+    expect((await dup.json<{ errors: Record<string, string[]> }>()).errors.email).toBeDefined()
++    await csrf.post('/newsletter/subscribe', { email: 'not-an-email' }).assertUnprocessable()
++    expect(await NewsletterSubscription.all()).toHaveLength(0)
 +
++    await NewsletterSubscription.create({ email: 'reader@example.com', token: 'a'.repeat(64) })
++    await csrf
++      .post('/newsletter/subscribe', { email: 'reader@example.com' })
++      .assertUnprocessable()
++      .assertJsonPath('errors.email.0', 'This email address is already subscribed.')
 +    expect(await NewsletterSubscription.all()).toHaveLength(1)
 +  })
 +
-+  it('confirms by token and 404s on an unknown token', async () => {
-+    await (await client()).post('/newsletter/subscribe', { email: 'reader@example.com' }).assertRedirect()
-+    const [row] = await NewsletterSubscription.all()
++  it('confirms a subscription by token and 404s on an unknown one', async () => {
++    await NewsletterSubscription.create({ email: 'reader@example.com', token: 'b'.repeat(64) })
 +
-+    await http.get('/newsletter/confirm/not-a-real-token').assertNotFound()
-+    expect((await NewsletterSubscription.first({ id: row!.id }))!.confirmedAt).toBeNull()
++    await http.get(`/newsletter/confirm/${'c'.repeat(64)}`).assertNotFound()
++    expect((await NewsletterSubscription.first({ email: 'reader@example.com' }))?.confirmedAt).toBeNull()
 +
-+    await http.get(`/newsletter/confirm/${row!.token}`).assertRedirect('/')
-+    expect((await NewsletterSubscription.first({ id: row!.id }))!.confirmedAt).not.toBeNull()
++    await http.get(`/newsletter/confirm/${'b'.repeat(64)}`).assertRedirect('/')
++    expect((await NewsletterSubscription.first({ email: 'reader@example.com' }))?.confirmedAt).not.toBeNull()
 +  })
 +
 +  it('unsubscribes only the given address', async () => {
-+    const csrf = await client()
-+    await csrf.post('/newsletter/subscribe', { email: 'a@example.com' }).assertRedirect()
-+    await csrf.post('/newsletter/subscribe', { email: 'b@example.com' }).assertRedirect()
++    await NewsletterSubscription.create({ email: 'one@example.com', token: 'd'.repeat(64) })
++    await NewsletterSubscription.create({ email: 'two@example.com', token: 'e'.repeat(64) })
 +
-+    await csrf.post('/newsletter/unsubscribe', { email: 'a@example.com' }).assertRedirect('http://localhost/posts')
++    const csrf = await client()
++    await csrf.post('/newsletter/unsubscribe', { email: 'one@example.com' }).assertRedirect(REFERER)
 +
 +    const rows = await NewsletterSubscription.all()
-+    expect(rows.map((r) => r.email)).toEqual(['b@example.com'])
++    expect(rows.map((row) => row.email)).toEqual(['two@example.com'])
 +  })
 +})
 diff --git a/src/app.ts b/src/app.ts

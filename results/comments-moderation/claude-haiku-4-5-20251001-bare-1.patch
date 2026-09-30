@@ -114,30 +114,31 @@ index 846382c..5a9e9a9 100644
        'posts.update': { body: { title: string; excerpt: string; body: string } }
 diff --git a/app/Http/Controllers/CommentController.ts b/app/Http/Controllers/CommentController.ts
 new file mode 100644
-index 0000000..6c37cff
+index 0000000..def35ea
 --- /dev/null
 +++ b/app/Http/Controllers/CommentController.ts
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,54 @@
 +import { Controller } from '@guren/core'
 +import { Comment } from '../../Models/Comment.js'
 +import { CommentReport } from '../../Models/CommentReport.js'
 +import { Post } from '../../Models/Post.js'
 +import type { UserRecord } from '../../Models/User.js'
-+import { CommentIdParamSchema, PostIdParamSchema, CommentPayloadSchema } from '../Validators/CommentValidator.js'
++import { CommentIdParamSchema, PostIdParamSchema } from '../Validators/CommentValidator.js'
 +
 +export default class CommentController extends Controller {
 +  async store(): Promise<Response> {
 +    const { id: postId } = this.validateParams(PostIdParamSchema)
 +    const user = await this.auth.userOrFail<UserRecord>()
-+    const { body: data } = this.validated('comments.store')
 +
 +    const post = await Post.findOrFail(postId)
-+    const comment = await Comment.forceCreate({ ...data, postId: post.id, userId: user.id })
++    const { body: data } = this.validated('comments.store')
 +
-+    return this.redirect(`/posts/${post.id}`)
++    await Comment.forceCreate({ ...data, postId, userId: user.id })
++
++    return this.redirect(`/posts/${postId}`)
 +  }
 +
-+  async delete(): Promise<Response> {
++  async destroy(): Promise<Response> {
 +    const { id: commentId } = this.validateParams(CommentIdParamSchema)
 +    const user = await this.auth.userOrFail<UserRecord>()
 +
@@ -146,7 +147,7 @@ index 0000000..6c37cff
 +
 +    await this.authorize('delete', [Comment, comment, post])
 +
-+    await Comment.delete({ id: comment.id })
++    await Comment.delete({ id: commentId })
 +
 +    return this.redirect(`/posts/${post.id}`)
 +  }
@@ -155,18 +156,24 @@ index 0000000..6c37cff
 +    const { id: commentId } = this.validateParams(CommentIdParamSchema)
 +    const user = await this.auth.userOrFail<UserRecord>()
 +
-+    const comment = await Comment.findOrFail(commentId)
 +    await this.authorize('report', Comment)
 +
-+    await CommentReport.forceCreate({ commentId: comment.id, userId: user.id }).catch(() => {
-+      // Duplicate report (unique constraint) is silently ignored
-+    })
++    const comment = await Comment.findOrFail(commentId)
++
++    try {
++      await CommentReport.forceCreate({
++        commentId,
++        userId: user.id,
++      })
++    } catch {
++      // If the report already exists (unique constraint), ignore it
++    }
 +
 +    return new Response(null, { status: 204 })
 +  }
 +}
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..630e018 100644
+index 8f702c5..dbf2067 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
 @@ -1,8 +1,11 @@
@@ -181,39 +188,71 @@ index 8f702c5..630e018 100644
  import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
  
  type PostsIndexProps = PaginatedPageProps<PostResourceData>
-@@ -54,8 +57,29 @@ export default class PostController extends Controller {
+@@ -25,18 +28,11 @@ export default class PostController extends Controller {
+     } satisfies PostsIndexProps)
+   }
+ 
+-  // Serves the HTTP QUERY route `posts.search` — a safe read that carries its
+-  // criteria in a JSON body. Matches posts with any keyword in title or
+-  // excerpt; `%` and `_` in a keyword act as SQL LIKE wildcards, which this
+-  // starter treats as a feature.
+   async search(): Promise<Response> {
+     const { keywords, limit } = this.validated('posts.search').body
+ 
+     const posts = await Post.newQuery()
+       .with('author')
+-      // All keyword OR pairs sit inside one callback, keeping this an
+-      // any-keyword match while AND filters added later (a published flag,
+-      // tenancy) apply to every hit instead of being OR'd away.
+       .where((q) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+@@ -54,8 +50,33 @@ export default class PostController extends Controller {
      const { id } = this.validateParams(PostIdParamSchema)
      const post = await Post.findWithOrFail(id, 'author')
  
 +    const allComments = await Comment.newQuery()
 +      .with('author')
-+      .where('postId', '=', post.id)
-+      .orderBy('id', 'asc')
++      .where('postId', '=', id)
++      .orderBy('createdAt', 'asc')
 +      .get()
 +
-+    const hiddenCommentIds = new Set<number>()
-+    for (const comment of allComments) {
-+      const reportCount = await CommentReport.newQuery()
-+        .where('commentId', '=', comment.id)
-+        .count()
-+      if (reportCount >= 3) {
-+        hiddenCommentIds.add(comment.id)
++    const commentIds = allComments.map(c => c.id)
++
++    let reportCounts: Map<number, number> = new Map()
++    if (commentIds.length > 0) {
++      const reports = await CommentReport.newQuery()
++        .whereIn('commentId', commentIds)
++        .get()
++
++      for (const report of reports) {
++        const count = (reportCounts.get(report.commentId) ?? 0) + 1
++        reportCounts.set(report.commentId, count)
 +      }
 +    }
 +
-+    const comments = allComments
-+      .filter((c) => !hiddenCommentIds.has(c.id))
-+      .map((c) => new CommentResource(c).toJSON())
++    const visibleComments = allComments.filter(
++      (comment) => (reportCounts.get(comment.id) ?? 0) < 3
++    )
 +
      return this.inertia(pages.posts.Show, {
        post: new PostResource(post).toJSON(),
-+      comments,
++      comments: visibleComments.map((comment) => new CommentResource(comment).toJSON()),
      })
    }
  
+@@ -68,8 +89,6 @@ export default class PostController extends Controller {
+     await this.authorize('create', Post)
+     const author = await this.auth.userOrFail<UserRecord>()
+     const { body: data } = this.validated('posts.store')
+-    // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+-    // it comes from the session, and a request must never be able to set it.
+     const post = await Post.forceCreate({ ...data, authorId: author.id })
+ 
+     return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
 diff --git a/app/Http/Resources/CommentResource.ts b/app/Http/Resources/CommentResource.ts
 new file mode 100644
-index 0000000..92cfa4e
+index 0000000..08e53cc
 --- /dev/null
 +++ b/app/Http/Resources/CommentResource.ts
 @@ -0,0 +1,28 @@
@@ -237,17 +276,17 @@ index 0000000..92cfa4e
 +    return {
 +      id: comment.id,
 +      body: comment.body,
++      createdAt: new Date(comment.createdAt).toISOString(),
 +      author: this.whenLoaded('author', () => ({
 +        id: (comment as CommentWithAuthor).author?.id,
 +        name: (comment as CommentWithAuthor).author?.name,
 +      })) as CommentAuthorSummary | undefined,
-+      createdAt: new Date(comment.createdAt).toISOString(),
 +    }
 +  }
 +}
 diff --git a/app/Http/Validators/CommentValidator.ts b/app/Http/Validators/CommentValidator.ts
 new file mode 100644
-index 0000000..79f71a0
+index 0000000..0eec583
 --- /dev/null
 +++ b/app/Http/Validators/CommentValidator.ts
 @@ -0,0 +1,15 @@
@@ -262,7 +301,7 @@ index 0000000..79f71a0
 +})
 +
 +export const CommentPayloadSchema = z.object({
-+  body: z.string().trim().min(1, 'Body is required.').max(2000, 'Body must be 2000 characters or fewer.'),
++  body: z.string().trim().min(1, 'Comment is required.').max(2000, 'Comment must be 2000 characters or fewer.'),
 +})
 +
 +export type CommentPayload = z.infer<typeof CommentPayloadSchema>
@@ -291,29 +330,29 @@ index 0000000..b98a109
 +Comment.belongsTo('author', () => import('./User.js').then((module) => module.User), 'userId', 'id')
 diff --git a/app/Models/CommentReport.ts b/app/Models/CommentReport.ts
 new file mode 100644
-index 0000000..1c9b318
+index 0000000..cae7bf4
 --- /dev/null
 +++ b/app/Models/CommentReport.ts
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,8 @@
 +import { defineModel } from '@guren/core'
 +import { commentReports } from '../../db/schema.js'
 +
 +export type CommentReportRecord = typeof commentReports.$inferSelect
-+export type NewCommentReportRecord = typeof commentReports.$inferInsert
 +
 +export class CommentReport extends defineModel(commentReports, {
-+  fillable: [],
++  fillable: ['commentId', 'userId'],
 +}) {}
 diff --git a/app/Policies/CommentPolicy.ts b/app/Policies/CommentPolicy.ts
 new file mode 100644
-index 0000000..7da9056
+index 0000000..34f5886
 --- /dev/null
 +++ b/app/Policies/CommentPolicy.ts
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,26 @@
 +import { Policy, type AuthUser } from '@guren/core'
 +
 +interface CommentLike {
 +  userId: number
++  postId: number
 +}
 +
 +interface PostLike {
@@ -321,20 +360,14 @@ index 0000000..7da9056
 +}
 +
 +export class CommentPolicy extends Policy {
-+  viewAny(_user: AuthUser | null): boolean {
-+    return true
-+  }
-+
-+  view(_user: AuthUser | null, _comment: CommentLike): boolean {
-+    return true
-+  }
-+
 +  create(user: AuthUser | null): boolean {
 +    return user !== null
 +  }
 +
 +  delete(user: AuthUser | null, comment: CommentLike, post: PostLike): boolean {
-+    return user !== null && (Number(user.id) === comment.userId || Number(user.id) === post.authorId)
++    if (user === null) return false
++    const userId = Number(user.id)
++    return userId === comment.userId || userId === post.authorId
 +  }
 +
 +  report(user: AuthUser | null): boolean {
@@ -361,18 +394,17 @@ index 4f2bba9..bbd53fd 100644
 +    this.container.make('gate').policy(Comment, CommentPolicy)
    }
  }
-diff --git a/db/migrations/20260925014455_normal_timeslip/migration.sql b/db/migrations/20260925014455_normal_timeslip/migration.sql
+diff --git a/db/migrations/20260929154001_simple_avengers/migration.sql b/db/migrations/20260929154001_simple_avengers/migration.sql
 new file mode 100644
-index 0000000..b58cf26
+index 0000000..f704ca8
 --- /dev/null
-+++ b/db/migrations/20260925014455_normal_timeslip/migration.sql
-@@ -0,0 +1,17 @@
++++ b/db/migrations/20260929154001_simple_avengers/migration.sql
+@@ -0,0 +1,18 @@
 +CREATE TABLE `comment_reports` (
 +	`comment_id` integer NOT NULL,
 +	`user_id` integer NOT NULL,
 +	CONSTRAINT `fk_comment_reports_comment_id_comments_id_fk` FOREIGN KEY (`comment_id`) REFERENCES `comments`(`id`) ON DELETE CASCADE,
-+	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`),
-+	UNIQUE (`comment_id`, `user_id`)
++	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
 +);
 +--> statement-breakpoint
 +CREATE TABLE `comments` (
@@ -384,16 +416,19 @@ index 0000000..b58cf26
 +	CONSTRAINT `fk_comments_post_id_posts_id_fk` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`) ON DELETE CASCADE,
 +	CONSTRAINT `fk_comments_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
 +);
-diff --git a/db/migrations/20260925014455_normal_timeslip/snapshot.json b/db/migrations/20260925014455_normal_timeslip/snapshot.json
++--> statement-breakpoint
++CREATE UNIQUE INDEX `uniq_comment_reports` ON `comment_reports` (`comment_id`,`user_id`);
+\ No newline at end of file
+diff --git a/db/migrations/20260929154001_simple_avengers/snapshot.json b/db/migrations/20260929154001_simple_avengers/snapshot.json
 new file mode 100644
-index 0000000..e98b6fb
+index 0000000..ae64fc5
 --- /dev/null
-+++ b/db/migrations/20260925014455_normal_timeslip/snapshot.json
-@@ -0,0 +1,338 @@
++++ b/db/migrations/20260929154001_simple_avengers/snapshot.json
+@@ -0,0 +1,356 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "2813ed1c-730d-4211-ac2d-11b7db0679e4",
++  "id": "6ccf5880-0ac6-41d0-9fb3-f688bb2d5aa2",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -718,377 +753,20 @@ index 0000000..e98b6fb
 +    },
 +    {
 +      "columns": [
-+        "email"
++        {
++          "value": "comment_id",
++          "isExpression": false
++        },
++        {
++          "value": "user_id",
++          "isExpression": false
++        }
 +      ],
-+      "nameExplicit": false,
-+      "name": "users_email_unique",
-+      "entityType": "uniques",
-+      "table": "users"
-+    }
-+  ],
-+  "renames": []
-+}
-\ No newline at end of file
-diff --git a/db/migrations/20260925014633_nappy_prodigy/migration.sql b/db/migrations/20260925014633_nappy_prodigy/migration.sql
-new file mode 100644
-index 0000000..91e7d90
---- /dev/null
-+++ b/db/migrations/20260925014633_nappy_prodigy/migration.sql
-@@ -0,0 +1,13 @@
-+PRAGMA foreign_keys=OFF;--> statement-breakpoint
-+CREATE TABLE `__new_comment_reports` (
-+	`comment_id` integer NOT NULL,
-+	`user_id` integer NOT NULL,
-+	CONSTRAINT `fk_comment_reports_comment_id_comments_id_fk` FOREIGN KEY (`comment_id`) REFERENCES `comments`(`id`) ON DELETE CASCADE,
-+	CONSTRAINT `fk_comment_reports_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`),
-+	CONSTRAINT `comment_reports_comment_id_user_id_unique` UNIQUE(`comment_id`,`user_id`)
-+);
-+--> statement-breakpoint
-+INSERT INTO `__new_comment_reports`(`comment_id`, `user_id`) SELECT `comment_id`, `user_id` FROM `comment_reports`;--> statement-breakpoint
-+DROP TABLE `comment_reports`;--> statement-breakpoint
-+ALTER TABLE `__new_comment_reports` RENAME TO `comment_reports`;--> statement-breakpoint
-+PRAGMA foreign_keys=ON;
-\ No newline at end of file
-diff --git a/db/migrations/20260925014633_nappy_prodigy/snapshot.json b/db/migrations/20260925014633_nappy_prodigy/snapshot.json
-new file mode 100644
-index 0000000..a0a87a5
---- /dev/null
-+++ b/db/migrations/20260925014633_nappy_prodigy/snapshot.json
-@@ -0,0 +1,348 @@
-+{
-+  "version": "7",
-+  "dialect": "sqlite",
-+  "id": "fde4865c-ec8c-4658-b454-beabead47cd9",
-+  "prevIds": [
-+    "2813ed1c-730d-4211-ac2d-11b7db0679e4"
-+  ],
-+  "ddl": [
-+    {
-+      "name": "comment_reports",
-+      "entityType": "tables"
-+    },
-+    {
-+      "name": "comments",
-+      "entityType": "tables"
-+    },
-+    {
-+      "name": "posts",
-+      "entityType": "tables"
-+    },
-+    {
-+      "name": "users",
-+      "entityType": "tables"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "comment_id",
-+      "entityType": "columns",
-+      "table": "comment_reports"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "user_id",
-+      "entityType": "columns",
-+      "table": "comment_reports"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": false,
-+      "autoincrement": true,
-+      "default": null,
-+      "generated": null,
-+      "name": "id",
-+      "entityType": "columns",
-+      "table": "comments"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "post_id",
-+      "entityType": "columns",
-+      "table": "comments"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "user_id",
-+      "entityType": "columns",
-+      "table": "comments"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "body",
-+      "entityType": "columns",
-+      "table": "comments"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "created_at",
-+      "entityType": "columns",
-+      "table": "comments"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": false,
-+      "autoincrement": true,
-+      "default": null,
-+      "generated": null,
-+      "name": "id",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "title",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "excerpt",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "body",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "author_id",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "created_at",
-+      "entityType": "columns",
-+      "table": "posts"
-+    },
-+    {
-+      "type": "integer",
-+      "notNull": false,
-+      "autoincrement": true,
-+      "default": null,
-+      "generated": null,
-+      "name": "id",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "name",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "email",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "password_hash",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": false,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "remember_token",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "created_at",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "type": "text",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "updated_at",
-+      "entityType": "columns",
-+      "table": "users"
-+    },
-+    {
-+      "columns": [
-+        "comment_id"
-+      ],
-+      "tableTo": "comments",
-+      "columnsTo": [
-+        "id"
-+      ],
-+      "onUpdate": "NO ACTION",
-+      "onDelete": "CASCADE",
-+      "nameExplicit": false,
-+      "name": "fk_comment_reports_comment_id_comments_id_fk",
-+      "entityType": "fks",
-+      "table": "comment_reports"
-+    },
-+    {
-+      "columns": [
-+        "user_id"
-+      ],
-+      "tableTo": "users",
-+      "columnsTo": [
-+        "id"
-+      ],
-+      "onUpdate": "NO ACTION",
-+      "onDelete": "NO ACTION",
-+      "nameExplicit": false,
-+      "name": "fk_comment_reports_user_id_users_id_fk",
-+      "entityType": "fks",
-+      "table": "comment_reports"
-+    },
-+    {
-+      "columns": [
-+        "post_id"
-+      ],
-+      "tableTo": "posts",
-+      "columnsTo": [
-+        "id"
-+      ],
-+      "onUpdate": "NO ACTION",
-+      "onDelete": "CASCADE",
-+      "nameExplicit": false,
-+      "name": "fk_comments_post_id_posts_id_fk",
-+      "entityType": "fks",
-+      "table": "comments"
-+    },
-+    {
-+      "columns": [
-+        "user_id"
-+      ],
-+      "tableTo": "users",
-+      "columnsTo": [
-+        "id"
-+      ],
-+      "onUpdate": "NO ACTION",
-+      "onDelete": "NO ACTION",
-+      "nameExplicit": false,
-+      "name": "fk_comments_user_id_users_id_fk",
-+      "entityType": "fks",
-+      "table": "comments"
-+    },
-+    {
-+      "columns": [
-+        "author_id"
-+      ],
-+      "tableTo": "users",
-+      "columnsTo": [
-+        "id"
-+      ],
-+      "onUpdate": "NO ACTION",
-+      "onDelete": "NO ACTION",
-+      "nameExplicit": false,
-+      "name": "fk_posts_author_id_users_id_fk",
-+      "entityType": "fks",
-+      "table": "posts"
-+    },
-+    {
-+      "columns": [
-+        "id"
-+      ],
-+      "nameExplicit": false,
-+      "name": "comments_pk",
-+      "table": "comments",
-+      "entityType": "pks"
-+    },
-+    {
-+      "columns": [
-+        "id"
-+      ],
-+      "nameExplicit": false,
-+      "name": "posts_pk",
-+      "table": "posts",
-+      "entityType": "pks"
-+    },
-+    {
-+      "columns": [
-+        "id"
-+      ],
-+      "nameExplicit": false,
-+      "name": "users_pk",
-+      "table": "users",
-+      "entityType": "pks"
-+    },
-+    {
-+      "columns": [
-+        "comment_id",
-+        "user_id"
-+      ],
-+      "nameExplicit": false,
-+      "name": "comment_reports_comment_id_user_id_unique",
-+      "entityType": "uniques",
++      "isUnique": true,
++      "where": null,
++      "origin": "manual",
++      "name": "uniq_comment_reports",
++      "entityType": "indexes",
 +      "table": "comment_reports"
 +    },
 +    {
@@ -1105,16 +783,16 @@ index 0000000..a0a87a5
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..c128759 100644
+index 47b96e5..501b4d0 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
 @@ -1,4 +1,4 @@
 -import { sqliteTable, integer, text } from '@guren/orm/drizzle/sqlite'
-+import { sqliteTable, integer, text, unique } from '@guren/orm/drizzle/sqlite'
++import { sqliteTable, integer, text, uniqueIndex } from '@guren/orm/drizzle/sqlite'
  
  export const users = sqliteTable('users', {
    id: integer('id').primaryKey({ autoIncrement: true }),
-@@ -20,3 +20,30 @@ export const posts = sqliteTable('posts', {
+@@ -20,3 +20,26 @@ export const posts = sqliteTable('posts', {
      .references(() => users.id),
    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
  })
@@ -1131,26 +809,23 @@ index 47b96e5..c128759 100644
 +  createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
 +})
 +
-+export const commentReports = sqliteTable(
-+  'comment_reports',
-+  {
-+    commentId: integer('comment_id')
-+      .notNull()
-+      .references(() => comments.id, { onDelete: 'cascade' }),
-+    userId: integer('user_id')
-+      .notNull()
-+      .references(() => users.id),
-+  },
-+  (table) => ({
-+    unq: unique().on(table.commentId, table.userId),
-+  }),
-+)
++export const commentReports = sqliteTable('comment_reports', {
++  commentId: integer('comment_id')
++    .notNull()
++    .references(() => comments.id, { onDelete: 'cascade' }),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id),
++}, (table) => ({
++  uniqReport: uniqueIndex('uniq_comment_reports').on(table.commentId, table.userId),
++}))
 diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
-index 537c81e..675795c 100644
+index 537c81e..f4d3fb2 100644
 --- a/resources/js/pages/posts/Show.tsx
 +++ b/resources/js/pages/posts/Show.tsx
-@@ -1,10 +1,12 @@
- import { Head, Link, usePage } from '@inertiajs/react'
+@@ -1,17 +1,28 @@
+-import { Head, Link, usePage } from '@inertiajs/react'
++import { Head, Link, usePage, useForm } from '@inertiajs/react'
  import type { PostResourceData } from '@/app/Http/Resources/PostResource'
 +import type { CommentResourceData } from '@/app/Http/Resources/CommentResource'
  import { route } from '@/.guren/routes.gen'
@@ -1161,9 +836,109 @@ index 537c81e..675795c 100644
 +  comments?: CommentResourceData[]
  }
  
- export default function PostShow({ post }: Props) {
+-export default function PostShow({ post }: Props) {
+-  const { props } = usePage<{ auth?: { user?: { id?: number } } }>()
+-  // Mirrors PostPolicy — the server rejects it either way, this only keeps
+-  // controls the viewer cannot use off the page.
+-  const canManage = props.auth?.user?.id === post.authorId
++export default function PostShow({ post, comments = [] }: Props) {
++  const { props } = usePage<{ auth?: { user?: { id?: number; name?: string } } }>()
++  const userId = props.auth?.user?.id
++  const canManage = userId === post.authorId
++  const isSignedIn = userId !== undefined
++
++  const form = useForm({ body: '' })
++
++  const handleCommentSubmit = (e: React.FormEvent) => {
++    e.preventDefault()
++    form.post(route('comments.store', { id: post.id }), {
++      onSuccess: () => form.setData('body', ''),
++    })
++  }
+ 
+   return (
+     <Layout>
+@@ -52,6 +63,78 @@ export default function PostShow({ post }: Props) {
+             </>
+           ) : null}
+         </footer>
++
++        <section className="space-y-6 border-t border-g-line pt-8">
++          <h2 className="text-2xl font-bold text-g-heading">Comments</h2>
++
++          {isSignedIn && (
++            <form onSubmit={handleCommentSubmit} className="space-y-4 rounded-lg bg-g-tint p-4">
++              <textarea
++                value={form.data.body}
++                onChange={(e) => form.setData('body', e.target.value)}
++                placeholder="Add a comment..."
++                className="w-full resize-none rounded-g-input border border-g-line bg-g-bg px-4 py-2 text-g-text placeholder:text-g-muted focus:outline-none focus:ring-2 focus:ring-g-accent"
++                rows={4}
++              />
++              <button
++                type="submit"
++                disabled={form.processing || !form.data.body.trim()}
++                className="rounded-g-ctl bg-g-accent px-4 py-2 font-bold text-g-accent-text transition enabled:hover:opacity-90 disabled:opacity-50"
++              >
++                Comment
++              </button>
++            </form>
++          )}
++
++          {!isSignedIn && (
++            <p className="text-g-text-2">
++              <Link href={route('login')} className="font-bold text-g-accent-text hover:underline">
++                Sign in
++              </Link>
++              {' to leave a comment.'}
++            </p>
++          )}
++
++          {comments.length > 0 ? (
++            <div className="space-y-4">
++              {comments.map((comment) => (
++                <div key={comment.id} className="space-y-2 rounded-lg bg-g-tint p-4">
++                  <div className="flex items-start justify-between">
++                    <div className="space-y-1">
++                      <p className="font-bold text-g-heading">{comment.author?.name ?? 'Anonymous'}</p>
++                      <p className="text-xs text-g-muted">{new Date(comment.createdAt).toLocaleDateString()}</p>
++                    </div>
++                    <div className="flex gap-2">
++                      {(userId === comment.author?.id || canManage) && (
++                        <Link
++                          href={route('comments.destroy', { id: comment.id })}
++                          method="delete"
++                          as="button"
++                          className="text-xs text-g-danger transition hover:underline"
++                        >
++                          Delete
++                        </Link>
++                      )}
++                      {userId && userId !== comment.author?.id && (
++                        <button
++                          onClick={() => {
++                            fetch(route('comments.report', { id: comment.id }), { method: 'POST' })
++                          }}
++                          className="text-xs text-g-muted transition hover:text-g-text"
++                        >
++                          Report
++                        </button>
++                      )}
++                    </div>
++                  </div>
++                  <p className="whitespace-pre-wrap text-g-text">{comment.body}</p>
++                </div>
++              ))}
++            </div>
++          ) : (
++            <p className="text-g-text-2">No comments yet. Be the first to comment!</p>
++          )}
++        </section>
+       </article>
+     </Layout>
+   )
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..f24e79d 100644
+index 4c174ac..7626510 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
 @@ -1,7 +1,9 @@
@@ -1191,7 +966,7 @@ index 4c174ac..f24e79d 100644
 +
 +  router.group('/comments', (comments) => {
 +    comments.middleware('auth').group((authed) => {
-+      authed.delete('/:id', { name: 'comments.destroy' }, [CommentController, 'delete'])
++      authed.delete('/:id', { name: 'comments.destroy' }, [CommentController, 'destroy'])
 +      authed.post('/:id/report', { name: 'comments.report' }, [CommentController, 'report'])
 +    })
 +  })

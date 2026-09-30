@@ -1,24 +1,26 @@
 diff --git a/.guren/api-client.gen.ts b/.guren/api-client.gen.ts
-index 61e4c73..ff6111a 100644
+index 61e4c73..f9f32d4 100644
 --- a/.guren/api-client.gen.ts
 +++ b/.guren/api-client.gen.ts
-@@ -14,6 +14,15 @@ import type { Data } from './data.gen'
+@@ -14,6 +14,17 @@ import type { Data } from './data.gen'
   * `path` literal, the same string the server routes on.
   */
  export interface ApiRoutes {
 +  'api.posts.index': {
 +    method: 'GET'
 +    path: '/api/posts'
++    response: { data: Array<Data.Post> }
 +  }
 +  'api.posts.store': {
 +    method: 'POST'
 +    path: '/api/posts'
 +    body: { title: string; excerpt: string; body: string }
++    response: { data: Data.Post }
 +  }
    'dashboard': {
      method: 'GET'
      path: '/dashboard'
-@@ -74,6 +83,15 @@ export interface ApiRoutes {
+@@ -74,6 +85,15 @@ export interface ApiRoutes {
      method: 'GET'
      path: '/profile'
    }
@@ -34,7 +36,7 @@ index 61e4c73..ff6111a 100644
    'profile.update': {
      method: 'PUT'
      path: '/profile'
-@@ -303,6 +321,8 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
+@@ -303,6 +323,8 @@ export function createApiClient<TRoutes extends { [K in keyof TRoutes]: { method
  }
  
  const routes: Record<string, { method: string; path: string }> = {
@@ -43,7 +45,7 @@ index 61e4c73..ff6111a 100644
    'dashboard': { method: 'GET', path: '/dashboard' },
    'home': { method: 'GET', path: '/' },
    'login': { method: 'GET', path: '/login' },
-@@ -317,6 +337,8 @@ const routes: Record<string, { method: string; path: string }> = {
+@@ -317,6 +339,8 @@ const routes: Record<string, { method: string; path: string }> = {
    'posts.store': { method: 'POST', path: '/posts' },
    'posts.update': { method: 'PUT', path: '/posts/:id' },
    'profile.edit': { method: 'GET', path: '/profile' },
@@ -53,24 +55,18 @@ index 61e4c73..ff6111a 100644
    'register': { method: 'GET', path: '/register' },
    'register.store': { method: 'POST', path: '/register' },
 diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
-index 8db6dc3..2b8a20c 100644
+index 8db6dc3..2ddab95 100644
 --- a/.guren/pages.gen.ts
 +++ b/.guren/pages.gen.ts
-@@ -30,6 +30,13 @@ export function isPageId(value: string): value is PageId {
- }
+@@ -3,6 +3,7 @@
  
- type PostFormData = ApiRoutes['posts.store']['body']
-+
-+interface ApiTokenSummary {
-+  id: string
-+  name: string
-+  createdAt: string
-+  lastUsedAt: string | null
-+}
- /**
-  * Auto-extracted Props types from page components.
-  */
-@@ -56,6 +63,7 @@ export interface PagePropsMap {
+ import type { PageContract, PagePropsRecord } from '@guren/inertia-client'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
++import type { ApiTokenSummary } from '@/app/Http/Controllers/ProfileController'
+ import type { PostResourceData } from '@/app/Http/Resources/PostResource'
+ import type { PaginatedPageProps, ValidationErrors } from '@guren/core'
+ 
+@@ -56,6 +57,7 @@ export interface PagePropsMap {
  }
    'profile/Edit': {
    profile: { name: string; email: string }
@@ -79,7 +75,7 @@ index 8db6dc3..2b8a20c 100644
    status?: string
  }
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..405cef8 100644
+index 846382c..0076985 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -2,6 +2,8 @@
@@ -124,7 +120,7 @@ index 846382c..405cef8 100644
      update: (query?: RouteQuery) => route('profile.update', query)
    },
    register: Object.assign(
-@@ -147,9 +161,12 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+@@ -147,9 +161,11 @@ function appendQueryString(path: string, query?: RouteQuery): string {
  declare module '@guren/core' {
    interface GurenRouteContracts {
      routes: {
@@ -132,64 +128,20 @@ index 846382c..405cef8 100644
        'posts.search': { body: { keywords: string[]; limit: number } }
        'posts.store': { body: { title: string; excerpt: string; body: string } }
        'posts.update': { body: { title: string; excerpt: string; body: string } }
-+      'profile.tokens.destroy': { params: { id: string } }
 +      'profile.tokens.store': { body: { name: string } }
      }
    }
  }
-diff --git a/app/Auth/apiTokens.ts b/app/Auth/apiTokens.ts
+diff --git a/app/Http/Controllers/Api/PostController.ts b/app/Http/Controllers/Api/PostController.ts
 new file mode 100644
-index 0000000..c7a9d03
+index 0000000..49cc216
 --- /dev/null
-+++ b/app/Auth/apiTokens.ts
-@@ -0,0 +1,35 @@
-+import {
-+  DatabaseApiTokenStore,
-+  MemoryRateLimitStore,
-+  createBearerTokenMiddleware,
-+  createRateLimitMiddleware,
-+  getApiTokenOrFail,
-+} from '@guren/core'
-+import { apiTokens } from '../../db/schema.js'
-+import { User } from '../Models/User.js'
-+
-+export const API_RATE_LIMIT_PER_MINUTE = 60
-+
-+// Tokens are `{id}|{secret}`; the store keeps only sha256(secret).
-+export const apiTokenStore = new DatabaseApiTokenStore(apiTokens)
-+
-+const unauthenticated = { message: 'Unauthenticated.' }
-+
-+// Installs the token's owner as this request's principal, so `this.auth` and
-+// policies see that user.
-+export const authenticateApiToken = createBearerTokenMiddleware({
-+  store: apiTokenStore,
-+  loadUser: async (userId) => User.find(Number(userId)),
-+  onUnauthorized: (ctx) => ctx.json(unauthenticated, 401),
-+})
-+
-+// Keyed by token id, so each of a user's tokens gets its own budget. Must run
-+// after authenticateApiToken. Per process: a multi-instance deploy needs a
-+// shared store (Redis) here.
-+export const throttleApiToken = createRateLimitMiddleware({
-+  limit: API_RATE_LIMIT_PER_MINUTE,
-+  windowMs: 60_000,
-+  keyPrefix: 'api-token:',
-+  store: new MemoryRateLimitStore(),
-+  keyGenerator: (ctx) => getApiTokenOrFail(ctx).token.id,
-+})
-diff --git a/app/Http/Controllers/Api/ApiPostController.ts b/app/Http/Controllers/Api/ApiPostController.ts
-new file mode 100644
-index 0000000..4604764
---- /dev/null
-+++ b/app/Http/Controllers/Api/ApiPostController.ts
-@@ -0,0 +1,26 @@
++++ b/app/Http/Controllers/Api/PostController.ts
+@@ -0,0 +1,24 @@
 +import { Controller } from '@guren/core'
 +import { Post } from '../../../Models/Post.js'
-+import type { UserRecord } from '../../../Models/User.js'
 +import { PostResource } from '../../Resources/PostResource.js'
 +
-+// Bearer-token JSON API; routes/api.ts authenticates and throttles every action.
 +export default class ApiPostController extends Controller {
 +  async index(): Promise<Response> {
 +    const posts = await Post.newQuery()
@@ -201,127 +153,185 @@ index 0000000..4604764
 +  }
 +
 +  async store(): Promise<Response> {
-+    await this.authorize('create', Post)
-+    const author = await this.auth.userOrFail<UserRecord>()
++    const { userId } = this.apiToken()
 +    const { body: data } = this.validated('api.posts.store')
-+    // forceCreate, because `authorId` comes from the token, never the body.
-+    const post = await Post.forceCreate({ ...data, authorId: author.id })
++    // forceCreate, because `authorId` is deliberately absent from Post.fillable:
++    // it comes from the token's owner, never from the request body.
++    const post = await Post.forceCreate({ ...data, authorId: Number(userId) })
 +
 +    return this.json({ data: new PostResource(post).toJSON() }, { status: 201 })
 +  }
 +}
 diff --git a/app/Http/Controllers/ApiTokenController.ts b/app/Http/Controllers/ApiTokenController.ts
 new file mode 100644
-index 0000000..d0c18bc
+index 0000000..09b6230
 --- /dev/null
 +++ b/app/Http/Controllers/ApiTokenController.ts
-@@ -0,0 +1,31 @@
-+import { Controller, NotFoundHttpException, createApiToken, revokeApiToken } from '@guren/core'
-+import { apiTokenStore } from '../../Auth/apiTokens.js'
-+import { ApiToken } from '../../Models/ApiToken.js'
+@@ -0,0 +1,29 @@
++import { Controller, HttpException, createApiToken } from '@guren/core'
++import { ApiToken, apiTokenStore } from '../../Models/ApiToken.js'
 +import type { UserRecord } from '../../Models/User.js'
++import { ApiTokenIdParamSchema } from '../Validators/ApiTokenValidator.js'
 +
 +export default class ApiTokenController extends Controller {
-+  // The plain-text token exists only in this response; the store keeps its hash.
++  // The plain-text token exists only in this response; the store keeps its SHA-256.
 +  async store(): Promise<Response> {
 +    const user = await this.auth.userOrFail<UserRecord>()
-+    const { body } = this.validated('profile.tokens.store')
-+    const { plainTextToken, token } = await createApiToken(apiTokenStore, {
-+      name: body.name,
-+      userId: user.id,
-+    })
++    const { name } = this.validated('profile.tokens.store').body
++    const { plainTextToken, token } = await createApiToken(apiTokenStore, { name, userId: user.id })
 +
 +    return this.json({ id: token.id, name: token.name, token: plainTextToken }, { status: 201 })
 +  }
 +
 +  async destroy(): Promise<Response> {
 +    const user = await this.auth.userOrFail<UserRecord>()
-+    const { id } = this.validated('profile.tokens.destroy').params
-+    // Another user's token answers the same 404 as a missing one.
++    const { id } = this.validateParams(ApiTokenIdParamSchema)
++    // Another user's token id answers the same 404 as an unknown one.
 +    const token = await ApiToken.first({ id, userId: user.id })
 +    if (!token) {
-+      throw new NotFoundHttpException('Token not found.')
++      throw HttpException.notFound('Token not found.')
 +    }
 +
-+    await revokeApiToken(token.id, apiTokenStore)
++    await ApiToken.delete({ id: token.id, userId: user.id })
++
 +    return this.noContent()
 +  }
 +}
 diff --git a/app/Http/Controllers/ProfileController.ts b/app/Http/Controllers/ProfileController.ts
-index 21df6cf..c950c2f 100644
+index 21df6cf..2f66d76 100644
 --- a/app/Http/Controllers/ProfileController.ts
 +++ b/app/Http/Controllers/ProfileController.ts
-@@ -2,6 +2,17 @@ import { Controller, ValidationException } from '@guren/core'
+@@ -1,8 +1,16 @@
+ import { Controller, ValidationException } from '@guren/core'
  import { User, type UserRecord } from '../../Models/User.js'
++import { ApiToken } from '../../Models/ApiToken.js'
  import { ProfileUpdateSchema } from '../Validators/ProfileValidator.js'
  import { pages } from '@/.guren/pages.gen'
-+import { ApiToken } from '../../Models/ApiToken.js'
-+
-+async function listTokens(userId: number) {
-+  const tokens = await ApiToken.where({ userId }).orderBy('createdAt', 'desc').get()
-+  return tokens.map((token) => ({
-+    id: token.id,
-+    name: token.name,
-+    createdAt: new Date(token.createdAt).toISOString(),
-+    lastUsedAt: token.lastUsedAt ? new Date(token.lastUsedAt).toISOString() : null,
-+  }))
-+}
  
++export interface ApiTokenSummary {
++  id: string
++  name: string
++  createdAt: string
++  lastUsedAt: string | null
++}
++
  export default class ProfileController extends Controller {
    async edit(): Promise<Response> {
-@@ -15,6 +26,7 @@ export default class ProfileController extends Controller {
+     const user = await this.auth.user<UserRecord | null>()
+@@ -15,6 +23,7 @@ export default class ProfileController extends Controller {
          name: user.name,
          email: user.email,
        },
-+      tokens: await listTokens(user.id),
++      tokens: await this.tokensFor(user.id),
      }, { title: 'Profile' })
    }
  
-@@ -48,6 +60,7 @@ export default class ProfileController extends Controller {
+@@ -48,7 +57,18 @@ export default class ProfileController extends Controller {
  
      return this.inertia(pages.profile.Edit, {
        profile: { name, email },
-+      tokens: await listTokens(user.id),
++      tokens: await this.tokensFor(user.id),
        status: 'Profile updated successfully.',
      }, { title: 'Profile' })
    }
++
++  private async tokensFor(userId: number): Promise<ApiTokenSummary[]> {
++    const tokens = await ApiToken.where({ userId }).orderBy('createdAt', 'desc').get()
++    return tokens.map((token) => ({
++      id: token.id,
++      name: token.name,
++      createdAt: new Date(token.createdAt).toISOString(),
++      lastUsedAt: token.lastUsedAt ? new Date(token.lastUsedAt).toISOString() : null,
++    }))
++  }
+ }
+diff --git a/app/Http/Middleware/ApiTokenMiddleware.ts b/app/Http/Middleware/ApiTokenMiddleware.ts
+new file mode 100644
+index 0000000..d8be631
+--- /dev/null
++++ b/app/Http/Middleware/ApiTokenMiddleware.ts
+@@ -0,0 +1,36 @@
++import {
++  MemoryRateLimitStore,
++  createBearerTokenMiddleware,
++  createRateLimitMiddleware,
++  getApiToken,
++} from '@guren/core'
++import { apiTokenStore } from '../../Models/ApiToken.js'
++import { User } from '../../Models/User.js'
++
++export const API_REQUESTS_PER_MINUTE = 60
++
++/**
++ * Authenticates `Authorization: Bearer {id}|{secret}` against api_tokens and
++ * installs the token's owner as the request user. Every failure — missing,
++ * malformed, unknown, tampered or revoked — is the same JSON 401.
++ */
++export const authenticateApiToken = createBearerTokenMiddleware({
++  store: apiTokenStore,
++  loadUser: (userId) => User.find(Number(userId)),
++  onUnauthorized: (c) => c.json({ message: 'Unauthenticated.' }, 401),
++})
++
++/**
++ * Per token, not per user or IP: two tokens of one account each get their own
++ * budget. Must run after `authenticateApiToken`, which puts the token on the context.
++ * The in-memory store is per process; a multi-instance deployment needs a shared one.
++ */
++export const throttleApiToken = createRateLimitMiddleware({
++  limit: API_REQUESTS_PER_MINUTE,
++  windowMs: 60_000,
++  store: new MemoryRateLimitStore(),
++  keyPrefix: 'api-token:',
++  keyGenerator: (c) => getApiToken(c)?.token.id ?? 'anonymous',
++  onRateLimited: (c, retryAfter) =>
++    c.json({ message: 'Too many requests.', retryAfter }, 429),
++})
 diff --git a/app/Http/Validators/ApiTokenValidator.ts b/app/Http/Validators/ApiTokenValidator.ts
 new file mode 100644
-index 0000000..587005b
+index 0000000..cfdbe9f
 --- /dev/null
 +++ b/app/Http/Validators/ApiTokenValidator.ts
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,15 @@
 +import { z } from 'zod'
 +
 +export const CreateApiTokenSchema = z.object({
-+  name: z.string().trim().min(1, 'Name is required.').max(50, 'Name must be 50 characters or fewer.'),
++  name: z
++    .string({ error: 'Name is required.' })
++    .trim()
++    .min(1, 'Name is required.')
++    .max(50, 'Name must be 50 characters or fewer.'),
 +})
 +
 +export const ApiTokenIdParamSchema = z.object({
 +  id: z.string().min(1),
 +})
++
++export type CreateApiTokenInput = z.infer<typeof CreateApiTokenSchema>
 diff --git a/app/Models/ApiToken.ts b/app/Models/ApiToken.ts
 new file mode 100644
-index 0000000..dd8ff02
+index 0000000..8876ffa
 --- /dev/null
 +++ b/app/Models/ApiToken.ts
-@@ -0,0 +1,11 @@
-+import { defineModel } from '@guren/core'
+@@ -0,0 +1,13 @@
++import { DatabaseApiTokenStore, defineModel } from '@guren/core'
 +import { apiTokens } from '../../db/schema.js'
 +
 +export type ApiTokenRecord = typeof apiTokens.$inferSelect
 +
-+// Rows are written by DatabaseApiTokenStore (app/Auth/apiTokens.ts); this model
-+// only reads and deletes them, so nothing is mass-assignable.
++// Rows are written only through `apiTokenStore` (createApiToken), never from
++// request input, so nothing is mass-assignable.
 +export class ApiToken extends defineModel(apiTokens, {
 +  fillable: [],
 +  hidden: ['hashedToken'],
 +}) {}
-diff --git a/db/migrations/20260925030142_create_api_tokens/migration.sql b/db/migrations/20260925030142_create_api_tokens/migration.sql
++
++export const apiTokenStore = new DatabaseApiTokenStore(apiTokens)
+diff --git a/db/migrations/20260929150334_create_api_tokens/migration.sql b/db/migrations/20260929150334_create_api_tokens/migration.sql
 new file mode 100644
 index 0000000..ee3fe78
 --- /dev/null
-+++ b/db/migrations/20260925030142_create_api_tokens/migration.sql
++++ b/db/migrations/20260929150334_create_api_tokens/migration.sql
 @@ -0,0 +1,11 @@
 +CREATE TABLE `api_tokens` (
 +	`id` text PRIMARY KEY,
@@ -334,16 +344,16 @@ index 0000000..ee3fe78
 +	`created_at` integer NOT NULL,
 +	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
 +);
-diff --git a/db/migrations/20260925030142_create_api_tokens/snapshot.json b/db/migrations/20260925030142_create_api_tokens/snapshot.json
+diff --git a/db/migrations/20260929150334_create_api_tokens/snapshot.json b/db/migrations/20260929150334_create_api_tokens/snapshot.json
 new file mode 100644
-index 0000000..e26dab6
+index 0000000..a787ac2
 --- /dev/null
-+++ b/db/migrations/20260925030142_create_api_tokens/snapshot.json
++++ b/db/migrations/20260929150334_create_api_tokens/snapshot.json
 @@ -0,0 +1,308 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "6387b994-9041-42de-a7e8-4d7f9efebb06",
++  "id": "878b08b2-aa28-44c4-b29a-00c4ebd971b5",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -650,7 +660,7 @@ index 0000000..e26dab6
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..9e704c0 100644
+index 47b96e5..2394814 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
 @@ -20,3 +20,19 @@ export const posts = sqliteTable('posts', {
@@ -658,9 +668,9 @@ index 47b96e5..9e704c0 100644
    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
  })
 +
-+// Property names match the framework's ApiToken fields, which
-+// DatabaseApiTokenStore reads and writes as-is. Only the SHA-256 of the
-+// secret half is kept; `id` is the public half before the `|`.
++// Column property names match the framework's ApiToken fields, which
++// DatabaseApiTokenStore reads and writes directly. `hashed_token` is the
++// SHA-256 of the secret half of `{id}|{secret}`; the secret itself is never stored.
 +export const apiTokens = sqliteTable('api_tokens', {
 +  id: text('id').primaryKey(),
 +  name: text('name').notNull(),
@@ -671,27 +681,20 @@ index 47b96e5..9e704c0 100644
 +  abilities: text('abilities', { mode: 'json' }).$type<string[]>().notNull(),
 +  lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }),
 +  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
-+  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
++  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().$defaultFn(() => new Date()),
 +})
 diff --git a/resources/js/pages/profile/Edit.tsx b/resources/js/pages/profile/Edit.tsx
-index 2d6e948..9f6bd78 100644
+index 2d6e948..95ee6eb 100644
 --- a/resources/js/pages/profile/Edit.tsx
 +++ b/resources/js/pages/profile/Edit.tsx
-@@ -1,21 +1,135 @@
--import { Head, useForm } from '@inertiajs/react'
+@@ -1,21 +1,28 @@
+ import { Head, useForm } from '@inertiajs/react'
 -import type { FormEvent } from 'react'
-+import { Head, router, useForm } from '@inertiajs/react'
 +import { useState, type FormEvent } from 'react'
  import Layout from '../../components/Layout.js'
  import type { ValidationErrors } from '@guren/core'
++import type { ApiTokenSummary } from '@/app/Http/Controllers/ProfileController'
 +import { createApiClient, type ApiRoutes } from '@/.guren/api-client.gen'
-+
-+interface ApiTokenSummary {
-+  id: string
-+  name: string
-+  createdAt: string
-+  lastUsedAt: string | null
-+}
  
  interface Props {
    profile: { name: string; email: string }
@@ -700,9 +703,9 @@ index 2d6e948..9f6bd78 100644
    status?: string
  }
  
-+// Token routes answer JSON (the plain token is shown once, in the create
-+// response), so they go through the typed client rather than Inertia visits.
-+const api = createApiClient<ApiRoutes>({ baseUrl: '' })
++// Token routes answer JSON (the new token is shown once, in the create
++// response), so this section talks to them through the typed client.
++const api = createApiClient<ApiRoutes>({ baseUrl: '', headers: { Accept: 'application/json' } })
 +
  type ProfileFormValues = {
    name: string
@@ -711,9 +714,24 @@ index 2d6e948..9f6bd78 100644
  }
  
 -export default function ProfileEdit({ profile, status }: Props) {
-+function ApiTokens({ tokens }: { tokens: ApiTokenSummary[] }) {
++export default function ProfileEdit({ profile, tokens, status }: Props) {
+   const form = useForm<ProfileFormValues>({
+     name: profile.name,
+     email: profile.email,
+@@ -89,6 +96,114 @@ export default function ProfileEdit({ profile, status }: Props) {
+           </button>
+         </form>
+       </section>
++
++      <ApiTokens initialTokens={tokens} />
+     </Layout>
+   )
+ }
++
++function ApiTokens({ initialTokens }: { initialTokens: ApiTokenSummary[] }) {
++  const [tokens, setTokens] = useState(initialTokens)
 +  const [name, setName] = useState('')
-+  const [created, setCreated] = useState<{ name: string; token: string } | null>(null)
++  const [created, setCreated] = useState<string | null>(null)
 +  const [error, setError] = useState<string | null>(null)
 +  const [busy, setBusy] = useState(false)
 +
@@ -723,16 +741,21 @@ index 2d6e948..9f6bd78 100644
 +    setError(null)
 +    try {
 +      const response = await api.request('profile.tokens.store', { body: { name } })
-+      if (!response.ok) {
-+        setError(response.status === 422 ? 'Name must be 1 to 50 characters.' : 'Could not create the token.')
++      const payload = (await response.json()) as
++        | { id: string; name: string; token: string }
++        | { errors?: Record<string, string[]> }
++      if (!response.ok || !('token' in payload)) {
++        setError(('errors' in payload && payload.errors?.name?.[0]) || 'Could not create the token.')
 +        return
 +      }
-+      const payload = (await response.json()) as { name: string; token: string }
-+      setCreated({ name: payload.name, token: payload.token })
++      setCreated(payload.token)
 +      setName('')
-+      router.reload({ only: ['tokens'] })
++      setTokens((current) => [
++        { id: payload.id, name: payload.name, createdAt: new Date().toISOString(), lastUsedAt: null },
++        ...current,
++      ])
 +    } catch {
-+      setError('Could not create the token — check your connection.')
++      setError('Could not create the token — check your connection and try again.')
 +    } finally {
 +      setBusy(false)
 +    }
@@ -741,28 +764,26 @@ index 2d6e948..9f6bd78 100644
 +  async function revoke(id: string) {
 +    setError(null)
 +    const response = await api.request('profile.tokens.destroy', { params: { id } })
-+    if (!response.ok) {
++    if (!response.ok && response.status !== 404) {
 +      setError('Could not revoke the token.')
 +      return
 +    }
-+    router.reload({ only: ['tokens'] })
++    setTokens((current) => current.filter((token) => token.id !== id))
 +  }
 +
 +  return (
-+    <section className="space-y-4 rounded-g-card border border-g-line bg-g-panel p-8 shadow-g-card">
++    <section className="mt-6 space-y-6 rounded-g-card border border-g-line bg-g-panel p-8 shadow-g-card">
 +      <header>
 +        <h2 className="text-xl font-bold text-g-heading">API tokens</h2>
 +        <p className="mt-2 text-sm text-g-text-2">
-+          Send a token as <code>Authorization: Bearer &lt;token&gt;</code> to use the JSON API.
++          Send a token as <code>Authorization: Bearer &lt;token&gt;</code> to call the JSON API as yourself.
 +        </p>
 +      </header>
 +
-+      {created ? (
-+        <div className="space-y-1 border-y border-g-line py-2.5 text-sm">
-+          <p className="text-g-text">
-+            Token “{created.name}” created. Copy it now — it will not be shown again.
-+          </p>
-+          <code className="block break-all font-mono text-xs text-g-heading">{created.token}</code>
++      {created !== null ? (
++        <div className="space-y-2 border-y border-g-line py-3 text-sm">
++          <p className="font-bold text-g-heading">Copy your new token now — it will not be shown again.</p>
++          <code className="block break-all rounded-g-ctl border border-g-line-strong px-3 py-2 font-mono text-g-text">{created}</code>
 +        </div>
 +      ) : null}
 +
@@ -771,36 +792,37 @@ index 2d6e948..9f6bd78 100644
 +          type="text"
 +          value={name}
 +          maxLength={50}
-+          placeholder="Token name, e.g. CI"
 +          onChange={(event) => setName(event.target.value)}
++          placeholder="Token name, e.g. CI"
 +          className="w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent"
 +        />
 +        <button
 +          type="submit"
 +          disabled={busy}
-+          className="shrink-0 rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
++          className="rounded-g-ctl bg-g-accent px-4 py-2 text-sm font-bold text-g-on-accent transition hover:bg-g-accent-down disabled:cursor-not-allowed disabled:opacity-45"
 +        >
-+          Create token
++          Create
 +        </button>
 +      </form>
-+      {error ? <p className="text-sm text-g-danger">{error}</p> : null}
++      {error !== null ? <p className="text-sm text-g-danger">{error}</p> : null}
 +
 +      {tokens.length === 0 ? (
-+        <p className="text-sm text-g-muted">No tokens yet.</p>
++        <p className="text-sm text-g-muted">No API tokens yet.</p>
 +      ) : (
 +        <ul className="divide-y divide-g-line">
 +          {tokens.map((token) => (
-+            <li key={token.id} className="flex items-center justify-between gap-3 py-2 text-sm">
-+              <span>
-+                <span className="font-bold text-g-heading">{token.name}</span>
-+                <span className="ml-2 text-xs text-g-muted">
-+                  {token.lastUsedAt ? `last used ${new Date(token.lastUsedAt).toLocaleString()}` : 'never used'}
-+                </span>
-+              </span>
++            <li key={token.id} className="flex items-center justify-between gap-4 py-2.5">
++              <div>
++                <p className="font-bold text-g-heading">{token.name}</p>
++                <p className="text-xs text-g-muted">
++                  Created {new Date(token.createdAt).toLocaleDateString()}
++                  {token.lastUsedAt ? ` · last used ${new Date(token.lastUsedAt).toLocaleString()}` : ' · never used'}
++                </p>
++              </div>
 +              <button
 +                type="button"
 +                onClick={() => revoke(token.id)}
-+                className="text-sm font-bold text-g-danger hover:underline"
++                className="rounded-g-ctl border border-g-line-strong px-3 py-1.5 text-sm font-bold text-g-danger transition hover:border-g-muted"
 +              >
 +                Revoke
 +              </button>
@@ -811,83 +833,76 @@ index 2d6e948..9f6bd78 100644
 +    </section>
 +  )
 +}
-+
-+export default function ProfileEdit({ profile, tokens, status }: Props) {
-   const form = useForm<ProfileFormValues>({
-     name: profile.name,
-     email: profile.email,
-@@ -89,6 +203,9 @@ export default function ProfileEdit({ profile, status }: Props) {
-           </button>
-         </form>
-       </section>
-+      <div className="mt-6">
-+        <ApiTokens tokens={tokens} />
-+      </div>
-     </Layout>
-   )
- }
 diff --git a/routes/api.ts b/routes/api.ts
 new file mode 100644
-index 0000000..a1d1926
+index 0000000..166175c
 --- /dev/null
 +++ b/routes/api.ts
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,27 @@
 +import type { Router } from '@guren/core'
-+import ApiPostController from '../app/Http/Controllers/Api/ApiPostController.js'
++import ApiPostController from '../app/Http/Controllers/Api/PostController.js'
++import { authenticateApiToken, throttleApiToken } from '../app/Http/Middleware/ApiTokenMiddleware.js'
 +import { PostPayloadSchema } from '../app/Http/Validators/PostValidator.js'
++import { PostResource } from '../app/Http/Resources/PostResource.js'
 +
-+// Uses the 'api.token' and 'api.throttle' aliases routes/web.ts registers.
-+// Authentication runs before throttling so the limit is counted per token.
-+export function registerApiRoutes(router: Router<'api.token' | 'api.throttle'>): void {
++// Bearer-token API for scripts. Authentication runs before throttling so the
++// limit is keyed by token, and unauthenticated calls never spend a budget.
++// Cookie-less bearer writes are exempt from CSRF by the framework.
++export function registerApiRoutes(router: Router): void {
 +  router.group('/api', (api) => {
-+    api.middleware('api.token', 'api.throttle').group((authed) => {
-+      authed.get('/posts', [ApiPostController, 'index']).name('api.posts.index')
-+      authed.post('/posts', { name: 'api.posts.store', body: PostPayloadSchema }, [ApiPostController, 'store'])
-+    })
++    const middlewares = [authenticateApiToken, throttleApiToken]
++
++    api.get('/posts', {
++      name: 'api.posts.index',
++      middlewares,
++      resource: { data: [PostResource] },
++    }, [ApiPostController, 'index'])
++
++    api.post('/posts', {
++      name: 'api.posts.store',
++      middlewares,
++      body: PostPayloadSchema,
++      resource: { data: PostResource },
++    }, [ApiPostController, 'store'])
 +  })
 +}
 diff --git a/routes/auth.ts b/routes/auth.ts
-index c559cad..1226a67 100644
+index c559cad..3e78dad 100644
 --- a/routes/auth.ts
 +++ b/routes/auth.ts
-@@ -1,4 +1,6 @@
- import type { Router } from '@guren/core'
-+import ApiTokenController from '../app/Http/Controllers/ApiTokenController.js'
-+import { ApiTokenIdParamSchema, CreateApiTokenSchema } from '../app/Http/Validators/ApiTokenValidator.js'
- import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
+@@ -3,6 +3,8 @@ import LoginController from '../app/Http/Controllers/Auth/LoginController.js'
  import RegisterController from '../app/Http/Controllers/Auth/RegisterController.js'
  import DashboardController from '../app/Http/Controllers/DashboardController.js'
-@@ -18,5 +20,7 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+ import ProfileController from '../app/Http/Controllers/ProfileController.js'
++import ApiTokenController from '../app/Http/Controllers/ApiTokenController.js'
++import { CreateApiTokenSchema } from '../app/Http/Validators/ApiTokenValidator.js'
+ 
+ // Uses the 'auth' and 'guest' aliases routes/web.ts registers on this router.
+ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
+@@ -18,5 +20,10 @@ export function registerAuthRoutes(router: Router<'auth' | 'guest'>): void {
      authed.get('/dashboard', [DashboardController, 'index']).name('dashboard')
      authed.get('/profile', [ProfileController, 'edit']).name('profile.edit')
      authed.put('/profile', [ProfileController, 'update']).name('profile.update')
-+    authed.post('/profile/tokens', { name: 'profile.tokens.store', body: CreateApiTokenSchema }, [ApiTokenController, 'store'])
-+    authed.delete('/profile/tokens/:id', { name: 'profile.tokens.destroy', params: ApiTokenIdParamSchema }, [ApiTokenController, 'destroy'])
++    authed.post('/profile/tokens', {
++      name: 'profile.tokens.store',
++      body: CreateApiTokenSchema,
++    }, [ApiTokenController, 'store'])
++    authed.delete('/profile/tokens/:id', { name: 'profile.tokens.destroy' }, [ApiTokenController, 'destroy'])
    })
  }
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..f86e395 100644
+index 4c174ac..8e6bca2 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
-@@ -3,6 +3,8 @@ import HomeController from '../app/Http/Controllers/HomeController.js'
- import PostController from '../app/Http/Controllers/PostController.js'
+@@ -4,6 +4,7 @@ import PostController from '../app/Http/Controllers/PostController.js'
  import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
  import { PostResource } from '../app/Http/Resources/PostResource.js'
-+import { authenticateApiToken, throttleApiToken } from '../app/Auth/apiTokens.js'
-+import { registerApiRoutes } from './api.js'
  import { registerAuthRoutes } from './auth.js'
++import { registerApiRoutes } from './api.js'
  
  export function registerWebRoutes(baseRouter: Router): void {
-@@ -11,6 +13,8 @@ export function registerWebRoutes(baseRouter: Router): void {
-   const router = baseRouter
-     .aliasMiddleware('auth', requireAuthenticated({ redirectTo: '/login' }))
-     .aliasMiddleware('guest', requireGuest({ redirectTo: '/dashboard' }))
-+    .aliasMiddleware('api.token', authenticateApiToken)
-+    .aliasMiddleware('api.throttle', throttleApiToken)
- 
-   router.get('/', [HomeController, 'index']).name('home')
- 
-@@ -18,6 +22,7 @@ export function registerWebRoutes(baseRouter: Router): void {
+   // Named rather than inline so `guren audit` can see which routes are
+@@ -18,6 +19,7 @@ export function registerWebRoutes(baseRouter: Router): void {
    router.get('/health', (c) => c.json({ status: 'ok' }))
  
    registerAuthRoutes(router)
@@ -897,10 +912,10 @@ index 4c174ac..f86e395 100644
      // Registered before '/:id', or "create" is read as a post id.
 diff --git a/tests/controllers/ApiTokenController.test.ts b/tests/controllers/ApiTokenController.test.ts
 new file mode 100644
-index 0000000..8b3e6fd
+index 0000000..03afaee
 --- /dev/null
 +++ b/tests/controllers/ApiTokenController.test.ts
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,138 @@
 +import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp } from '@guren/testing'
 +import app from '../../src/app.js'
@@ -909,10 +924,16 @@ index 0000000..8b3e6fd
 +import { Post } from '../../app/Models/Post.js'
 +import { User, type UserRecord } from '../../app/Models/User.js'
 +
++interface CreatedToken {
++  id: string
++  name: string
++  token: string
++}
++
 +describe('personal API tokens', () => {
 +  let http: TestApp
-+  let alice: UserRecord
-+  let bob: UserRecord
++  let owner: UserRecord
++  let other: UserRecord
 +
 +  beforeAll(async () => {
 +    http = await TestApp.fromApp(app)
@@ -920,75 +941,106 @@ index 0000000..8b3e6fd
 +
 +  beforeEach(async () => {
 +    await resetDatabase()
-+    alice = (await User.create({ name: 'Alice', email: 'alice@example.com', password: 'secret-password' })) as UserRecord
-+    bob = (await User.create({ name: 'Bob', email: 'bob@example.com', password: 'secret-password' })) as UserRecord
++    owner = await User.create({ name: 'Owner', email: 'owner@example.com', password: 'password123' })
++    other = await User.create({ name: 'Other', email: 'other@example.com', password: 'password123' })
 +  })
 +
-+  async function issueToken(user: UserRecord, name = 'CI'): Promise<{ id: string; token: string }> {
++  async function issue(user: UserRecord, name = 'CI'): Promise<CreatedToken> {
 +    const csrf = await http.actingAs(user).withCsrf()
 +    const res = await csrf.json().post('/profile/tokens', { name })
 +    res.assertCreated()
-+    return res.json<{ id: string; token: string }>()
++    return res.json<CreatedToken>()
 +  }
 +
 +  const bearer = (token: string) => http.json().withHeader('Authorization', `Bearer ${token}`)
 +
-+  it('creates a token shown once and stores only its hash', async () => {
-+    const { id, token } = await issueToken(alice)
-+    const secret = token.split('|')[1] ?? ''
++  it('creates a token shown once and stores only a hash', async () => {
++    const created = await issue(owner, 'old laptop')
++    expect(created.name).toBe('old laptop')
++    const secret = created.token.split('|')[1] ?? ''
 +    expect(secret.length).toBeGreaterThanOrEqual(16)
 +
-+    const row = await ApiToken.find(id)
-+    const raw = JSON.stringify(await ApiToken.newQuery().get()) + JSON.stringify(row)
-+    expect(raw).not.toContain(secret)
-+    expect(row?.hashedToken).not.toBe(secret)
++    const rows = await ApiToken.all()
++    expect(rows).toHaveLength(1)
++    for (const value of Object.values(rows[0] as Record<string, unknown>)) {
++      expect(String(value)).not.toContain(secret)
++    }
 +  })
 +
-+  it('rejects invalid names', async () => {
-+    const csrf = await http.actingAs(alice).withCsrf()
++  it('rejects a missing, empty or over-long name', async () => {
++    const csrf = await http.actingAs(owner).withCsrf()
 +    await csrf.json().post('/profile/tokens', {}).assertUnprocessable()
 +    await csrf.json().post('/profile/tokens', { name: '' }).assertUnprocessable()
 +    await csrf.json().post('/profile/tokens', { name: 'x'.repeat(51) }).assertUnprocessable()
-+    expect(await ApiToken.newQuery().count()).toBe(0)
++    expect(await ApiToken.all()).toHaveLength(0)
 +  })
 +
-+  it('lists and creates posts as the token owner', async () => {
-+    const { token } = await issueToken(alice)
-+    await bearer(token).post('/api/posts', { title: 'Hi', excerpt: 'e', body: 'b', authorId: bob.id })
++  it('gives a guest no token', async () => {
++    const csrf = await http.withCsrf()
++    const res = await csrf.json().post('/profile/tokens', { name: 'CI' })
++    expect([302, 401]).toContain(res.status)
++    expect(await ApiToken.all()).toHaveLength(0)
++  })
++
++  it('lists posts newest first for a valid token', async () => {
++    const { token } = await issue(owner)
++    await Post.forceCreate({ title: 'First', excerpt: 'e', body: 'b', authorId: other.id, createdAt: '2026-01-01T00:00:00.000Z' })
++    await Post.forceCreate({ title: 'Second', excerpt: 'e', body: 'b', authorId: owner.id, createdAt: '2026-02-01T00:00:00.000Z' })
++
++    await bearer(token).get('/api/posts')
++      .assertOk()
++      .assertJsonCount(2, 'data')
++      .assertJsonPath('data.0.title', 'Second')
++      .assertJsonPath('data.0.createdAt', '2026-02-01T00:00:00.000Z')
++      .assertJsonPath('data.1.authorId', other.id)
++  })
++
++  it('creates a post owned by the token owner, ignoring authorId', async () => {
++    const { token } = await issue(owner)
++    await bearer(token)
++      .post('/api/posts', { title: 'Release notes', excerpt: 'v1.2', body: 'Changes', authorId: other.id })
 +      .assertCreated()
-+      .assertJsonPath('data.authorId', alice.id)
-+
-+    await bearer(token).get('/api/posts').assertOk().assertJsonCount(1, 'data')
-+    await bearer(token).post('/api/posts', { title: '', excerpt: 'e' }).assertUnprocessable()
-+    expect(await Post.newQuery().count()).toBe(1)
++      .assertJsonPath('data.title', 'Release notes')
++      .assertJsonPath('data.authorId', owner.id)
 +  })
 +
-+  it('answers 401 for missing, malformed or tampered tokens', async () => {
-+    const { token } = await issueToken(alice)
++  it('rejects invalid post input with 422', async () => {
++    const { token } = await issue(owner)
++    await bearer(token).post('/api/posts', { title: '', excerpt: 'x' }).assertUnprocessable()
++    expect(await Post.all()).toHaveLength(0)
++  })
++
++  it('answers 401 for missing, malformed, unknown and tampered tokens', async () => {
++    const { token } = await issue(owner)
++    const [id, secret] = token.split('|') as [string, string]
++    const tampered = `${id}|${secret.slice(0, -1)}${secret.endsWith('a') ? 'b' : 'a'}`
++
 +    await http.json().get('/api/posts').assertUnauthorized()
-+    await bearer('nonsense').get('/api/posts').assertUnauthorized()
-+    await bearer(`${token}x`).get('/api/posts').assertUnauthorized()
-+    await bearer(`${token}x`).post('/api/posts', { title: 'a', excerpt: 'b', body: 'c' }).assertUnauthorized()
-+    expect(await Post.newQuery().count()).toBe(0)
++    for (const bad of ['garbage', `${'0'.repeat(32)}|${'f'.repeat(64)}`, tampered]) {
++      await bearer(bad).get('/api/posts').assertUnauthorized()
++      await bearer(bad).post('/api/posts', { title: 't', excerpt: 'e', body: 'b' }).assertUnauthorized()
++    }
++    await bearer('garbage').post('/api/posts', {}).assertUnauthorized()
++    expect(await Post.all()).toHaveLength(0)
 +  })
 +
 +  it('revokes only the owner\'s token', async () => {
-+    const first = await issueToken(alice, 'one')
-+    const second = await issueToken(alice, 'two')
-+    const bobs = await issueToken(bob)
++    const mine = await issue(owner, 'one')
++    const second = await issue(owner, 'two')
++    const theirs = await issue(other)
 +
-+    const csrf = await http.actingAs(alice).withCsrf()
-+    await csrf.json().delete(`/profile/tokens/${bobs.id}`).assertNotFound()
-+    await bearer(bobs.token).get('/api/posts').assertOk()
++    const csrf = await http.actingAs(owner).withCsrf()
++    await csrf.json().delete(`/profile/tokens/${theirs.id}`).assertNotFound()
++    await bearer(theirs.token).get('/api/posts').assertOk()
 +
-+    await csrf.json().delete(`/profile/tokens/${first.id}`).assertNoContent()
-+    await bearer(first.token).get('/api/posts').assertUnauthorized()
++    await csrf.json().delete(`/profile/tokens/${mine.id}`).assertNoContent()
++    await bearer(mine.token).get('/api/posts').assertUnauthorized()
 +    await bearer(second.token).get('/api/posts').assertOk()
 +  })
 +
-+  it('limits each token to 60 requests per minute', async () => {
-+    const first = await issueToken(alice, 'one')
-+    const second = await issueToken(alice, 'two')
++  it('limits each token to 60 requests a minute', async () => {
++    const first = await issue(owner, 'first')
++    const second = await issue(owner, 'second')
 +
 +    for (let i = 0; i < 60; i++) {
 +      await bearer(first.token).get('/api/posts').assertOk()
@@ -996,7 +1048,7 @@ index 0000000..8b3e6fd
 +    const limited = await bearer(first.token).get('/api/posts')
 +    limited.assertStatus(429)
 +    const retryAfter = Number(limited.headers.get('Retry-After'))
-+    expect(retryAfter).toBeGreaterThanOrEqual(0)
++    expect(retryAfter).toBeGreaterThan(0)
 +    expect(retryAfter).toBeLessThanOrEqual(60)
 +
 +    await bearer(second.token).get('/api/posts').assertOk()

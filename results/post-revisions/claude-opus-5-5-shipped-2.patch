@@ -27,7 +27,7 @@ index 61e4c73..d74e715 100644
    'posts.show': { method: 'GET', path: '/posts/:id' },
    'posts.store': { method: 'POST', path: '/posts' },
 diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
-index 392ad58..82a3c21 100644
+index 392ad58..d42e422 100644
 --- a/.guren/data.gen.ts
 +++ b/.guren/data.gen.ts
 @@ -2,6 +2,7 @@
@@ -38,19 +38,22 @@ index 392ad58..82a3c21 100644
  import type { WithRelations } from '@guren/core'
  
  /**
-@@ -20,4 +21,10 @@ export namespace Data {
+@@ -20,4 +21,13 @@ export namespace Data {
    createdAt: string
    author?: PostAuthorSummary
  }
 +
 +  export type PostRevision = {
 +  id: number
++  postId: number
 +  title: string
++  excerpt: string
++  body: string
 +  createdAt: string
 +}
  }
 diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
-index 8db6dc3..f55920a 100644
+index 8db6dc3..aff43fd 100644
 --- a/.guren/pages.gen.ts
 +++ b/.guren/pages.gen.ts
 @@ -4,6 +4,7 @@
@@ -74,7 +77,7 @@ index 8db6dc3..f55920a 100644
  }
    'posts/Index': PaginatedPageProps<PostResourceData> & {}
 +  'posts/Revisions': {
-+  post: { id: number; title: string }
++  post: PostResourceData
 +  revisions: PostRevisionResourceData[]
 +}
    'posts/Show': {
@@ -89,7 +92,7 @@ index 8db6dc3..f55920a 100644
    },
    profile: {
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..c2ccbc7 100644
+index 846382c..a5e97e2 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -11,6 +11,8 @@ export const routeManifest = {
@@ -112,46 +115,63 @@ index 846382c..c2ccbc7 100644
      search: (query?: RouteQuery) => route('posts.search', query),
      show: (params: RouteParams<'posts.show'>, query?: RouteQuery) => route('posts.show', params, query),
      store: (query?: RouteQuery) => route('posts.store', query),
+@@ -147,6 +153,7 @@ function appendQueryString(path: string, query?: RouteQuery): string {
+ declare module '@guren/core' {
+   interface GurenRouteContracts {
+     routes: {
++      'posts.revisions.restore': { params: { id: number; revisionId: number } }
+       'posts.search': { body: { keywords: string[]; limit: number } }
+       'posts.store': { body: { title: string; excerpt: string; body: string } }
+       'posts.update': { body: { title: string; excerpt: string; body: string } }
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..479dd78 100644
+index 8f702c5..9b1aa1b 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
 @@ -1,6 +1,7 @@
  import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
  import { pages } from '@/.guren/pages.gen'
  import { Post } from '../../Models/Post.js'
-+import { PostRevision } from '../../Models/PostRevision.js'
++import { PostRevision, keepRevision } from '../../Models/PostRevision.js'
  import type { UserRecord } from '../../Models/User.js'
  import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
  import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
-@@ -91,6 +92,7 @@ export default class PostController extends Controller {
+@@ -91,7 +92,10 @@ export default class PostController extends Controller {
      await this.authorize('update', [Post, post])
  
      const { body: data } = this.validated('posts.update')
-+    await PostRevision.keep(post)
-     await Post.update({ id: post.id }, data)
+-    await Post.update({ id: post.id }, data)
++    await Post.transaction(async (trx) => {
++      await keepRevision(post, trx)
++      await Post.update({ id: post.id }, data, { trx })
++    })
  
      return this.redirect(`/posts/${post.id}`)
-@@ -101,6 +103,9 @@ export default class PostController extends Controller {
+   }
+@@ -101,7 +105,12 @@ export default class PostController extends Controller {
      const post = await Post.findOrFail(id)
      await this.authorize('delete', [Post, post])
  
-+    // Explicit rather than relying on ON DELETE CASCADE, which SQLite only
-+    // honours when foreign_keys is enabled on the connection.
-+    await PostRevision.delete({ postId: post.id })
-     await Post.delete({ id: post.id })
+-    await Post.delete({ id: post.id })
++    // Explicit because SQLite only honours ON DELETE CASCADE with the
++    // foreign_keys pragma enabled.
++    await Post.transaction(async (trx) => {
++      await PostRevision.delete({ postId: post.id }, { trx })
++      await Post.delete({ id: post.id }, { trx })
++    })
  
      return this.redirect('/posts')
+   }
 diff --git a/app/Http/Controllers/PostRevisionController.ts b/app/Http/Controllers/PostRevisionController.ts
 new file mode 100644
-index 0000000..a0dba64
+index 0000000..a640559
 --- /dev/null
 +++ b/app/Http/Controllers/PostRevisionController.ts
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,45 @@
 +import { Controller } from '@guren/core'
 +import { pages } from '@/.guren/pages.gen'
 +import { Post } from '../../Models/Post.js'
-+import { PostRevision } from '../../Models/PostRevision.js'
++import { PostRevision, keepRevision } from '../../Models/PostRevision.js'
++import { PostResource } from '../Resources/PostResource.js'
 +import { PostRevisionResource } from '../Resources/PostRevisionResource.js'
 +import { PostIdParamSchema, PostRevisionParamSchema } from '../Validators/PostValidator.js'
 +
@@ -159,13 +179,15 @@ index 0000000..a0dba64
 +  async index(): Promise<Response> {
 +    const { id } = this.validateParams(PostIdParamSchema)
 +    const post = await Post.findOrFail(id)
-+    await this.authorize('viewRevisions', [Post, post])
++    // History is private: gated on `update`, the same ability as editing.
++    await this.authorize('update', [Post, post])
 +
-+    // Ordered by id: rows kept within the same millisecond share a created_at.
-+    const revisions = await PostRevision.where({ postId: post.id }).orderBy('id', 'desc').get()
++    const revisions = await PostRevision.where({ postId: post.id })
++      .orderBy('id', 'desc')
++      .get()
 +
 +    return this.inertia(pages.posts.Revisions, {
-+      post: { id: post.id, title: post.title },
++      post: new PostResource(post).toJSON(),
 +      revisions: revisions.map((revision) => new PostRevisionResource(revision).toJSON()),
 +    })
 +  }
@@ -175,29 +197,36 @@ index 0000000..a0dba64
 +    const post = await Post.findOrFail(id)
 +    await this.authorize('update', [Post, post])
 +
++    // Scoped to the post, so a revision of another post answers 404.
 +    const revision = await PostRevision.where({ id: revisionId, postId: post.id }).firstOrFail()
 +
-+    await PostRevision.keep(post)
-+    await Post.update(
-+      { id: post.id },
-+      { title: revision.title, excerpt: revision.excerpt, body: revision.body },
-+    )
++    await Post.transaction(async (trx) => {
++      await keepRevision(post, trx)
++      await Post.update(
++        { id: post.id },
++        { title: revision.title, excerpt: revision.excerpt, body: revision.body },
++        { trx },
++      )
++    })
 +
 +    return this.redirect(`/posts/${post.id}`)
 +  }
 +}
 diff --git a/app/Http/Resources/PostRevisionResource.ts b/app/Http/Resources/PostRevisionResource.ts
 new file mode 100644
-index 0000000..b2f74ed
+index 0000000..9c4eb23
 --- /dev/null
 +++ b/app/Http/Resources/PostRevisionResource.ts
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,26 @@
 +import { Resource } from '@guren/core'
 +import type { PostRevisionRecord } from '../../Models/PostRevision.js'
 +
 +export interface PostRevisionResourceData extends Record<string, unknown> {
 +  id: number
++  postId: number
 +  title: string
++  excerpt: string
++  body: string
 +  createdAt: string
 +}
 +
@@ -207,7 +236,10 @@ index 0000000..b2f74ed
 +
 +    return {
 +      id: revision.id,
++      postId: revision.postId,
 +      title: revision.title,
++      excerpt: revision.excerpt,
++      body: revision.body,
 +      createdAt: new Date(revision.createdAt).toISOString(),
 +    }
 +  }
@@ -230,49 +262,35 @@ index 804642a..a4e10b4 100644
  })
 diff --git a/app/Models/PostRevision.ts b/app/Models/PostRevision.ts
 new file mode 100644
-index 0000000..a6e3f2a
+index 0000000..dbaf4ca
 --- /dev/null
 +++ b/app/Models/PostRevision.ts
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,20 @@
 +import { defineModel } from '@guren/core'
 +import { postRevisions } from '../../db/schema.js'
 +import type { PostRecord } from './Post.js'
 +
 +export type PostRevisionRecord = typeof postRevisions.$inferSelect
 +
-+export class PostRevision extends defineModel(postRevisions, {
-+  fillable: ['postId', 'title', 'excerpt', 'body'],
-+}) {
-+  /** Keeps the title, excerpt and body `post` has now, before it is overwritten. */
-+  static async keep(post: PostRecord): Promise<void> {
-+    await PostRevision.create({
-+      postId: post.id,
-+      title: post.title,
-+      excerpt: post.excerpt,
-+      body: post.body,
-+    })
-+  }
-+}
-diff --git a/app/Policies/PostPolicy.ts b/app/Policies/PostPolicy.ts
-index 0ceaa1e..2cd21f2 100644
---- a/app/Policies/PostPolicy.ts
-+++ b/app/Policies/PostPolicy.ts
-@@ -26,6 +26,10 @@ export class PostPolicy extends Policy {
-     return user !== null && Number(user.id) === post.authorId
-   }
- 
-+  viewRevisions(user: AuthUser | null, post: PostLike): boolean {
-+    return user !== null && Number(user.id) === post.authorId
-+  }
++type TransactionHandle = Parameters<Parameters<typeof PostRevision.transaction>[0]>[0]
 +
-   delete(user: AuthUser | null, post: PostLike): boolean {
-     return user !== null && Number(user.id) === post.authorId
-   }
-diff --git a/db/migrations/20260925024738_add_post_revisions/migration.sql b/db/migrations/20260925024738_add_post_revisions/migration.sql
++export class PostRevision extends defineModel(postRevisions, {
++  fillable: ['title', 'excerpt', 'body'],
++}) {}
++
++/** Snapshots the post's current content; call before overwriting it. */
++export async function keepRevision(post: PostRecord, trx?: TransactionHandle): Promise<void> {
++  // forceCreate because `postId` comes from the loaded post, never from input.
++  await PostRevision.forceCreate(
++    { postId: post.id, title: post.title, excerpt: post.excerpt, body: post.body },
++    { trx },
++  )
++}
+diff --git a/db/migrations/20260929152308_add_post_revisions/migration.sql b/db/migrations/20260929152308_add_post_revisions/migration.sql
 new file mode 100644
 index 0000000..6c95e24
 --- /dev/null
-+++ b/db/migrations/20260925024738_add_post_revisions/migration.sql
++++ b/db/migrations/20260929152308_add_post_revisions/migration.sql
 @@ -0,0 +1,9 @@
 +CREATE TABLE `post_revisions` (
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
@@ -283,16 +301,16 @@ index 0000000..6c95e24
 +	`created_at` text NOT NULL,
 +	CONSTRAINT `fk_post_revisions_post_id_posts_id_fk` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`) ON DELETE CASCADE
 +);
-diff --git a/db/migrations/20260925024738_add_post_revisions/snapshot.json b/db/migrations/20260925024738_add_post_revisions/snapshot.json
+diff --git a/db/migrations/20260929152308_add_post_revisions/snapshot.json b/db/migrations/20260929152308_add_post_revisions/snapshot.json
 new file mode 100644
-index 0000000..c003578
+index 0000000..c75e753
 --- /dev/null
-+++ b/db/migrations/20260925024738_add_post_revisions/snapshot.json
++++ b/db/migrations/20260929152308_add_post_revisions/snapshot.json
 @@ -0,0 +1,279 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "9f528438-3edc-4984-8d1a-3cff28d4ec91",
++  "id": "b46b0f9e-38aa-4ac6-9efe-480c5cdff844",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -590,39 +608,42 @@ index 47b96e5..87d48aa 100644
 +})
 diff --git a/resources/js/pages/posts/Revisions.tsx b/resources/js/pages/posts/Revisions.tsx
 new file mode 100644
-index 0000000..f6984e4
+index 0000000..5af7878
 --- /dev/null
 +++ b/resources/js/pages/posts/Revisions.tsx
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,55 @@
 +import { Head, Link } from '@inertiajs/react'
++import type { PostResourceData } from '@/app/Http/Resources/PostResource'
 +import type { PostRevisionResourceData } from '@/app/Http/Resources/PostRevisionResource'
 +import { route } from '@/.guren/routes.gen'
 +import Layout from '../../components/Layout.js'
 +
 +interface Props {
-+  post: { id: number; title: string }
++  post: PostResourceData
 +  revisions: PostRevisionResourceData[]
 +}
 +
 +export default function PostRevisions({ post, revisions }: Props) {
 +  return (
 +    <Layout>
-+      <Head title={`Revisions of ${post.title}`} />
++      <Head title={`Revisions · ${post.title}`} />
 +      <section className="space-y-6">
-+        <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
-+          <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
-+          Revisions
-+        </h1>
-+        <p className="text-g-text-2">Earlier versions of “{post.title}”, newest first.</p>
++        <header className="space-y-2">
++          <h1 className="flex items-center gap-3 text-3xl font-bold text-g-heading">
++            <span aria-hidden className="h-7 w-[3px] shrink-0 rounded-full bg-[image:var(--g-tick)]" />
++            Revisions
++          </h1>
++          <p className="text-sm text-g-muted">Earlier versions of “{post.title}”, newest first.</p>
++        </header>
 +
 +        {revisions.length === 0 ? (
-+          <p className="text-g-muted">No earlier versions yet — one is kept each time you save an edit.</p>
++          <p className="text-g-text-2">No earlier versions yet — one is kept each time you save an edit.</p>
 +        ) : (
 +          <ul className="divide-y divide-g-line border-y border-g-line">
 +            {revisions.map((revision) => (
 +              <li key={revision.id} className="flex items-center justify-between gap-4 py-3">
-+                <div>
-+                  <p className="font-bold text-g-heading">{revision.title}</p>
++                <div className="min-w-0">
++                  <p className="truncate font-bold text-g-heading">{revision.title}</p>
 +                  <p className="text-sm text-g-muted">{new Date(revision.createdAt).toLocaleString()}</p>
 +                </div>
 +                <Link
@@ -630,7 +651,7 @@ index 0000000..f6984e4
 +                  method="post"
 +                  as="button"
 +                  onBefore={() => window.confirm('Restore this version? The current one is kept as a revision.')}
-+                  className="rounded-g-ctl border border-g-line-strong px-3 py-1 text-sm font-bold text-g-accent-text transition hover:underline"
++                  className="shrink-0 rounded-g-ctl border border-g-line px-3 py-1 text-sm font-bold text-g-accent-text transition hover:underline"
 +                >
 +                  Restore
 +                </Link>
@@ -661,25 +682,31 @@ index 537c81e..0ec4309 100644
                  href={route('posts.destroy', { id: post.id })}
                  method="delete"
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..fa1d11c 100644
+index 4c174ac..cab4f22 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
-@@ -1,6 +1,7 @@
+@@ -1,7 +1,12 @@
  import { Router, requireAuthenticated, requireGuest } from '@guren/core'
  import HomeController from '../app/Http/Controllers/HomeController.js'
  import PostController from '../app/Http/Controllers/PostController.js'
+-import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
 +import PostRevisionController from '../app/Http/Controllers/PostRevisionController.js'
- import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
++import {
++  PostPayloadSchema,
++  PostRevisionParamSchema,
++  PostSearchSchema,
++} from '../app/Http/Validators/PostValidator.js'
  import { PostResource } from '../app/Http/Resources/PostResource.js'
  import { registerAuthRoutes } from './auth.js'
-@@ -27,6 +28,12 @@ export function registerWebRoutes(baseRouter: Router): void {
+ 
+@@ -27,6 +32,12 @@ export function registerWebRoutes(baseRouter: Router): void {
        authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
        authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
        authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
 +      authed.get('/:id/revisions', [PostRevisionController, 'index']).name('posts.revisions.index')
 +      authed.post(
 +        '/:id/revisions/:revisionId/restore',
-+        { name: 'posts.revisions.restore' },
++        { name: 'posts.revisions.restore', params: PostRevisionParamSchema },
 +        [PostRevisionController, 'restore'],
 +      )
      })
@@ -687,40 +714,34 @@ index 4c174ac..fa1d11c 100644
      posts.get('/', [PostController, 'index']).name('posts.index')
 diff --git a/tests/PostRevisionController.test.ts b/tests/PostRevisionController.test.ts
 new file mode 100644
-index 0000000..29bfea3
+index 0000000..ac19d4c
 --- /dev/null
 +++ b/tests/PostRevisionController.test.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,118 @@
 +import { beforeAll, beforeEach, describe, expect, it } from 'bun:test'
 +import { TestApp } from '@guren/testing'
 +import app from '../src/app.js'
 +import { resetDatabase } from '../config/database.js'
-+import { Post, type PostRecord } from '../app/Models/Post.js'
++import { Post } from '../app/Models/Post.js'
 +import { PostRevision } from '../app/Models/PostRevision.js'
 +import { User, type UserRecord } from '../app/Models/User.js'
 +
-+let userCount = 0
++let counter = 0
 +
 +async function makeUser(): Promise<UserRecord> {
-+  userCount += 1
-+  return (await User.create({
-+    name: `User ${userCount}`,
-+    email: `user${userCount}@example.com`,
-+    password: 'password123',
-+  })) as UserRecord
++  counter += 1
++  return User.create({ name: `User ${counter}`, email: `user${counter}@example.com`, password: 'password123' })
 +}
 +
-+async function makePost(author: UserRecord, title = 'First'): Promise<PostRecord> {
-+  return (await Post.forceCreate({ title, excerpt: `${title} excerpt`, body: `${title} body`, authorId: author.id })) as PostRecord
++async function makePost(author: UserRecord, title = 'First') {
++  return Post.forceCreate({ title, excerpt: `${title} excerpt`, body: `${title} body`, authorId: author.id })
 +}
 +
-+function postInput(title: string) {
-+  return { title, excerpt: `${title} excerpt`, body: `${title} body` }
-+}
-+
-+async function revisionTitles(postId: number): Promise<string[]> {
-+  const rows = await PostRevision.where({ postId }).orderBy('id', 'desc').get()
-+  return rows.map((row) => row.title)
++function revisionTitles(postId: number) {
++  return PostRevision.where({ postId })
++    .orderBy('id', 'desc')
++    .get()
++    .then((rows) => rows.map((row) => row.title))
 +}
 +
 +describe('post revisions', () => {
@@ -734,107 +755,84 @@ index 0000000..29bfea3
 +    await resetDatabase()
 +  })
 +
-+  it('keeps the previous version on each edit and none on create', async () => {
++  it('keeps the previous version on each edit and restores one', async () => {
 +    const author = await makeUser()
++    const post = await makePost(author)
 +    const csrf = await http.actingAs(author).withCsrf()
 +
-+    await csrf.post('/posts', postInput('First')).assertRedirect()
-+    const post = (await Post.first({ authorId: author.id })) as PostRecord
-+    expect(await revisionTitles(post.id)).toEqual([])
-+
-+    await csrf.put(`/posts/${post.id}`, postInput('Second')).assertRedirect(`/posts/${post.id}`)
-+    await csrf.put(`/posts/${post.id}`, postInput('Third')).assertRedirect(`/posts/${post.id}`)
++    for (const title of ['Second', 'Third']) {
++      await csrf.put(`/posts/${post.id}`, { title, excerpt: `${title} excerpt`, body: `${title} body` })
++        .assertRedirect(`/posts/${post.id}`)
++    }
 +    expect(await revisionTitles(post.id)).toEqual(['Second', 'First'])
 +
-+    const res = await csrf.get(`/posts/${post.id}/revisions`)
++    const res = await http.actingAs(author).withHeader('X-Inertia', 'true').get(`/posts/${post.id}/revisions`)
 +    res.assertOk()
-+  })
++    const page = await res.json<{ component: string; props: { revisions: { id: number; title: string; createdAt: string }[] } }>()
++    expect(page.props.revisions.map((r) => r.title)).toEqual(['Second', 'First'])
++    expect(typeof page.props.revisions[0]?.createdAt).toBe('string')
 +
-+  it('keeps nothing for a refused edit', async () => {
-+    const author = await makeUser()
-+    const other = await makeUser()
-+    const post = await makePost(author)
-+
-+    await (await http.actingAs(author).withCsrf()).json().put(`/posts/${post.id}`, { title: '' }).assertUnprocessable()
-+    await (await http.actingAs(other).withCsrf()).put(`/posts/${post.id}`, postInput('Hacked')).assertForbidden()
-+
-+    expect(await revisionTitles(post.id)).toEqual([])
-+  })
-+
-+  it('lists revisions newest first in the page props', async () => {
-+    const author = await makeUser()
-+    const post = await makePost(author)
-+    const csrf = await http.actingAs(author).withCsrf()
-+    await csrf.put(`/posts/${post.id}`, postInput('Second'))
-+    await csrf.put(`/posts/${post.id}`, postInput('Third'))
-+
-+    const res = await http.actingAs(author).json().get(`/posts/${post.id}/revisions`).assertInertia('posts/Revisions')
-+    const page = await res.json<{ props: { revisions: Array<{ id: number; title: string; createdAt: string }> } }>()
-+    const revisions = page.props.revisions
-+    expect(revisions.map((r) => r.title)).toEqual(['Second', 'First'])
-+    expect(typeof revisions[0]?.createdAt).toBe('string')
-+  })
-+
-+  it('restores a revision and keeps the version it replaced', async () => {
-+    const author = await makeUser()
-+    const post = await makePost(author)
-+    const csrf = await http.actingAs(author).withCsrf()
-+    await csrf.put(`/posts/${post.id}`, postInput('Second'))
-+    await csrf.put(`/posts/${post.id}`, postInput('Third'))
-+
-+    const first = (await PostRevision.first({ postId: post.id, title: 'First' }))!
++    const first = page.props.revisions[1]!
 +    await csrf.post(`/posts/${post.id}/revisions/${first.id}/restore`).assertRedirect(`/posts/${post.id}`)
 +
-+    const restored = (await Post.find(post.id)) as PostRecord
++    const restored = await Post.findOrFail(post.id)
 +    expect(restored.title).toBe('First')
 +    expect(restored.body).toBe('First body')
 +    expect(await revisionTitles(post.id)).toEqual(['Third', 'Second', 'First'])
++  })
++
++  it('keeps nothing when an edit is refused', async () => {
++    const author = await makeUser()
++    const post = await makePost(author)
++    const csrf = await http.actingAs(author).withCsrf()
++
++    await csrf.json().put(`/posts/${post.id}`, { title: '', excerpt: 'x', body: 'y' }).assertUnprocessable()
++    expect(await revisionTitles(post.id)).toEqual([])
 +  })
 +
 +  it('refuses other users and redirects guests', async () => {
 +    const author = await makeUser()
 +    const other = await makeUser()
 +    const post = await makePost(author)
-+    await (await http.actingAs(author).withCsrf()).put(`/posts/${post.id}`, postInput('Second'))
-+    const revision = (await PostRevision.first({ postId: post.id }))!
++    await Post.update({ id: post.id }, { title: 'Second' })
++    const revision = await PostRevision.forceCreate({ postId: post.id, title: 'First', excerpt: 'e', body: 'b' })
 +
 +    await http.actingAs(other).get(`/posts/${post.id}/revisions`).assertForbidden()
-+    await (await http.actingAs(other).withCsrf())
-+      .post(`/posts/${post.id}/revisions/${revision.id}/restore`)
-+      .assertForbidden()
++    const csrf = await http.actingAs(other).withCsrf()
++    await csrf.post(`/posts/${post.id}/revisions/${revision.id}/restore`).assertForbidden()
 +
 +    await http.get(`/posts/${post.id}/revisions`).assertRedirect('/login')
-+    await (await http.withCsrf()).post(`/posts/${post.id}/revisions/${revision.id}/restore`).assertRedirect('/login')
++    const guest = await http.withCsrf()
++    await guest.post(`/posts/${post.id}/revisions/${revision.id}/restore`).assertRedirect('/login')
 +
-+    expect(((await Post.find(post.id)) as PostRecord).title).toBe('Second')
++    expect((await Post.findOrFail(post.id)).title).toBe('Second')
 +    expect(await revisionTitles(post.id)).toEqual(['First'])
 +  })
 +
 +  it('answers 404 for a revision of another post', async () => {
 +    const author = await makeUser()
-+    const post = await makePost(author, 'Mine')
-+    const otherPost = await makePost(author, 'Other')
++    const post = await makePost(author, 'A')
++    const otherPost = await makePost(author, 'B')
++    const revision = await PostRevision.forceCreate({ postId: otherPost.id, title: 'Old B', excerpt: 'e', body: 'b' })
++
 +    const csrf = await http.actingAs(author).withCsrf()
-+    await csrf.put(`/posts/${otherPost.id}`, postInput('Other 2'))
-+    const foreign = (await PostRevision.first({ postId: otherPost.id }))!
++    await csrf.post(`/posts/${post.id}/revisions/${revision.id}/restore`).assertNotFound()
 +
-+    await csrf.post(`/posts/${post.id}/revisions/${foreign.id}/restore`).assertNotFound()
-+
-+    expect(((await Post.find(post.id)) as PostRecord).title).toBe('Mine')
++    expect((await Post.findOrFail(post.id)).title).toBe('A')
 +    expect(await revisionTitles(post.id)).toEqual([])
 +  })
 +
-+  it('deletes a post history with the post and leaves others alone', async () => {
++  it('deletes a post history with the post', async () => {
 +    const author = await makeUser()
-+    const post = await makePost(author, 'Gone')
-+    const kept = await makePost(author, 'Kept')
-+    const csrf = await http.actingAs(author).withCsrf()
-+    await csrf.put(`/posts/${post.id}`, postInput('Gone 2'))
-+    await csrf.put(`/posts/${kept.id}`, postInput('Kept 2'))
++    const post = await makePost(author, 'A')
++    const otherPost = await makePost(author, 'B')
++    await PostRevision.forceCreate({ postId: post.id, title: 'Old A', excerpt: 'e', body: 'b' })
++    await PostRevision.forceCreate({ postId: otherPost.id, title: 'Old B', excerpt: 'e', body: 'b' })
 +
++    const csrf = await http.actingAs(author).withCsrf()
 +    await csrf.delete(`/posts/${post.id}`).assertRedirect('/posts')
 +
 +    expect(await revisionTitles(post.id)).toEqual([])
-+    expect(await revisionTitles(kept.id)).toEqual(['Kept'])
++    expect(await revisionTitles(otherPost.id)).toEqual(['Old B'])
 +  })
 +})

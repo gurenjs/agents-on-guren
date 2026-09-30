@@ -1,6 +1,6 @@
 diff --git a/.guren/agents.gen.ts b/.guren/agents.gen.ts
 new file mode 100644
-index 0000000..9e8acc3
+index 0000000..50cade6
 --- /dev/null
 +++ b/.guren/agents.gen.ts
 @@ -0,0 +1,132 @@
@@ -38,7 +38,7 @@ index 0000000..9e8acc3
 +    routeName: "posts.search",
 +    method: "QUERY",
 +    path: "/posts/search",
-+    description: "Search published posts by keyword. Matches any keyword against titles and excerpts, newest first.\n\nReturns: { data: Array<{\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}> }",
++    description: "Search the blog's posts. Returns the posts whose title or excerpt contains any of the keywords, newest first.\n\nReturns: { data: Array<{\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n}> }",
 +    inputSchema: {
 +      "type": "object",
 +      "properties": {
@@ -81,7 +81,7 @@ index 0000000..9e8acc3
 +    routeName: "posts.store",
 +    method: "POST",
 +    path: "/posts",
-+    description: "Create a blog post authored by the signed-in user. Takes a title, an excerpt and the body.\n\nReturns: { data: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n} }",
++    description: "Create a blog post. The author is always the user the caller is signed in as, whatever the input says. Returns the created post.\n\nReturns: { data: {\n  id: number\n  title: string\n  excerpt: string\n  body: string\n  authorId: number\n  // Serialized here because `created_at` is a string on SQLite and a Date on\n  // PostgreSQL and MySQL — pages should not have to know which.\n  createdAt: string\n  author?: PostAuthorSummary\n} }",
 +    inputSchema: {
 +      "type": "object",
 +      "properties": {
@@ -149,54 +149,95 @@ index 61e4c73..a88913e 100644
    'posts.update': {
      method: 'PUT'
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..1c5146a 100644
+index 8f702c5..c2b4f95 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -72,9 +72,20 @@ export default class PostController extends Controller {
+@@ -72,9 +72,24 @@ export default class PostController extends Controller {
      // it comes from the session, and a request must never be able to set it.
      const post = await Post.forceCreate({ ...data, authorId: author.id })
  
-+    // The `posts_store` MCP tool reaches this action with a JSON accept and
-+    // no Inertia header; it wants the created post, not a redirect.
-+    if (post && this.wantsJson()) {
-+      return this.json({ data: new PostResource(post).toJSON() }, { status: 201 })
++    // The form follows the redirect to the new post's page. A caller asking
++    // for JSON — the `posts_store` agent tool — has no page to land on, and
++    // gets the post it created instead.
++    if (post?.id && this.expectsJson()) {
++      return this.created({ data: new PostResource(post).toJSON() })
 +    }
 +
      return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
    }
  
-+  private wantsJson(): boolean {
-+    if (this.request.header('x-inertia')) return false
-+    return (this.request.header('accept') ?? '').includes('application/json')
++  // An Inertia visit is answered like a browser whatever it accepts: its
++  // client expects the redirect.
++  private expectsJson(): boolean {
++    if (this.request.header('X-Inertia')) return false
++    const accept = this.request.header('Accept')?.toLowerCase() ?? ''
++    return accept.includes('application/json') && !accept.includes('text/html')
 +  }
 +
    async edit(): Promise<Response> {
      const { id } = this.validateParams(PostIdParamSchema)
      const post = await Post.findOrFail(id)
-diff --git a/app/Providers/AuthProvider.ts b/app/Providers/AuthProvider.ts
-index 4a7788b..0349064 100644
---- a/app/Providers/AuthProvider.ts
-+++ b/app/Providers/AuthProvider.ts
-@@ -1,5 +1,6 @@
--import { ServiceProvider, shareInertiaProps, AUTH_CONTEXT_KEY } from '@guren/core'
-+import { ServiceProvider, shareInertiaProps, AUTH_CONTEXT_KEY, DatabaseApiTokenStore } from '@guren/core'
- import type { AuthContext, AuthManager } from '@guren/core'
-+import { apiTokens } from '../../db/schema.js'
- import { User } from '../Models/User.js'
- 
- export default class AuthProvider extends ServiceProvider {
-@@ -11,6 +12,11 @@ export default class AuthProvider extends ServiceProvider {
-       rememberTokenColumn: 'rememberToken',
-       credentialsPasswordField: 'password',
-     })
+diff --git a/app/Http/Middleware/ConfineApiTokensMiddleware.ts b/app/Http/Middleware/ConfineApiTokensMiddleware.ts
+new file mode 100644
+index 0000000..3e2ced0
+--- /dev/null
++++ b/app/Http/Middleware/ConfineApiTokensMiddleware.ts
+@@ -0,0 +1,55 @@
++import {
++  AuthorizationException,
++  defineMiddleware,
++  deriveAgentTools,
++  gateToolCall,
++  getRequestContainer,
++  readBearerToken,
++  verifyApiToken,
++  type Application,
++  type AuthManager,
++  type Context,
++  type DerivedAgentTool,
++} from '@guren/core'
 +
-+    // Bearer credentials for the MCP endpoint. A request carrying
-+    // `Authorization: Bearer …` resolves to the token guard and acts as the
-+    // token's user; `createApiToken()` from @guren/core issues them.
-+    auth.useTokens(new DatabaseApiTokenStore(apiTokens), { provider: 'users' })
-   }
- 
-   // Nothing shares the signed-in user with the frontend by default, so every
++// A bearer sent straight to a route signs in as its user, past the scopes only
++// /mcp checks: a `tools:read` token would be the whole account. So a token
++// reaches a route only if the route is an agent tool its scopes grant.
++// Calls from /mcp re-enter the app through here and face the same gate.
++const toolsByApp = new WeakMap<Application, DerivedAgentTool[]>()
++
++function agentTools(app: Application): DerivedAgentTool[] {
++  let tools = toolsByApp.get(app)
++  if (!tools) {
++    // Derived on the first bearer request rather than at registration, when
++    // the routes after this middleware have yet to be declared.
++    tools = deriveAgentTools(app.router.definitions()).tools
++    toolsByApp.set(app, tools)
++  }
++  return tools
++}
++
++export const ConfineApiTokensMiddleware = defineMiddleware(async (ctx: Context, next: () => Promise<void>) => {
++  // The rule the token guard selects itself by: anything it would not read
++  // as a bearer stays an ordinary session request.
++  const bearer = readBearerToken(ctx.req.header('Authorization'))
++  if (!bearer) return next()
++
++  const container = getRequestContainer(ctx)
++  const store = container.make<AuthManager>('auth').getApiTokenStore()
++  const token = store ? await verifyApiToken(bearer, store, { updateLastUsed: false }) : null
++  // Unknown, expired or revoked: the guard finds no user, and the route
++  // answers as it answers any guest.
++  if (!token) return next()
++
++  const tool = agentTools(container.make<Application>('app'))
++    .find((candidate) => candidate.method === ctx.req.method && candidate.path === ctx.req.routePath)
++  if (!tool) {
++    throw new AuthorizationException('API tokens can only call the agent tools they are scoped for.')
++  }
++
++  const verdict = gateToolCall(tool, token.abilities, { scopeSubject: 'The token\'s scopes' })
++  if (!verdict.allowed) throw new AuthorizationException(verdict.message)
++
++  return next()
++})
 diff --git a/bun.lock b/bun.lock
 index 8ac2665..853d62a 100644
 --- a/bun.lock
@@ -218,33 +259,33 @@ index 8ac2665..853d62a 100644
      "@guren/server": ["@guren/server@2.26.0", "", { "dependencies": { "@guren/orm": "^2.12.0", "chalk": "^5.3.0", "consola": "^3.4.2", "figlet": "^1.7.0", "hono": "^4.13.7", "ioredis": "^5.11.1", "nodemailer": "^9.1.1" }, "peerDependencies": { "@aws-sdk/client-s3": "^3.0.0", "@aws-sdk/client-sqs": "^3.0.0", "@aws-sdk/s3-request-presigner": "^3.0.0", "@guren/inertia-client": "^1.0.0", "vite": ">=7.0.0" }, "optionalPeers": ["@aws-sdk/client-s3", "@aws-sdk/client-sqs", "@aws-sdk/s3-request-presigner", "@guren/inertia-client"] }, "sha512-S0UC5neehto3aItMhGVBqDp+kWbxSdb1C3HrUG2JODm3+VRIY4l7WHcjToi7zpB3rD24nk0VnlVSbTZEoWLzhg=="],
  
      "@guren/testing": ["@guren/testing@1.14.0", "", { "peerDependencies": { "@guren/core": ">=1.8.0", "@guren/plugin-ai": ">=0.1.0", "@guren/server": ">=2.26.0", "@inertiajs/react": "^3.6.1", "@testing-library/react": "^14.0.0 || ^15.0.0 || ^16.0.0", "ai": "^7.0.106", "hono": "^4.13.7", "react": "^18.0.0 || ^19.0.0", "vitest": "^3.2.6 || ^4.1.11 || ^5.0.0" }, "optionalPeers": ["@guren/core", "@guren/plugin-ai", "@inertiajs/react", "@testing-library/react", "ai", "react", "vitest"] }, "sha512-T5NR9ZV/PtdJFEd8r2RVau34mLxSwOUci7kvr0wWkBYZ8tHGoWI0eQ9zc7mLYhmWaYxYmKHlq4ER4l7eWAC1Gw=="],
-diff --git a/db/migrations/20260925060726_api_tokens/migration.sql b/db/migrations/20260925060726_api_tokens/migration.sql
+diff --git a/db/migrations/20260929181623_add_api_tokens_table/migration.sql b/db/migrations/20260929181623_add_api_tokens_table/migration.sql
 new file mode 100644
-index 0000000..93dbd22
+index 0000000..ee3fe78
 --- /dev/null
-+++ b/db/migrations/20260925060726_api_tokens/migration.sql
++++ b/db/migrations/20260929181623_add_api_tokens_table/migration.sql
 @@ -0,0 +1,11 @@
 +CREATE TABLE `api_tokens` (
 +	`id` text PRIMARY KEY,
-+	`user_id` integer NOT NULL,
 +	`name` text NOT NULL,
 +	`hashed_token` text NOT NULL UNIQUE,
++	`user_id` integer NOT NULL,
 +	`abilities` text NOT NULL,
 +	`last_used_at` integer,
 +	`expires_at` integer,
 +	`created_at` integer NOT NULL,
-+	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`)
++	CONSTRAINT `fk_api_tokens_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
 +);
-diff --git a/db/migrations/20260925060726_api_tokens/snapshot.json b/db/migrations/20260925060726_api_tokens/snapshot.json
+diff --git a/db/migrations/20260929181623_add_api_tokens_table/snapshot.json b/db/migrations/20260929181623_add_api_tokens_table/snapshot.json
 new file mode 100644
-index 0000000..a20ef64
+index 0000000..ecbfc96
 --- /dev/null
-+++ b/db/migrations/20260925060726_api_tokens/snapshot.json
++++ b/db/migrations/20260929181623_add_api_tokens_table/snapshot.json
 @@ -0,0 +1,308 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "dd100548-a8a2-4463-ac54-20d8437d092e",
++  "id": "66ab276e-7e2a-4dfd-a7e6-0665cebf052d",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -272,16 +313,6 @@ index 0000000..a20ef64
 +      "table": "api_tokens"
 +    },
 +    {
-+      "type": "integer",
-+      "notNull": true,
-+      "autoincrement": false,
-+      "default": null,
-+      "generated": null,
-+      "name": "user_id",
-+      "entityType": "columns",
-+      "table": "api_tokens"
-+    },
-+    {
 +      "type": "text",
 +      "notNull": true,
 +      "autoincrement": false,
@@ -298,6 +329,16 @@ index 0000000..a20ef64
 +      "default": null,
 +      "generated": null,
 +      "name": "hashed_token",
++      "entityType": "columns",
++      "table": "api_tokens"
++    },
++    {
++      "type": "integer",
++      "notNull": true,
++      "autoincrement": false,
++      "default": null,
++      "generated": null,
++      "name": "user_id",
 +      "entityType": "columns",
 +      "table": "api_tokens"
 +    },
@@ -480,7 +521,7 @@ index 0000000..a20ef64
 +        "id"
 +      ],
 +      "onUpdate": "NO ACTION",
-+      "onDelete": "NO ACTION",
++      "onDelete": "CASCADE",
 +      "nameExplicit": false,
 +      "name": "fk_api_tokens_user_id_users_id_fk",
 +      "entityType": "fks",
@@ -551,7 +592,7 @@ index 0000000..a20ef64
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..081302c 100644
+index 47b96e5..61b0546 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
 @@ -20,3 +20,20 @@ export const posts = sqliteTable('posts', {
@@ -559,22 +600,101 @@ index 47b96e5..081302c 100644
    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
  })
 +
-+// Bearer credentials for the MCP endpoint (`/mcp`) and any other API caller.
-+// Read and written by the framework's DatabaseApiTokenStore, so the property
-+// names must match its ApiToken fields exactly. Only the hash is stored: the
-+// plain token is shown once, when `createApiToken()` issues it.
++// Bearer credentials for the MCP endpoint, read and written through
++// DatabaseApiTokenStore (src/app.ts). The property names are that store's
++// contract, the ApiToken fields, so rename columns rather than properties.
++// Only the SHA-256 of a token is kept: the plain text exists once, at issue.
 +export const apiTokens = sqliteTable('api_tokens', {
 +  id: text('id').primaryKey(),
-+  userId: integer('user_id')
-+    .notNull()
-+    .references(() => users.id),
 +  name: text('name').notNull(),
 +  hashedToken: text('hashed_token').notNull().unique(),
++  userId: integer('user_id')
++    .notNull()
++    .references(() => users.id, { onDelete: 'cascade' }),
 +  abilities: text('abilities', { mode: 'json' }).$type<string[]>().notNull(),
 +  lastUsedAt: integer('last_used_at', { mode: 'timestamp_ms' }),
 +  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
 +  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
 +})
+diff --git a/docs/adr/0002-serve-agent-tools-over-mcp-from-the-existing-routes.md b/docs/adr/0002-serve-agent-tools-over-mcp-from-the-existing-routes.md
+new file mode 100644
+index 0000000..9c41c6c
+--- /dev/null
++++ b/docs/adr/0002-serve-agent-tools-over-mcp-from-the-existing-routes.md
+@@ -0,0 +1,73 @@
++---
++type: adr
++status: draft
++entities: [Post]
++related:
++  - app/Http/Controllers/PostController.ts
++  - app/Http/Resources/PostResource.ts
++  - app/Policies/PostPolicy.ts
++  - app/Http/Middleware/ConfineApiTokensMiddleware.ts
++  - routes/web.ts
++  - src/app.ts
++  - db/schema.ts
++  - tests/McpEndpoint.test.ts
++generated: { by: "claude-code/claude-fable-5-1", at: 2026-09-29T18:20:58.245Z }
++---
++
++# Serve agent tools over MCP from the existing routes
++
++## Context
++
++Authors write with their own AI assistants and want them to search the
++blog and draft posts. We do not want a chatbot in the blog, a second
++implementation of search or of post creation, or protocol code of our
++own to maintain.
++
++## Decision
++
++Two existing routes declare `agent` metadata in `routes/web.ts` and are
++served as MCP tools by `@guren/plugin-mcp` at `POST /mcp`:
++
++| Tool | Route | Read-only |
++|---|---|---|
++| `posts_search` | `QUERY /posts/search` (`posts.search`) | yes |
++| `posts_store` | `POST /posts` (`posts.store`) | no |
++
++- A tool call re-enters the app as the route's own HTTP request, so the
++  `auth` middleware, the route's body schema and `PostPolicy` decide it
++  exactly as they do for the website. There is no tool class.
++- Tool names use underscores (`agent.toolName`): some assistants drop
++  names outside `[A-Za-z0-9_-]`. Route names are unchanged.
++- `posts_store` declares no hints. Read-only is derived from the HTTP
++  method, and the default for a writing tool ("may be destructive") is
++  what makes an assistant ask its user first.
++- Credentials are the framework's API tokens, kept hashed in the
++  `api_tokens` table through `DatabaseApiTokenStore` (`src/app.ts`).
++  A bearer request is authenticated as the token's user; the author of a
++  created post is that user, never a value from the input.
++- Which tools a credential reaches is its scopes (`tools:read`,
++  `tool:posts_store`, `tools:*`). Ops issue one from a terminal:
++
++  ```bash
++  bunx guren token:issue --name "Ada's assistant" --user 1 --tools tools:read
++  ```
++
++- A token opens nothing but its tools. Accepting bearers makes every
++  route authenticate them, where no scope is checked, so
++  `ConfineApiTokensMiddleware` wraps all routes and refuses (403) a
++  token on any route that is not an agent tool its scopes grant.
++
++- `PostController.store` answers a caller asking for JSON with the
++  created post (201) instead of the redirect the form follows, because
++  an assistant has no page to land on.
++
++## Consequences
++
++- A change to the search or to the post rules reaches assistants with no
++  further work, and `bunx guren tool:list` shows what is exposed.
++- Exposing another route is a decision, not a default: it needs its own
++  `agent` metadata, and `bunx guren check` fails a writing tool whose
++  action does not authorize.
++- Rate limits are the plugin's defaults and are kept per process.
++- There is no page for users to manage their credentials, no approval
++  queue and no audit sink yet.
 diff --git a/package.json b/package.json
 index cd951fa..31b83dd 100644
 --- a/package.json
@@ -588,287 +708,373 @@ index cd951fa..31b83dd 100644
      "drizzle-orm": "1.0.0-rc.4",
      "react": "^19.0.0",
 diff --git a/routes/web.ts b/routes/web.ts
-index 4c174ac..1046825 100644
+index 4c174ac..a1be573 100644
 --- a/routes/web.ts
 +++ b/routes/web.ts
-@@ -24,7 +24,19 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -1,6 +1,7 @@
+ import { Router, requireAuthenticated, requireGuest } from '@guren/core'
+ import HomeController from '../app/Http/Controllers/HomeController.js'
+ import PostController from '../app/Http/Controllers/PostController.js'
++import { ConfineApiTokensMiddleware } from '../app/Http/Middleware/ConfineApiTokensMiddleware.js'
+ import { PostPayloadSchema, PostSearchSchema } from '../app/Http/Validators/PostValidator.js'
+ import { PostResource } from '../app/Http/Resources/PostResource.js'
+ import { registerAuthRoutes } from './auth.js'
+@@ -11,7 +12,14 @@ export function registerWebRoutes(baseRouter: Router): void {
+   const router = baseRouter
+     .aliasMiddleware('auth', requireAuthenticated({ redirectTo: '/login' }))
+     .aliasMiddleware('guest', requireGuest({ redirectTo: '/dashboard' }))
++    .aliasMiddleware('tokens', ConfineApiTokensMiddleware)
+ 
++  // Around every route, so a route added later is closed to API tokens until
++  // it declares itself an agent tool.
++  router.middleware('tokens').group(registerRoutes)
++}
++
++function registerRoutes(router: Router<'auth' | 'guest' | 'tokens'>): void {
+   router.get('/', [HomeController, 'index']).name('home')
+ 
+   // Health check endpoint for load balancers and uptime monitors
+@@ -24,7 +32,23 @@ export function registerWebRoutes(baseRouter: Router): void {
      posts.middleware('auth').group((authed) => {
        authed.get('/create', [PostController, 'create']).name('posts.create')
        authed.get('/:id/edit', [PostController, 'edit']).name('posts.edit')
 -      authed.post('/', { name: 'posts.store', body: PostPayloadSchema }, [PostController, 'store'])
-+      // Also the `posts_store` MCP tool: same schema, policy and controller as
-+      // the form. The tool answers the created post as JSON, the form a redirect.
-+      authed
-+        .post('/', {
-+          name: 'posts.store',
-+          body: PostPayloadSchema,
-+          resource: { data: PostResource },
-+        }, [PostController, 'store'])
-+        .agent({
++      // Also the agent tool `posts_store`: a call over MCP re-enters the app
++      // as this request, so it passes the same 'auth' middleware, validation
++      // and policy check as the "New post" form. Not read-only, which is what
++      // tells an assistant to ask its user before calling it.
++      authed.post('/', {
++        name: 'posts.store',
++        body: PostPayloadSchema,
++        // What the action answers a JSON caller with; the form gets a redirect.
++        resource: { data: PostResource },
++        agent: {
++          // Underscores: some assistants drop tool names outside [A-Za-z0-9_-].
 +          toolName: 'posts_store',
-+          description: 'Create a blog post authored by the signed-in user. Takes a title, an excerpt and the body.',
-+          readOnlyHint: false,
-+        })
++          description:
++            'Create a blog post. The author is always the user the caller is signed in as, '
++            + 'whatever the input says. Returns the created post.',
++        },
++      }, [PostController, 'store'])
        authed.put('/:id', { name: 'posts.update', body: PostPayloadSchema }, [PostController, 'update'])
        authed.delete('/:id', { name: 'posts.destroy' }, [PostController, 'destroy'])
      })
-@@ -43,5 +55,11 @@ export function registerWebRoutes(baseRouter: Router): void {
+@@ -42,6 +66,14 @@ export function registerWebRoutes(baseRouter: Router): void {
+       // the client's json() comes back typed — no runtime validation, just the
        // type codegen already extracts from the Resource.
        resource: { data: [PostResource] },
-     }, [PostController, 'search'])
-+      // Also the `posts_search` MCP tool, open to guests like the site search.
-+      .agent({
++      // The agent tool `posts_search`. QUERY is a safe method, so the tool is
++      // derived read-only; like the search on the site it needs no sign-in.
++      agent: {
 +        toolName: 'posts_search',
-+        description: 'Search published posts by keyword. Matches any keyword against titles and excerpts, newest first.',
-+        readOnlyHint: true,
-+      })
++        description:
++          'Search the blog\'s posts. Returns the posts whose title or excerpt contains any '
++          + 'of the keywords, newest first.',
++      },
+     }, [PostController, 'search'])
    })
  }
 diff --git a/src/app.ts b/src/app.ts
-index 3789858..eebecd4 100644
+index 3789858..ce7c6ca 100644
 --- a/src/app.ts
 +++ b/src/app.ts
-@@ -5,7 +5,8 @@
+@@ -5,12 +5,14 @@
  // on invalid input, refinements/transforms can run twice (fast path, then
  // fallback), so keep .refine()/.transform() free of side effects.
  import 'zod/compile'
 -import { createApp } from '@guren/core'
-+import { createApp, EventServiceProvider } from '@guren/core'
++import { createApp, DatabaseApiTokenStore, EventServiceProvider } from '@guren/core'
 +import { mcpPlugin } from '@guren/plugin-mcp'
  import AuthProvider from '../app/Providers/AuthProvider.js'
  import AuthorizationProvider from '../app/Providers/AuthorizationProvider.js'
  import database from '../config/database.js'
-@@ -25,7 +26,11 @@ const app = createApp({
+ import env from '../config/env.js'
+ import http from '../config/http.js'
++import { apiTokens } from '../db/schema.js'
+ import { registerWebRoutes } from '../routes/web.js'
+ 
+ const app = createApp({
+@@ -25,11 +27,28 @@ const app = createApp({
    config: [database, http],
    auth: {},
    routes: registerWebRoutes,
 -  providers: [AuthProvider, AuthorizationProvider],
-+  // EventServiceProvider goes first: the MCP plugin looks up the event manager
-+  // at boot. mcpPlugin() mounts `/mcp` and serves every route that declares
-+  // `.agent()` as a tool, authenticated with the bearer tokens AuthProvider
-+  // configures.
-+  providers: [EventServiceProvider, AuthProvider, AuthorizationProvider, mcpPlugin()],
++  providers: [
++    AuthProvider,
++    AuthorizationProvider,
++    // The MCP endpoint reports every tool call as an event; without an event
++    // manager it warns at boot and the calls go unrecorded.
++    EventServiceProvider,
++    // Serves the routes that declare `agent` metadata (routes/web.ts) as MCP
++    // tools at POST /mcp, in production too. Each call re-enters the app as
++    // the route's own HTTP request, so there is no second implementation.
++    mcpPlugin({ serverInfo: { name: 'agents-on-guren-app', version: '0.1.0' } }),
++  ],
    // Translations live in lang/<locale>/*.json. Add locales to `supported`
    // and the request locale is detected from ?locale=, a locale cookie, or
    // Accept-Language. `guren codegen` types the keys for t()/useTranslation().
-diff --git a/tests/PostAgentTools.test.ts b/tests/PostAgentTools.test.ts
+   i18n: { supported: ['en'] },
+ })
+ 
++// Bearer credentials: /mcp verifies them against this store, and a request
++// carrying one is authenticated as the token's user by the 'token' guard this
++// registers, where a browser would present its session. `provider` is the one
++// AuthProvider fills, so policies see the same user record either way. Issue a
++// credential with `bunx guren token:issue --user <id> --tools <scopes>`.
++app.auth.useTokens(new DatabaseApiTokenStore(apiTokens), { provider: 'users' })
++
+ export default app
+diff --git a/tests/McpEndpoint.test.ts b/tests/McpEndpoint.test.ts
 new file mode 100644
-index 0000000..b79a590
+index 0000000..ce7a70e
 --- /dev/null
-+++ b/tests/PostAgentTools.test.ts
-@@ -0,0 +1,215 @@
++++ b/tests/McpEndpoint.test.ts
+@@ -0,0 +1,248 @@
 +import { beforeAll, describe, expect, it } from 'bun:test'
 +import { createApiToken } from '@guren/core'
 +import { TestApp } from '@guren/testing'
 +import { Post } from '../app/Models/Post.js'
-+import { User, type UserRecord } from '../app/Models/User.js'
++import { User } from '../app/Models/User.js'
++import { migrateDatabase } from '../config/database.js'
 +import app from '../src/app.js'
 +
-+// The two agent tools derived from posts.search and posts.store, reached two
-+// ways: through the TestApp agent bridge (same dispatch the MCP endpoint uses,
-+// authenticated through the session) and over the real `/mcp` endpoint with a
-+// bearer token issued by the framework's API-token support.
++// The production MCP endpoint, exercised the way an assistant reaches it: a
++// bearer credential issued through the app's own token store, JSON-RPC over
++// POST /mcp. Unlike the starter tests this one needs the schema, so it
++// migrates the test database (NODE_ENV=test points at its own SQLite file).
 +
-+interface RpcResponse {
-+  result?: Record<string, unknown>
-+  error?: { code: number; message: string }
-+}
-+
-+interface ToolListing {
++interface ToolDescription {
 +  name: string
 +  annotations?: { readOnlyHint?: boolean }
 +}
 +
-+interface ToolCallResult {
-+  content: Array<{ type: string; text?: string }>
++interface ToolResult {
++  content: Array<{ type: string; text: string }>
 +  structuredContent?: Record<string, unknown>
 +  isError?: boolean
 +}
 +
-+// Streamable HTTP may answer JSON-RPC as an SSE stream; the payload is the
-+// last `data:` line either way.
-+async function readRpc(raw: Response): Promise<RpcResponse> {
-+  const text = await raw.text()
-+  const dataLines = text.split('\n').filter((line) => line.startsWith('data:'))
-+  const payload = dataLines.length > 0 ? dataLines[dataLines.length - 1]!.slice('data:'.length) : text
-+  return JSON.parse(payload.trim()) as RpcResponse
-+}
-+
-+function toolResult(response: RpcResponse): ToolCallResult {
-+  expect(response.error).toBeUndefined()
-+  return response.result as unknown as ToolCallResult
-+}
-+
-+function resultJson<T = Record<string, unknown>>(result: ToolCallResult): T {
-+  if (result.structuredContent) return result.structuredContent as T
-+  const text = result.content.find((part) => part.type === 'text')?.text ?? ''
-+  return JSON.parse(text) as T
-+}
-+
-+let sequence = 0
-+async function createUser(): Promise<UserRecord> {
-+  sequence += 1
-+  const user = await User.create({
-+    name: `Agent Author ${sequence}`,
-+    email: `agent-author-${Date.now()}-${sequence}@example.com`,
-+    password: 'secret',
-+  })
-+  return user as unknown as UserRecord
-+}
-+
-+describe('agent tools', () => {
-+  let http: TestApp
-+
-+  beforeAll(async () => {
-+    http = await TestApp.fromApp(app)
-+  })
-+
-+  it('exposes exactly posts_search (read-only) and posts_store', async () => {
-+    const tools = await http.agent().tools()
-+    const byName = new Map(tools.map((tool) => [tool.toolName, tool]))
-+
-+    expect([...byName.keys()].sort()).toEqual(['posts_search', 'posts_store'])
-+    expect(byName.get('posts_search')?.annotations?.readOnlyHint).toBe(true)
-+    expect(byName.get('posts_store')?.annotations?.readOnlyHint).toBe(false)
-+  })
-+
-+  it('posts_search answers the search JSON for a guest', async () => {
-+    const author = await createUser()
-+    const marker = `bridge-${Date.now()}`
-+    await Post.forceCreate({ title: `About ${marker}`, excerpt: 'x', body: 'y', authorId: author.id })
-+
-+    const result = await http.agent().call('posts_search', { keywords: [marker], limit: 5 }).assertOk()
-+    const { data } = result.json<{ data: Array<{ title: string; authorId: number }> }>()
-+
-+    expect(data).toHaveLength(1)
-+    expect(data[0]!.title).toBe(`About ${marker}`)
-+    expect(data[0]!.authorId).toBe(author.id)
-+  })
-+
-+  it('posts_store creates the post for the acting user', async () => {
-+    const author = await createUser()
-+    const other = await createUser()
-+    const title = `Bridge post ${Date.now()}`
-+
-+    const result = await (await http.withCsrf('/posts'))
-+      .agent()
-+      .call('posts_store', { title, excerpt: 'From the bridge', body: 'Body', authorId: other.id }, { as: author })
-+      .assertOk()
-+
-+    expect(result.status).toBe(201)
-+    const post = await Post.newQuery().where('title', title).first()
-+    expect(post?.authorId).toBe(author.id)
-+  })
-+
-+  it('posts_store rejects invalid input with 422 and creates nothing', async () => {
-+    const author = await createUser()
-+    const before = await Post.newQuery().count()
-+
-+    const result = await (await http.withCsrf('/posts'))
-+      .agent()
-+      .call('posts_store', { title: '', excerpt: 'x', body: 'y' }, { as: author })
-+
-+    expect(result.isError).toBe(true)
-+    expect(result.status).toBe(422)
-+    expect(await Post.newQuery().count()).toBe(before)
-+  })
-+
-+  it('posts_store refuses a guest', async () => {
-+    const before = await Post.newQuery().count()
-+    const result = await http.agent().call('posts_store', { title: 'Guest', excerpt: 'x', body: 'y' })
-+
-+    expect([302, 303, 401, 403]).toContain(result.status)
-+    if (result.status === 302 || result.status === 303) {
-+      expect(result.response.headers.get('location')).toContain('/login')
-+    }
-+    expect(await Post.newQuery().count()).toBe(before)
-+  })
-+})
-+
 +describe('POST /mcp', () => {
 +  let http: TestApp
-+  let user: UserRecord
++  let author: { id: number }
 +  let bearer: string
-+  let requestId = 0
++  // Unique per run: the test database file outlives the run.
++  const marker = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 +
-+  const rpc = (method: string, params: Record<string, unknown> = {}, token: string | null = bearer) => {
-+    let client = http.json().withHeader('Accept', 'application/json, text/event-stream')
-+    if (token) client = client.withHeader('Authorization', `Bearer ${token}`)
-+    requestId += 1
-+    return client.post('/mcp', { jsonrpc: '2.0', id: requestId, method, params })
++  async function issueToken(abilities: string[]): Promise<string> {
++    const store = app.auth.getApiTokenStore()
++    if (!store) throw new Error('The app configures no API token store.')
++    const { plainTextToken } = await createApiToken(store, { name: marker, userId: author.id, abilities })
++    return plainTextToken
++  }
++
++  function rpc(method: string, params: Record<string, unknown>, token?: string): Promise<Response> {
++    return app.fetch(new Request('http://localhost/mcp', {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        Accept: 'application/json, text/event-stream',
++        ...(token ? { Authorization: `Bearer ${token}` } : {}),
++      },
++      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
++    }))
++  }
++
++  // Streamable HTTP may answer as a single JSON document or as one SSE event.
++  async function result<T>(response: Response): Promise<T> {
++    expect(response.status).toBe(200)
++    const text = await response.text()
++    const json = response.headers.get('Content-Type')?.includes('text/event-stream')
++      ? text.split('\n').find((line) => line.startsWith('data:'))?.slice('data:'.length) ?? ''
++      : text
++    const message = JSON.parse(json) as { result?: T; error?: unknown }
++    if (!message.result) throw new Error(`MCP error: ${JSON.stringify(message.error)}`)
++    return message.result
++  }
++
++  function call(name: string, args: Record<string, unknown>, token = bearer): Promise<ToolResult> {
++    return rpc('tools/call', { name, arguments: args }, token).then((response) => result<ToolResult>(response))
++  }
++
++  function payload(outcome: ToolResult): unknown {
++    return outcome.structuredContent ?? JSON.parse(outcome.content[0]?.text ?? 'null')
 +  }
 +
 +  beforeAll(async () => {
 +    http = await TestApp.fromApp(app)
-+    user = await createUser()
-+    const store = app.auth.getApiTokenStore()
-+    if (!store) throw new Error('No API token store configured')
-+    const issued = await createApiToken(store, { name: 'test', userId: user.id, abilities: ['tools:*'] })
-+    bearer = issued.plainTextToken
++    await migrateDatabase()
++    author = await User.create({ name: 'MCP Author', email: `${marker}@example.com`, password: 'secret-password' })
++    bearer = await issueToken(['tools:*'])
 +  })
 +
 +  it('refuses a call without a credential', async () => {
-+    await rpc('tools/list', {}, null).assertStatus(401)
++    const response = await rpc('tools/list', {})
++    expect(response.status).toBe(401)
 +  })
 +
-+  it('lists the two tools with their read-only flags', async () => {
-+    const response = await rpc('tools/list')
-+    expect(response.status).toBe(200)
-+    const { tools } = toolResult(await readRpc(response.raw)) as unknown as { tools: ToolListing[] }
-+    const app = tools.filter((tool) => !tool.name.startsWith('guren_'))
-+    const byName = new Map(app.map((tool) => [tool.name, tool]))
-+
-+    expect([...byName.keys()].sort()).toEqual(['posts_search', 'posts_store'])
-+    expect(byName.get('posts_search')?.annotations?.readOnlyHint).toBe(true)
-+    expect(byName.get('posts_store')?.annotations?.readOnlyHint).toBe(false)
++  it('refuses a credential it did not issue', async () => {
++    const response = await rpc('tools/list', {}, 'unknown|credential')
++    expect(response.status).toBe(401)
 +  })
 +
-+  it('posts_search returns the same JSON as QUERY /posts/search', async () => {
-+    const marker = `mcp-${Date.now()}`
-+    await Post.forceCreate({ title: `Note on ${marker}`, excerpt: 'x', body: 'y', authorId: user.id })
-+    const input = { keywords: [marker], limit: 3 }
++  it('lists the two tools and says which one only reads', async () => {
++    const { tools } = await result<{ tools: ToolDescription[] }>(await rpc('tools/list', {}, bearer))
++    const own = tools.filter((tool) => !tool.name.startsWith('guren_'))
 +
-+    const direct = await http.query('/posts/search', input).assertOk()
-+    const result = toolResult(await readRpc((await rpc('tools/call', { name: 'posts_search', arguments: input })).raw))
-+
-+    expect(result.isError ?? false).toBe(false)
-+    expect(resultJson(result)).toEqual(await direct.json())
++    expect(own.map((tool) => [tool.name, tool.annotations?.readOnlyHint === true]).sort()).toEqual([
++      ['posts_search', true],
++      ['posts_store', false],
++    ])
 +  })
 +
-+  it('posts_store creates the post as the token user, ignoring authorId', async () => {
-+    const other = await createUser()
-+    const title = `MCP post ${Date.now()}`
-+    const result = toolResult(await readRpc((await rpc('tools/call', {
-+      name: 'posts_store',
-+      arguments: { title, excerpt: 'Drafted by an assistant', body: 'Body', authorId: other.id },
-+    })).raw))
++  it('agrees with the tools the app derives for the CLI and the test agent', async () => {
++    const tools = await http.agent().tools()
 +
-+    expect(result.isError ?? false).toBe(false)
-+    const post = await Post.newQuery().where('title', title).first()
-+    expect(post?.authorId).toBe(user.id)
++    expect(tools.map((tool) => [tool.toolName, tool.annotations.readOnlyHint]).sort()).toEqual([
++      ['posts_search', true],
++      ['posts_store', false],
++    ])
 +  })
 +
-+  it('posts_store answers a validation error without creating anything', async () => {
-+    const before = await Post.newQuery().count()
-+    const result = toolResult(await readRpc((await rpc('tools/call', {
-+      name: 'posts_store',
-+      arguments: { title: '', excerpt: 'x', body: 'y' },
-+    })).raw))
++  it('creates a post as the credential\'s user, whatever authorId says', async () => {
++    const title = `${marker} created`
++    const outcome = await call('posts_store', { title, excerpt: 'An excerpt', body: 'A body', authorId: author.id + 1000 })
 +
-+    expect(result.isError).toBe(true)
-+    const body = resultJson<{ errors: Record<string, string[]> }>(result)
-+    expect(body.errors.title).toBeDefined()
-+    expect(await Post.newQuery().count()).toBe(before)
++    expect(outcome.isError).toBeFalsy()
++    const created = await Post.where({ title }).get()
++    expect(created).toHaveLength(1)
++    expect(created[0]?.authorId).toBe(author.id)
++    expect(payload(outcome)).toMatchObject({ data: { id: created[0]?.id, title, authorId: author.id } })
++  })
 +
-+    // A plain tools/call result carries no HTTP status; the guren_preflight
-+    // companion rehearses the same call and reports the 422 it resolved to.
-+    const preflight = toolResult(await readRpc((await rpc('tools/call', {
-+      name: 'guren_preflight',
-+      arguments: { tool: 'posts_store', input: { title: '', excerpt: 'x', body: 'y' } },
-+    })).raw))
-+    const verdict = preflight.structuredContent as { allowed: boolean; status: number }
-+    expect(verdict.allowed).toBe(false)
-+    expect(verdict.status).toBe(422)
-+    expect(await Post.newQuery().count()).toBe(before)
++  it('answers posts_search with what QUERY /posts/search answers', async () => {
++    const title = `${marker} searchable`
++    await Post.forceCreate({ title, excerpt: 'An excerpt', body: 'A body', authorId: author.id })
++    const input = { keywords: [title], limit: 5 }
++
++    const outcome = await call('posts_search', input)
++    const direct = await app.fetch(new Request('http://localhost/posts/search', {
++      method: 'QUERY',
++      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
++      body: JSON.stringify(input),
++    }))
++
++    expect(outcome.isError).toBeFalsy()
++    const found = payload(outcome) as { data: Array<{ title: string }> }
++    expect(found).toEqual(await direct.json())
++    expect(found.data.map((post) => post.title)).toEqual([title])
++  })
++
++  it('rejects input the form would reject with a 422, and creates nothing', async () => {
++    const excerpt = `${marker} rejected`
++    const outcome = await call('posts_store', { title: '', excerpt, body: 'A body' })
++
++    expect(outcome.isError).toBe(true)
++    expect(JSON.stringify(outcome.content)).toContain('Title is required.')
++    expect(await Post.where({ excerpt }).get()).toHaveLength(0)
++  })
++
++  it('lets a read-only credential search but not create', async () => {
++    const reader = await issueToken(['tools:read'])
++    const excerpt = `${marker} read-only`
++
++    const { tools } = await result<{ tools: ToolDescription[] }>(await rpc('tools/list', {}, reader))
++    expect(tools.map((tool) => tool.name).filter((name) => !name.startsWith('guren_'))).toEqual(['posts_search'])
++
++    const outcome = await call('posts_store', { title: 'Denied', excerpt, body: 'A body' }, reader)
++    expect(outcome.isError).toBe(true)
++    expect(await Post.where({ excerpt }).get()).toHaveLength(0)
++  })
++
++  // Sent straight to the routes, past the endpoint and its scope check.
++  function direct(method: string, path: string, token: string, body?: Record<string, unknown>): Promise<Response> {
++    return app.fetch(new Request(`http://localhost${path}`, {
++      method,
++      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${token}` },
++      body: body ? JSON.stringify(body) : undefined,
++    }))
++  }
++
++  it('does not let a credential past its scopes on the routes themselves', async () => {
++    const reader = await issueToken(['tools:read'])
++    const excerpt = `${marker} direct`
++
++    expect((await direct('POST', '/posts', reader, { title: 'Direct', excerpt, body: 'A body' })).status).toBe(403)
++    expect(await Post.where({ excerpt }).get()).toHaveLength(0)
++    expect((await direct('QUERY', '/posts/search', reader, { keywords: [marker] })).status).toBe(200)
++  })
++
++  it('does not let a credential reach a route that is not a tool', async () => {
++    const email = `${marker}-changed@example.com`
++
++    expect((await direct('PUT', '/profile', bearer, { name: 'Changed', email })).status).toBe(403)
++    expect((await direct('GET', '/dashboard', bearer)).status).toBe(403)
++    expect((await direct('POST', '/logout', bearer)).status).toBe(403)
++    expect(await User.where({ email }).get()).toHaveLength(0)
++    // Still valid: the logout above revoked nothing.
++    expect((await rpc('tools/list', {}, bearer)).status).toBe(200)
++  })
++})
++
++// The same two tools through the framework's dispatch contract and the
++// session guard, so without a bearer: a guest, and a user signed in the way a
++// browser is. The CSRF token is primed because without it every POST is a 403
++// that says nothing about who may create a post.
++describe('agent tools', () => {
++  let http: TestApp
++  let author: { id: number }
++  const marker = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
++
++  beforeAll(async () => {
++    const booted = await TestApp.fromApp(app)
++    await migrateDatabase()
++    http = await booted.withCsrf('/login')
++    author = await User.create({ name: 'Agent Author', email: `${marker}@example.com`, password: 'secret-password' })
++  })
++
++  it('lets a guest search, like the search on the site', async () => {
++    await http.agent().call('posts_search', { keywords: [marker] }).assertOk().assertStatus(200)
++  })
++
++  it('validates the search input', async () => {
++    await http.agent().call('posts_search', { keywords: [] }).assertStatus(422)
++  })
++
++  it('refuses a guest who creates a post', async () => {
++    const excerpt = `${marker} guest`
++    const result = await http.agent().call('posts_store', { title: 'Guest', excerpt, body: 'A body' })
++
++    // Either spelling of "sign in first": the form's redirect, or a 401/403.
++    if (result.status >= 300 && result.status < 400) {
++      expect(result.response.headers.get('Location')).toContain('/login')
++    } else {
++      expect([401, 403]).toContain(result.status)
++    }
++    expect(await Post.where({ excerpt }).get()).toHaveLength(0)
++  })
++
++  it('creates a post for a signed-in user', async () => {
++    const title = `${marker} created`
++    const result = await http.agent()
++      .call('posts_store', { title, excerpt: 'An excerpt', body: 'A body', authorId: author.id + 1000 }, { as: author })
++
++    result.assertOk().assertStatus(201)
++    expect(result.json()).toMatchObject({ data: { title, authorId: author.id } })
++    expect((await Post.where({ title }).get()).map((post) => post.authorId)).toEqual([author.id])
++  })
++
++  it('answers invalid input with a 422', async () => {
++    const excerpt = `${marker} rejected`
++    await http.agent().call('posts_store', { title: ' ', excerpt, body: 'A body' }, { as: author }).assertStatus(422)
++
++    expect(await Post.where({ excerpt }).get()).toHaveLength(0)
++  })
++
++  it('still redirects the form to the new post', async () => {
++    const title = `${marker} from the form`
++    const response = await http.actingAs(author).post('/posts', { title, excerpt: 'An excerpt', body: 'A body' })
++
++    const [created] = await Post.where({ title }).get()
++    expect(response.headers.get('Location')).toBe(`/posts/${created?.id}`)
 +  })
 +})

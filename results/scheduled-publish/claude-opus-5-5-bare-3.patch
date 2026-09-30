@@ -18,15 +18,17 @@ index 61e4c73..53adc8e 100644
    'profile.edit': {
      method: 'GET'
 diff --git a/.guren/data.gen.ts b/.guren/data.gen.ts
-index 392ad58..aa9e052 100644
+index 392ad58..897b102 100644
 --- a/.guren/data.gen.ts
 +++ b/.guren/data.gen.ts
-@@ -18,6 +18,8 @@ export namespace Data {
+@@ -18,6 +18,10 @@ export namespace Data {
    // Serialized here because `created_at` is a string on SQLite and a Date on
    // PostgreSQL and MySQL — pages should not have to know which.
    createdAt: string
 +  // When the post goes (or went) public; null means it was public on save.
 +  publishedAt: string | null
++  // True while `publishedAt` is still ahead — only the author gets such a post.
++  scheduled: boolean
    author?: PostAuthorSummary
  }
  }
@@ -47,74 +49,80 @@ index 846382c..1c99c20 100644
  }
 diff --git a/app/Console/Commands/ListScheduledPostsCommand.ts b/app/Console/Commands/ListScheduledPostsCommand.ts
 new file mode 100644
-index 0000000..e5b3b5f
+index 0000000..b846c2a
 --- /dev/null
 +++ b/app/Console/Commands/ListScheduledPostsCommand.ts
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,25 @@
 +import { Command } from '@guren/core'
 +import { Post } from '../../Models/Post.js'
 +
++/**
++ * Prints every scheduled post, soonest first, as `<id>\t<title>\t<published_at>`
++ * with `published_at` exactly as stored — plain lines and nothing else on
++ * stdout, so ops can pipe it into other tools.
++ */
 +export default class ListScheduledPostsCommand extends Command {
 +  static signature = 'posts:scheduled'
-+  static description = 'List posts scheduled to publish later, soonest first'
++  static description = 'List posts scheduled to publish later (tab-separated: id, title, published_at)'
 +
-+  // Machine-readable on purpose: one `<id>\t<title>\t<published_at>` line per
-+  // post and nothing else on stdout, so ops can pipe it into other tools.
 +  async handle(): Promise<void> {
-+    const posts = await Post.scheduled()
++    const posts = await Post.newQuery()
++      .whereNotNull('publishedAt')
++      .where('publishedAt', '>', new Date().toISOString())
++      .orderBy('publishedAt', 'asc')
++      .orderBy('id', 'asc')
++      .get()
 +
 +    for (const post of posts) {
 +      this.line(`${post.id}\t${post.title}\t${post.publishedAt}`)
 +    }
 +  }
 +}
-diff --git a/app/Http/Controllers/HomeController.ts b/app/Http/Controllers/HomeController.ts
-index fc8ac0b..6371dcf 100644
---- a/app/Http/Controllers/HomeController.ts
-+++ b/app/Http/Controllers/HomeController.ts
-@@ -7,7 +7,8 @@ const LATEST_POST_COUNT = 3
- 
- export default class HomeController extends Controller {
-   async index(): Promise<Response> {
--    const latest = await Post.newQuery()
-+    // Public posts only: the home page is the same for every visitor.
-+    const latest = await Post.visibleTo(null)
-       .with('author')
-       .orderBy('id', 'desc')
-       .limit(LATEST_POST_COUNT)
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..984df5a 100644
+index 8f702c5..90ea7f1 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -10,7 +10,8 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+@@ -1,6 +1,6 @@
+ import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+-import { Post } from '../../Models/Post.js'
++import { Post, visibleTo } from '../../Models/Post.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
+@@ -10,8 +10,9 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
  export default class PostController extends Controller {
    async index(): Promise<Response> {
      const { page } = this.validateQuery(ListPostsQuerySchema)
 -    const result = await Post.newQuery()
-+    const viewer = await this.auth.user<UserRecord>()
-+    const result = await Post.visibleTo(viewer?.id ?? null)
-       .with('author')
+-      .with('author')
++    const viewerId = await this.viewerId()
++    // Scheduled posts stay listed for their author only, with `publishedAt`.
++    const result = await visibleTo(Post.newQuery().with('author'), viewerId)
        .orderBy('id', 'desc')
        .paginate({ page, perPage: 10 })
-@@ -31,8 +32,9 @@ export default class PostController extends Controller {
+     const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+@@ -31,9 +32,9 @@ export default class PostController extends Controller {
    // starter treats as a feature.
    async search(): Promise<Response> {
      const { keywords, limit } = this.validated('posts.search').body
-+    const viewer = await this.auth.user<UserRecord>()
++    const viewerId = await this.viewerId()
  
 -    const posts = await Post.newQuery()
-+    const posts = await Post.visibleTo(viewer?.id ?? null)
-       .with('author')
+-      .with('author')
++    const posts = await visibleTo(Post.newQuery().with('author'), viewerId)
        // All keyword OR pairs sit inside one callback, keeping this an
        // any-keyword match while AND filters added later (a published flag,
-@@ -52,7 +54,9 @@ export default class PostController extends Controller {
+       // tenancy) apply to every hit instead of being OR'd away.
+@@ -52,7 +53,10 @@ export default class PostController extends Controller {
  
    async show(): Promise<Response> {
      const { id } = this.validateParams(PostIdParamSchema)
 -    const post = await Post.findWithOrFail(id, 'author')
-+    const viewer = await this.auth.user<UserRecord>()
-+    // A scheduled post 404s for everyone but its author, as if it did not exist.
-+    const post = await Post.visibleTo(viewer?.id ?? null).with('author').where('id', id).firstOrFail()
++    // A scheduled post answers 404 to everyone but its author, as if it did
++    // not exist yet — a 403 would confirm it is there.
++    const post = await visibleTo(Post.newQuery().with('author').where('id', id), await this.viewerId())
++      .firstOrFail()
  
      return this.inertia(pages.posts.Show, {
        post: new PostResource(post).toJSON(),
@@ -123,11 +131,11 @@ index 8f702c5..984df5a 100644
      await this.authorize('create', Post)
      const author = await this.auth.userOrFail<UserRecord>()
 -    const { body: data } = this.validated('posts.store')
-+    const { publishAt, ...data } = this.validated('posts.store').body
++    const { body: { publishAt, ...data } } = this.validated('posts.store')
      // forceCreate, because `authorId` is deliberately absent from Post.fillable:
      // it comes from the session, and a request must never be able to set it.
 -    const post = await Post.forceCreate({ ...data, authorId: author.id })
-+    const post = await Post.forceCreate({ ...data, publishedAt: publishAt ?? null, authorId: author.id })
++    const post = await Post.forceCreate({ ...data, publishedAt: publishAt, authorId: author.id })
  
      return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
    }
@@ -137,59 +145,84 @@ index 8f702c5..984df5a 100644
  
 -    const { body: data } = this.validated('posts.update')
 -    await Post.update({ id: post.id }, data)
-+    const { publishAt, ...data } = this.validated('posts.update').body
-+    // An absent or empty publishAt clears the schedule: the post is public now.
-+    await Post.update({ id: post.id }, { ...data, publishedAt: publishAt ?? null })
++    // An absent or blank `publishAt` clears the schedule: the post is public now.
++    const { body: { publishAt, ...data } } = this.validated('posts.update')
++    await Post.update({ id: post.id }, { ...data, publishedAt: publishAt })
  
      return this.redirect(`/posts/${post.id}`)
    }
+@@ -105,4 +110,10 @@ export default class PostController extends Controller {
+ 
+     return this.redirect('/posts')
+   }
++
++  /** The signed-in user's id, or null for a guest. */
++  private async viewerId(): Promise<number | null> {
++    const viewer = await this.auth.user<UserRecord | null>()
++    return viewer ? Number(viewer.id) : null
++  }
+ }
 diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
-index 679024d..207201e 100644
+index 679024d..43a975c 100644
 --- a/app/Http/Resources/PostResource.ts
 +++ b/app/Http/Resources/PostResource.ts
-@@ -13,6 +13,8 @@ export interface PostResourceData extends Record<string, unknown> {
+@@ -1,5 +1,5 @@
+ import { Resource, type WithRelations } from '@guren/core'
+-import { Post } from '../../Models/Post.js'
++import { Post, isScheduled } from '../../Models/Post.js'
+ import type { PostRecord, PostAuthorSummary } from '../../Models/Post.js'
+ 
+ type PostWithAuthor = WithRelations<typeof Post, 'author'>
+@@ -13,9 +13,20 @@ export interface PostResourceData extends Record<string, unknown> {
    // Serialized here because `created_at` is a string on SQLite and a Date on
    // PostgreSQL and MySQL — pages should not have to know which.
    createdAt: string
 +  // When the post goes (or went) public; null means it was public on save.
 +  publishedAt: string | null
++  // True while `publishedAt` is still ahead — only the author gets such a post.
++  scheduled: boolean
    author?: PostAuthorSummary
  }
  
-@@ -27,6 +29,7 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
++// Rows written outside the app may hold a timestamp Date cannot parse; pass
++// those through rather than throwing a RangeError from toISOString().
++function toIsoString(value: string): string {
++  const time = Date.parse(value)
++  return Number.isNaN(time) ? value : new Date(time).toISOString()
++}
++
+ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostResourceData> {
+   toArray(): PostResourceData {
+     const post = this.resource
+@@ -27,6 +38,8 @@ export class PostResource extends Resource<PostRecord | PostWithAuthor, PostReso
        body: post.body,
        authorId: post.authorId,
        createdAt: new Date(post.createdAt).toISOString(),
-+      publishedAt: post.publishedAt ? new Date(post.publishedAt).toISOString() : null,
++      publishedAt: post.publishedAt ? toIsoString(post.publishedAt) : null,
++      scheduled: isScheduled(post),
        author: this.whenLoaded('author', () => ({
          id: (post as PostWithAuthor).author?.id,
          name: (post as PostWithAuthor).author?.name,
 diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
-index 804642a..582af44 100644
+index 804642a..dc1a072 100644
 --- a/app/Http/Validators/PostValidator.ts
 +++ b/app/Http/Validators/PostValidator.ts
-@@ -16,10 +16,27 @@ export const PostSearchSchema = z.object({
+@@ -16,10 +16,21 @@ export const PostSearchSchema = z.object({
    limit: z.number().int().min(1).max(50).default(10),
  })
  
-+const IsoDateTimeSchema = z.iso.datetime({ offset: true, local: true })
-+
-+// ISO 8601 date and time, with or without an offset, that is a real instant
-+// (the format check alone lets through dates like February 30).
-+function isDateTime(value: string): boolean {
-+  return IsoDateTimeSchema.safeParse(value).success && !Number.isNaN(Date.parse(value))
-+}
++const IsoDateTimeSchema = z.iso.datetime({ offset: true })
 +
  export const PostPayloadSchema = z.object({
    title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
    excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
    body: z.string().trim().min(1, 'Body is required.'),
-+  // Absent, null or blank publishes now. Stored as ISO 8601 UTC text, like
-+  // `created_at`, so it compares correctly as a string.
++  // When the post goes public. Absent, null or blank means "publish now"; a
++  // date and time is stored as ISO 8601 UTC text, like `created_at`.
 +  publishAt: z
 +    .string()
 +    .trim()
-+    .refine((value) => value === '' || isDateTime(value), 'Publish at must be a date and time.')
++    .refine((value) => value === '' || IsoDateTimeSchema.safeParse(value).success, 'Publish at must be a date and time.')
 +    .nullable()
 +    .optional()
 +    .transform((value) => (value ? new Date(value).toISOString() : null)),
@@ -197,10 +230,16 @@ index 804642a..582af44 100644
  
  export type PostPayload = z.infer<typeof PostPayloadSchema>
 diff --git a/app/Models/Post.ts b/app/Models/Post.ts
-index ca838be..df46a5c 100644
+index ca838be..c5f6c65 100644
 --- a/app/Models/Post.ts
 +++ b/app/Models/Post.ts
-@@ -8,11 +8,35 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
+@@ -1,4 +1,4 @@
+-import { defineModel, type BelongsToRecord } from '@guren/core'
++import { defineModel, type BelongsToRecord, type QueryBuilder } from '@guren/core'
+ import { posts } from '../../db/schema.js'
+ import type { UserRecord } from './User.js'
+ 
+@@ -8,7 +8,7 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
  
  export class Post extends defineModel(posts, {
    // `authorId` is set from the signed-in user, never from request input.
@@ -209,76 +248,55 @@ index ca838be..df46a5c 100644
  }) {
    static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
      author: null,
-   }
-+
-+  /**
-+   * Posts the viewer may see: public ones (no `published_at`, or one that has
-+   * passed) plus, for a signed-in viewer, their own scheduled posts. Timestamps
-+   * are ISO 8601 UTC strings, so comparing them as text orders them in time.
-+   */
-+  static visibleTo(viewerId: number | null) {
-+    const now = new Date().toISOString()
-+
-+    return Post.newQuery().where((q) => {
-+      q.whereNull('publishedAt').orWhere('publishedAt', '<=', now)
-+      if (viewerId !== null) {
-+        q.orWhere('authorId', viewerId)
-+      }
-+    })
-+  }
-+
-+  /** Posts whose `published_at` is still ahead, soonest first. */
-+  static scheduled() {
-+    return Post.newQuery()
-+      .where('publishedAt', '>', new Date().toISOString())
-+      .orderBy('publishedAt', 'asc')
-+      .orderBy('id', 'asc')
-+  }
+@@ -16,3 +16,30 @@ export class Post extends defineModel(posts, {
  }
  
  Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
-diff --git a/bin/console.ts b/bin/console.ts
-index a1734c6..bb4366c 100644
---- a/bin/console.ts
-+++ b/bin/console.ts
-@@ -1,11 +1,19 @@
- import { ready } from '../src/main.js'
- import { kernel } from '../src/console.js'
- 
-+// Boot-time notices (applied migrations, seeding) go to stderr, so stdout
-+// carries only what the command prints and stays safe to pipe.
-+const { log, info } = console
-+console.log = console.info = console.error
 +
- try {
-   await ready
- } catch (error) {
-   console.error('Failed to bootstrap application:', error)
-   process.exit(1)
-+} finally {
-+  console.log = log
-+  console.info = info
- }
- 
- // process.exit() is required, not just tidy: an idle database pool keeps the
-diff --git a/db/migrations/20260925035719_add_published_at_to_posts/migration.sql b/db/migrations/20260925035719_add_published_at_to_posts/migration.sql
++/**
++ * True while a post's `published_at` lies in the future. NULL, or a time that
++ * has already passed, means the post is public — nothing has to run when the
++ * moment arrives.
++ */
++export function isScheduled(post: Pick<PostRecord, 'publishedAt'>, now: Date = new Date()): boolean {
++  if (post.publishedAt === null || post.publishedAt === undefined) return false
++  const time = Date.parse(post.publishedAt)
++  return !Number.isNaN(time) && time > now.getTime()
++}
++
++/**
++ * Restricts a post query to what `viewerId` may see: public posts, plus the
++ * viewer's own scheduled ones. `published_at` is stored as ISO 8601 UTC text,
++ * so comparing it with the current time as a string orders it correctly.
++ */
++export function visibleTo<Q extends QueryBuilder<PostRecord>>(
++  query: Q,
++  viewerId: number | null,
++  now: Date = new Date(),
++): Q {
++  return query.where((q) => {
++    q.whereNull('publishedAt').orWhere('publishedAt', '<=', now.toISOString())
++    if (viewerId !== null) q.orWhere('authorId', viewerId)
++  })
++}
+diff --git a/db/migrations/20260929164306_add_published_at_to_posts/migration.sql b/db/migrations/20260929164306_add_published_at_to_posts/migration.sql
 new file mode 100644
 index 0000000..c01c12b
 --- /dev/null
-+++ b/db/migrations/20260925035719_add_published_at_to_posts/migration.sql
++++ b/db/migrations/20260929164306_add_published_at_to_posts/migration.sql
 @@ -0,0 +1 @@
 +ALTER TABLE `posts` ADD `published_at` text;
 \ No newline at end of file
-diff --git a/db/migrations/20260925035719_add_published_at_to_posts/snapshot.json b/db/migrations/20260925035719_add_published_at_to_posts/snapshot.json
+diff --git a/db/migrations/20260929164306_add_published_at_to_posts/snapshot.json b/db/migrations/20260929164306_add_published_at_to_posts/snapshot.json
 new file mode 100644
-index 0000000..b41aa38
+index 0000000..35ed7b9
 --- /dev/null
-+++ b/db/migrations/20260925035719_add_published_at_to_posts/snapshot.json
++++ b/db/migrations/20260929164306_add_published_at_to_posts/snapshot.json
 @@ -0,0 +1,201 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "3b30a1b8-f732-471d-9b81-fb4a90cad55a",
++  "id": "2f4d44af-4baf-4b4e-8cf3-75a28968edbe",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -478,158 +496,185 @@ index 0000000..b41aa38
 +}
 \ No newline at end of file
 diff --git a/db/schema.ts b/db/schema.ts
-index 47b96e5..7b46583 100644
+index 47b96e5..76ac7cc 100644
 --- a/db/schema.ts
 +++ b/db/schema.ts
-@@ -19,4 +19,7 @@ export const posts = sqliteTable('posts', {
+@@ -19,4 +19,8 @@ export const posts = sqliteTable('posts', {
      .notNull()
      .references(() => users.id),
    createdAt: text('created_at').notNull().$defaultFn(() => new Date().toISOString()),
-+  // ISO 8601 text like `created_at`. NULL or a past time means public; a
-+  // future time keeps the post visible only to its author until then.
++  // ISO 8601 timestamp, stored like `created_at`. NULL or a past time means the
++  // post is public; a future time means it is scheduled and visible only to
++  // its author until then.
 +  publishedAt: text('published_at'),
  })
+diff --git a/resources/js/components/PublishAtField.tsx b/resources/js/components/PublishAtField.tsx
+new file mode 100644
+index 0000000..0532578
+--- /dev/null
++++ b/resources/js/components/PublishAtField.tsx
+@@ -0,0 +1,42 @@
++// A `datetime-local` input speaks the browser's local time without a zone,
++// while the server stores ISO 8601 UTC. These helpers convert at the edges.
++
++/** ISO timestamp → `YYYY-MM-DDTHH:mm` in local time, for the input's value. */
++export function toLocalInputValue(iso: string | null | undefined): string {
++  if (!iso) return ''
++  const date = new Date(iso)
++  if (Number.isNaN(date.getTime())) return ''
++  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
++  return local.toISOString().slice(0, 16)
++}
++
++/** The input's local value → ISO 8601 UTC, or null for "publish now". */
++export function toPublishAt(value: string | null | undefined): string | null {
++  if (!value) return null
++  const date = new Date(value)
++  // Sent as typed when unparseable, so the server's validation error shows.
++  return Number.isNaN(date.getTime()) ? value : date.toISOString()
++}
++
++interface Props {
++  value: string
++  onChange: (value: string) => void
++  error?: string
++  className: string
++}
++
++export default function PublishAtField({ value, onChange, error, className }: Props) {
++  return (
++    <div>
++      <label className="block text-sm font-bold text-g-heading">Publish at</label>
++      <input
++        type="datetime-local"
++        value={value}
++        onChange={(event) => onChange(event.target.value)}
++        className={className}
++      />
++      <p className="mt-1 text-sm text-g-muted">Leave empty to publish as soon as you save.</p>
++      {error ? <p className="mt-1 text-sm text-g-danger">{error}</p> : null}
++    </div>
++  )
++}
 diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
-index c5f3d76..c81218c 100644
+index c5f3d76..453db74 100644
 --- a/resources/js/pages/posts/Edit.tsx
 +++ b/resources/js/pages/posts/Edit.tsx
-@@ -6,7 +6,14 @@ import Layout from '../../components/Layout.js'
+@@ -2,11 +2,12 @@ import { Head, useForm } from '@inertiajs/react'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
++import PublishAtField, { toLocalInputValue, toPublishAt } from '../../components/PublishAtField.js'
+ 
  type PostFormData = ApiRoutes['posts.store']['body']
  
  interface Props {
 -  post: PostFormData & { id: number }
-+  post: Omit<PostFormData, 'publishAt'> & { id: number; publishedAt: string | null }
-+}
-+
-+// `datetime-local` wants the viewer's wall-clock time as YYYY-MM-DDTHH:MM.
-+function toLocalInput(iso: string | null): string {
-+  if (!iso) return ''
-+  const date = new Date(iso)
-+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
++  post: PostFormData & { id: number; publishedAt: string | null; scheduled: boolean }
  }
  
  const fieldClass =
-@@ -17,7 +24,13 @@ export default function EditPost({ post }: Props) {
+@@ -17,6 +18,8 @@ export default function EditPost({ post }: Props) {
      title: post.title,
      excerpt: post.excerpt,
      body: post.body,
-+    publishAt: toLocalInput(post.publishedAt),
++    // Only a pending schedule is shown; a past date would just read as noise.
++    publishAt: post.scheduled ? toLocalInputValue(post.publishedAt) : '',
    })
-+  // The field holds the author's local wall-clock time; the server stores UTC.
-+  form.transform((data) => ({
-+    ...data,
-+    publishAt: data.publishAt ? new Date(data.publishAt).toISOString() : null,
-+  }))
  
    return (
-     <Layout>
-@@ -68,6 +81,18 @@ export default function EditPost({ post }: Props) {
+@@ -32,6 +35,7 @@ export default function EditPost({ post }: Props) {
+           className="space-y-4"
+           onSubmit={(event) => {
+             event.preventDefault()
++            form.transform((data) => ({ ...data, publishAt: toPublishAt(data.publishAt) }))
+             form.put(route('posts.update', { id: post.id }))
+           }}
+         >
+@@ -68,6 +72,13 @@ export default function EditPost({ post }: Props) {
              {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
            </div>
  
-+          <div>
-+            <label className="block text-sm font-bold text-g-heading">Publish at</label>
-+            <input
-+              type="datetime-local"
-+              value={form.data.publishAt ?? ''}
-+              onChange={(event) => form.setData('publishAt', event.target.value)}
-+              className={fieldClass}
-+            />
-+            <p className="mt-1 text-sm text-g-muted">Leave empty to publish now.</p>
-+            {form.errors.publishAt ? <p className="mt-1 text-sm text-g-danger">{form.errors.publishAt}</p> : null}
-+          </div>
++          <PublishAtField
++            value={form.data.publishAt ?? ''}
++            onChange={(value) => form.setData('publishAt', value)}
++            error={form.errors.publishAt}
++            className={fieldClass}
++          />
 +
            <button
              type="submit"
              disabled={form.processing}
 diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
-index f4731cc..92cb2f9 100644
+index f4731cc..156add8 100644
 --- a/resources/js/pages/posts/Index.tsx
 +++ b/resources/js/pages/posts/Index.tsx
-@@ -17,6 +17,11 @@ interface Props extends PaginatedPageProps<PostResourceData> {}
- // route definition, so this file never restates the wire shape.
- const api = createApiClient<ApiRoutes>({ baseUrl: '' })
- 
-+// Only the author is sent their own scheduled posts; flag them in the list.
-+function isScheduled(post: PostResourceData): boolean {
-+  return post.publishedAt !== null && new Date(post.publishedAt) > new Date()
-+}
-+
- export default function PostsIndex({ data, pagination }: Props) {
-   const [keywords, setKeywords] = useState('')
-   const [results, setResults] = useState<PostResourceData[] | null>(null)
-@@ -105,6 +110,11 @@ export default function PostsIndex({ data, pagination }: Props) {
+@@ -105,6 +105,11 @@ export default function PostsIndex({ data, pagination }: Props) {
                >
                  {post.title}
                </Link>
-+              {isScheduled(post) ? (
++              {post.scheduled && post.publishedAt ? (
 +                <p className="mt-1 font-mono text-xs uppercase tracking-wide text-g-accent-text">
-+                  Scheduled · goes live {new Date(post.publishedAt!).toLocaleString()}
++                  Scheduled · goes live {new Date(post.publishedAt).toLocaleString()}
 +                </p>
 +              ) : null}
                <p className="mt-2 text-sm text-g-text-2">{post.excerpt}</p>
                {post.author ? (
                  <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
 diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
-index e06958d..17ae31d 100644
+index e06958d..15c7a26 100644
 --- a/resources/js/pages/posts/New.tsx
 +++ b/resources/js/pages/posts/New.tsx
-@@ -9,7 +9,12 @@ const fieldClass =
+@@ -2,6 +2,7 @@ import { Head, useForm } from '@inertiajs/react'
+ import type { ApiRoutes } from '@/.guren/api-client.gen'
+ import { route } from '@/.guren/routes.gen'
+ import Layout from '../../components/Layout.js'
++import PublishAtField, { toPublishAt } from '../../components/PublishAtField.js'
+ 
+ type PostFormData = ApiRoutes['posts.store']['body']
+ 
+@@ -9,7 +10,7 @@ const fieldClass =
    'mt-1 w-full rounded-g-ctl border border-g-line-strong bg-g-panel px-3 py-2 text-g-text transition outline-none placeholder:text-g-muted focus:border-transparent focus:outline-2 focus:-outline-offset-1 focus:outline-g-accent'
  
  export default function NewPost() {
 -  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '' })
 +  const form = useForm<PostFormData>({ title: '', excerpt: '', body: '', publishAt: '' })
-+  // The field holds the author's local wall-clock time; the server stores UTC.
-+  form.transform((data) => ({
-+    ...data,
-+    publishAt: data.publishAt ? new Date(data.publishAt).toISOString() : null,
-+  }))
  
    return (
      <Layout>
-@@ -60,6 +65,18 @@ export default function NewPost() {
+@@ -24,6 +25,7 @@ export default function NewPost() {
+           className="space-y-4"
+           onSubmit={(event) => {
+             event.preventDefault()
++            form.transform((data) => ({ ...data, publishAt: toPublishAt(data.publishAt) }))
+             form.post(route('posts.store'))
+           }}
+         >
+@@ -60,6 +62,13 @@ export default function NewPost() {
              {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
            </div>
  
-+          <div>
-+            <label className="block text-sm font-bold text-g-heading">Publish at</label>
-+            <input
-+              type="datetime-local"
-+              value={form.data.publishAt ?? ''}
-+              onChange={(event) => form.setData('publishAt', event.target.value)}
-+              className={fieldClass}
-+            />
-+            <p className="mt-1 text-sm text-g-muted">Leave empty to publish as soon as you save.</p>
-+            {form.errors.publishAt ? <p className="mt-1 text-sm text-g-danger">{form.errors.publishAt}</p> : null}
-+          </div>
++          <PublishAtField
++            value={form.data.publishAt ?? ''}
++            onChange={(value) => form.setData('publishAt', value)}
++            error={form.errors.publishAt}
++            className={fieldClass}
++          />
 +
            <button
              type="submit"
              disabled={form.processing}
 diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
-index 537c81e..1c7731e 100644
+index 537c81e..8a7e848 100644
 --- a/resources/js/pages/posts/Show.tsx
 +++ b/resources/js/pages/posts/Show.tsx
-@@ -12,6 +12,8 @@ export default function PostShow({ post }: Props) {
-   // Mirrors PostPolicy — the server rejects it either way, this only keeps
-   // controls the viewer cannot use off the page.
-   const canManage = props.auth?.user?.id === post.authorId
-+  // The server only sends a scheduled post to its author.
-+  const scheduled = post.publishedAt !== null && new Date(post.publishedAt) > new Date()
- 
-   return (
-     <Layout>
-@@ -24,8 +26,13 @@ export default function PostShow({ post }: Props) {
-           </h1>
-           <p className="text-sm text-g-muted">
+@@ -26,6 +26,11 @@ export default function PostShow({ post }: Props) {
              {post.author ? `by ${post.author.name} · ` : ''}
--            {new Date(post.createdAt).toLocaleDateString()}
-+            {new Date(post.publishedAt ?? post.createdAt).toLocaleDateString()}
+             {new Date(post.createdAt).toLocaleDateString()}
            </p>
-+          {scheduled ? (
-+            <p className="font-mono text-xs uppercase tracking-wide text-g-accent-text">
-+              Scheduled · goes live {new Date(post.publishedAt!).toLocaleString()} · only you can see this post
++          {post.scheduled && post.publishedAt ? (
++            <p className="text-sm font-bold text-g-accent-text">
++              Scheduled — only you can see this post until {new Date(post.publishedAt).toLocaleString()}.
 +            </p>
 +          ) : null}
            <p className="text-g-text-2">{post.excerpt}</p>
@@ -653,108 +698,153 @@ index 83594f0..a43f458 100644
 +kernel.registerMany([ListScheduledPostsCommand])
 diff --git a/tests/ScheduledPosts.test.ts b/tests/ScheduledPosts.test.ts
 new file mode 100644
-index 0000000..d3acf08
+index 0000000..e295083
 --- /dev/null
 +++ b/tests/ScheduledPosts.test.ts
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,156 @@
 +import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
-+import { TestApp } from '@guren/testing'
++import { TestApp, readInertiaResponse, type TestResponse } from '@guren/testing'
 +import app from '../src/app.js'
++import { migrateDatabase } from '../config/database.js'
 +import { Post, type PostRecord } from '../app/Models/Post.js'
 +import { User, type UserRecord } from '../app/Models/User.js'
 +import { PostPayloadSchema } from '../app/Http/Validators/PostValidator.js'
 +
-+// A post with a future `published_at` is visible only to its author until
-+// that time passes; after that it is public with nothing left to run.
++const HOUR = 60 * 60 * 1000
++
++async function makeUser(label: string): Promise<UserRecord> {
++  const email = `${label}-${crypto.randomUUID()}@example.com`
++  return (await User.create({ name: label, email, password: 'secret-password' })) as UserRecord
++}
++
++async function makePost(author: UserRecord, publishedAt: string | null): Promise<PostRecord> {
++  const marker = crypto.randomUUID()
++  return (await Post.forceCreate({
++    title: `Scheduled ${marker}`,
++    excerpt: `Excerpt ${marker}`,
++    body: 'Body',
++    authorId: author.id,
++    publishedAt,
++  })) as PostRecord
++}
++
++interface SearchResult {
++  data: PostRecord[]
++}
++
++async function inertiaProps(response: TestResponse): Promise<Record<string, any>> {
++  const { payload } = await readInertiaResponse(response.raw)
++  return payload.props as Record<string, any>
++}
++
 +describe('scheduled posts', () => {
 +  let http: TestApp
 +  let author: UserRecord
 +  let other: UserRecord
-+  let scheduled: PostRecord
-+  const tag = `sched-${Date.now()}`
-+
-+  const future = () => new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-+  const past = () => new Date(Date.now() - 60 * 1000).toISOString()
-+
-+  async function makeUser(name: string): Promise<UserRecord> {
-+    return (await User.forceCreate({
-+      name,
-+      email: `${name}-${tag}@example.com`,
-+      password: 'password',
-+    })) as UserRecord
-+  }
-+
-+  async function props(client: TestApp, path: string): Promise<Record<string, any>> {
-+    const response = await client.withHeaders({ 'X-Inertia': 'true' }).get(path).assertOk()
-+    return ((await response.json()) as { props: Record<string, any> }).props
-+  }
 +
 +  beforeAll(async () => {
 +    http = await TestApp.fromApp(app)
++    await migrateDatabase()
 +    author = await makeUser('author')
 +    other = await makeUser('other')
-+    scheduled = (await Post.forceCreate({
-+      title: `Launch ${tag}`,
-+      excerpt: 'Coming soon',
-+      body: 'Body',
-+      authorId: author.id,
-+      publishedAt: future(),
-+    })) as PostRecord
 +  })
 +
++  // `bun run console posts:scheduled` reads this same database, so leave no
++  // scheduled rows behind.
 +  afterAll(async () => {
-+    await Post.delete({ id: scheduled.id })
++    for (const user of [author, other]) {
++      await Post.delete({ authorId: user.id })
++      await User.delete({ id: user.id })
++    }
 +  })
 +
 +  it('hides a scheduled post page from guests and other users', async () => {
-+    await http.get(`/posts/${scheduled.id}`).assertNotFound()
-+    await http.actingAs(other).get(`/posts/${scheduled.id}`).assertNotFound()
-+  })
++    const post = await makePost(author, new Date(Date.now() + HOUR).toISOString())
 +
-+  it('shows a scheduled post page to its author with publishedAt', async () => {
-+    const { post } = await props(http.actingAs(author), `/posts/${scheduled.id}`)
-+    expect(post.id).toBe(scheduled.id)
-+    expect(new Date(post.publishedAt).getTime()).toBe(new Date(scheduled.publishedAt!).getTime())
++    await http.get(`/posts/${post.id}`).assertNotFound()
++    await http.actingAs(other).get(`/posts/${post.id}`).assertNotFound()
++
++    const response = await http.actingAs(author).get(`/posts/${post.id}`).assertOk()
++    const props = await inertiaProps(response)
++    expect(Date.parse(props.post.publishedAt)).toBe(Date.parse(post.publishedAt!))
++    expect(props.post.scheduled).toBe(true)
 +  })
 +
 +  it('lists a scheduled post only for its author', async () => {
-+    const guest = await props(http, '/posts')
-+    expect(guest.data.some((p: PostRecord) => p.id === scheduled.id)).toBe(false)
++    const post = await makePost(author, new Date(Date.now() + HOUR).toISOString())
 +
-+    const stranger = await props(http.actingAs(other), '/posts')
-+    expect(stranger.data.some((p: PostRecord) => p.id === scheduled.id)).toBe(false)
++    const guestIds = (await inertiaProps(await http.get('/posts'))).data.map((p: PostRecord) => p.id)
++    expect(guestIds).not.toContain(post.id)
 +
-+    const own = await props(http.actingAs(author), '/posts')
-+    const listed = own.data.find((p: PostRecord) => p.id === scheduled.id)
-+    expect(listed?.publishedAt).toBeString()
++    const otherIds = (await inertiaProps(await http.actingAs(other).get('/posts'))).data.map((p: PostRecord) => p.id)
++    expect(otherIds).not.toContain(post.id)
++
++    const own = (await inertiaProps(await http.actingAs(author).get('/posts'))).data.find(
++      (p: PostRecord) => p.id === post.id,
++    )
++    expect(own?.publishedAt).toBeString()
 +  })
 +
 +  it('keeps a scheduled post out of search for others', async () => {
-+    const response = await http.query('/posts/search', { keywords: [tag] }).assertOk()
-+    const { data } = (await response.json()) as { data: PostRecord[] }
-+    expect(data.some((p) => p.id === scheduled.id)).toBe(false)
++    const post = await makePost(author, new Date(Date.now() + HOUR).toISOString())
++    const keywords = [post.title.split(' ')[1]]
++
++    const guest = await (await http.query('/posts/search', { keywords })).json<SearchResult>()
++    expect(guest.data.map((p: PostRecord) => p.id)).not.toContain(post.id)
++
++    const signedIn = await (await http.actingAs(other).query('/posts/search', { keywords })).json<SearchResult>()
++    expect(signedIn.data.map((p: PostRecord) => p.id)).not.toContain(post.id)
 +  })
 +
-+  it('reports scheduled posts soonest first', async () => {
-+    const ids = (await Post.scheduled()).map((post) => post.id)
-+    expect(ids).toContain(scheduled.id)
++  it('shows the post to everyone once its time has passed', async () => {
++    const post = await makePost(author, new Date(Date.now() + HOUR).toISOString())
++    await Post.update({ id: post.id }, { publishedAt: new Date(Date.now() - HOUR).toISOString() })
++
++    await http.get(`/posts/${post.id}`).assertOk()
++    const ids = (await inertiaProps(await http.get('/posts'))).data.map((p: PostRecord) => p.id)
++    expect(ids).toContain(post.id)
++    const found = await (await http.query('/posts/search', { keywords: [post.title.split(' ')[1]] })).json<SearchResult>()
++    expect(found.data.map((p: PostRecord) => p.id)).toContain(post.id)
 +  })
 +
-+  it('makes the post public once its time has passed', async () => {
-+    await Post.update({ id: scheduled.id }, { publishedAt: past() })
++  it('stores publishAt from the create and edit requests', async () => {
++    const title = `Created ${crypto.randomUUID()}`
++    const client = await http.actingAs(author).withCsrf()
++    await client
++      .post('/posts', { title, excerpt: 'E', body: 'B', publishAt: '2099-10-01T09:00:00.000Z' })
++      .assertRedirect()
++    const created = (await Post.where('title', title))[0] as PostRecord
++    expect(created.publishedAt).toBe('2099-10-01T09:00:00.000Z')
 +
-+    await http.get(`/posts/${scheduled.id}`).assertOk()
-+    const guest = await props(http, '/posts')
-+    expect(guest.data.some((p: PostRecord) => p.id === scheduled.id)).toBe(true)
-+    const response = await http.query('/posts/search', { keywords: [tag] }).assertOk()
-+    const { data } = (await response.json()) as { data: PostRecord[] }
-+    expect(data.some((p) => p.id === scheduled.id)).toBe(true)
-+    expect((await Post.scheduled()).map((post) => post.id)).not.toContain(scheduled.id)
++    await client
++      .put(`/posts/${created.id}`, { title, excerpt: 'E', body: 'B', publishAt: null })
++      .assertRedirect()
++    expect(((await Post.find(created.id)) as PostRecord).publishedAt).toBeNull()
++  })
++
++  it('rejects a publishAt that is not a date and time like an empty title', async () => {
++    const title = `Rejected ${crypto.randomUUID()}`
++    const client = await http.actingAs(author).withCsrf()
++    const emptyTitle = await client.post('/posts', { title: '', excerpt: 'E', body: 'B' })
++    const badDate = await client
++      .post('/posts', { title, excerpt: 'E', body: 'B', publishAt: 'next tuesday' })
++    expect(badDate.status).toBe(emptyTitle.status)
++    expect(await Post.where('title', title)).toHaveLength(0)
++  })
++
++  it('treats a post without a date as public', async () => {
++    const post = await makePost(author, null)
++    await http.get(`/posts/${post.id}`).assertOk()
 +  })
 +})
 +
 +describe('publishAt validation', () => {
 +  const base = { title: 'T', excerpt: 'E', body: 'B' }
++
++  it('normalizes a date and time to ISO 8601 UTC', () => {
++    const parsed = PostPayloadSchema.parse({ ...base, publishAt: '2026-10-01T11:00:00+02:00' })
++    expect(parsed.publishAt).toBe('2026-10-01T09:00:00.000Z')
++  })
 +
 +  it('treats absent, null and blank as publish now', () => {
 +    expect(PostPayloadSchema.parse(base).publishAt).toBeNull()
@@ -762,13 +852,9 @@ index 0000000..d3acf08
 +    expect(PostPayloadSchema.parse({ ...base, publishAt: '' }).publishAt).toBeNull()
 +  })
 +
-+  it('accepts an ISO 8601 UTC timestamp', () => {
-+    expect(PostPayloadSchema.parse({ ...base, publishAt: '2026-10-01T09:00:00.000Z' }).publishAt).toBe(
-+      '2026-10-01T09:00:00.000Z',
-+    )
-+  })
-+
-+  it('rejects text that is not a date and time', () => {
-+    expect(PostPayloadSchema.safeParse({ ...base, publishAt: 'next tuesday' }).success).toBe(false)
++  it('rejects a value that is not a date and time', () => {
++    const result = PostPayloadSchema.safeParse({ ...base, publishAt: 'next tuesday' })
++    expect(result.success).toBe(false)
++    expect(result.error?.issues[0]?.path).toEqual(['publishAt'])
 +  })
 +})

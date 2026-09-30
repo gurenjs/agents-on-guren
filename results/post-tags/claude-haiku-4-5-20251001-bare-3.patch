@@ -29,28 +29,25 @@ index 392ad58..f34c0a6 100644
  }
  }
 diff --git a/.guren/pages.gen.ts b/.guren/pages.gen.ts
-index 8db6dc3..5e1cf41 100644
+index 8db6dc3..57e8f71 100644
 --- a/.guren/pages.gen.ts
 +++ b/.guren/pages.gen.ts
-@@ -29,7 +29,6 @@ export function isPageId(value: string): value is PageId {
-   return Object.prototype.hasOwnProperty.call(pageManifest, value)
- }
- 
--type PostFormData = ApiRoutes['posts.store']['body']
- /**
-  * Auto-extracted Props types from page components.
-  */
-@@ -48,7 +47,7 @@ export interface PagePropsMap {
+@@ -48,9 +48,11 @@ export interface PagePropsMap {
    latest: PostResourceData[]
  }
    'posts/Edit': {
 -  post: PostFormData & { id: number }
-+  post: PostResourceData
++  post: PostFormData & { id: number; tags: string[] }
++}
++  'posts/Index': PaginatedPageProps<PostResourceData> & {
++  tag?: string
  }
-   'posts/Index': PaginatedPageProps<PostResourceData> & {}
+-  'posts/Index': PaginatedPageProps<PostResourceData> & {}
    'posts/Show': {
+   post: PostResourceData
+ }
 diff --git a/.guren/routes.gen.ts b/.guren/routes.gen.ts
-index 846382c..e976062 100644
+index 846382c..e402f63 100644
 --- a/.guren/routes.gen.ts
 +++ b/.guren/routes.gen.ts
 @@ -148,8 +148,8 @@ declare module '@guren/core' {
@@ -59,109 +56,262 @@ index 846382c..e976062 100644
        'posts.search': { body: { keywords: string[]; limit: number } }
 -      'posts.store': { body: { title: string; excerpt: string; body: string } }
 -      'posts.update': { body: { title: string; excerpt: string; body: string } }
-+      'posts.store': { body: { title: string; excerpt: string; body: string; tags: string } }
-+      'posts.update': { body: { title: string; excerpt: string; body: string; tags: string } }
++      'posts.store': { body: { title: string; excerpt: string; body: string; tags?: string } }
++      'posts.update': { body: { title: string; excerpt: string; body: string; tags?: string } }
      }
    }
  }
 diff --git a/app/Http/Controllers/PostController.ts b/app/Http/Controllers/PostController.ts
-index 8f702c5..381af6c 100644
+index 8f702c5..7448856 100644
 --- a/app/Http/Controllers/PostController.ts
 +++ b/app/Http/Controllers/PostController.ts
-@@ -9,15 +9,32 @@ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+@@ -1,43 +1,106 @@
+ import { Controller, paginate, type PaginatedPageProps } from '@guren/core'
+ import { pages } from '@/.guren/pages.gen'
+ import { Post } from '../../Models/Post.js'
++import { Tag } from '../../Models/Tag.js'
++import { PostTag } from '../../Models/PostTag.js'
+ import type { UserRecord } from '../../Models/User.js'
+ import { PostResource, type PostResourceData } from '../Resources/PostResource.js'
+ import { PostIdParamSchema, ListPostsQuerySchema } from '../Validators/PostValidator.js'
  
+ type PostsIndexProps = PaginatedPageProps<PostResourceData>
+ 
++async function loadPostTags(postIds: number[]): Promise<Map<number, string[]>> {
++  if (postIds.length === 0) return new Map()
++
++  const postTags = (await (PostTag.query() as any)
++    .where((q: any) => {
++      q.whereIn('postId', postIds)
++    })
++    .get()) as any[]
++
++  const tagIds = [...new Set(postTags.map((pt) => pt.postId))]
++  const tags = (await (Tag.query() as any)
++    .where((q: any) => {
++      q.whereIn('id', tagIds)
++    })
++    .get()) as any[]
++
++  const tagMap = new Map(tags.map((t) => [t.id, t.name]))
++  const tagsByPost = new Map<number, string[]>()
++
++  for (const pt of postTags) {
++    const postId = pt.postId
++    const tagId = pt.tagId
++    if (!tagsByPost.has(postId)) {
++      tagsByPost.set(postId, [])
++    }
++    const tagName = tagMap.get(tagId)
++    if (tagName) {
++      tagsByPost.get(postId)!.push(tagName)
++    }
++  }
++
++  for (const tagList of tagsByPost.values()) {
++    tagList.sort()
++  }
++
++  return tagsByPost
++}
++
  export default class PostController extends Controller {
    async index(): Promise<Response> {
 -    const { page } = this.validateQuery(ListPostsQuerySchema)
 -    const result = await Post.newQuery()
 -      .with('author')
+-      .orderBy('id', 'desc')
+-      .paginate({ page, perPage: 10 })
+-    const paginator = paginate(result, { path: this.request.path ?? '/posts' })
 +    const { page, tag } = this.validateQuery(ListPostsQuerySchema)
-+    let query = Post.newQuery().with('author')
++
++    let postIds: number[] | null = null
 +
 +    if (tag) {
-+      const postIds = await Post.findPostIdsByTag(tag)
-+      query = query.whereIn('id', postIds.length > 0 ? postIds : [0])
++      const tagRecord = (await (Tag.query() as any).where('name', '=', tag).first()) as any
++      if (tagRecord) {
++        const postTagRecords = (await (PostTag.query() as any)
++          .where('tagId', '=', (tagRecord as any).id)
++          .get()) as any[]
++        postIds = postTagRecords.map((pt: any) => pt.postId)
++      } else {
++        postIds = []
++      }
 +    }
 +
-+    const result = await query
-       .orderBy('id', 'desc')
-       .paginate({ page, perPage: 10 })
--    const paginator = paginate(result, { path: this.request.path ?? '/posts' })
++    let query = Post.newQuery().with('author')
 +
-+    const posts = await Promise.all(
-+      result.data.map(async (post) => {
-+        const tags = await Post.getTagsForPost(post.id)
-+        return Object.assign(post, { tags })
-+      }),
-+    )
++    if (postIds !== null) {
++      if (postIds.length === 0) {
++        query = query.where('id', '=', -1)
++      } else {
++        query = query.whereIn('id', postIds)
++      }
++    }
 +
-+    const paginator = paginate(result, {
-+      path: this.request.path ?? '/posts',
-+      query: tag ? { tag } : {},
-+    })
++    const result = await query.orderBy('id', 'desc').paginate({ page, perPage: 10 })
++    const tagsByPost = await loadPostTags(result.data.map((p: any) => p.id))
++
++    const postsWithTags = result.data.map((post: any) => ({
++      ...post,
++      tagNames: tagsByPost.get(post.id) ?? [],
++    }))
++
++    const paginator = paginate({ ...result, data: postsWithTags }, { path: this.request.path ?? '/posts' })
  
      return this.inertia(pages.posts.Index, {
 -      data: result.data.map((post) => new PostResource(post).toJSON()),
-+      data: posts.map((post) => new PostResource(post).toJSON()),
++      data: postsWithTags.map((post) => new PostResource(post as any).toJSON()),
        pagination: {
          meta: paginator.meta(),
          links: paginator.links(),
-@@ -53,9 +70,11 @@ export default class PostController extends Controller {
+       },
+-    } satisfies PostsIndexProps)
++      tag,
++    } satisfies PostsIndexProps & { tag?: string })
+   }
+ 
+-  // Serves the HTTP QUERY route `posts.search` — a safe read that carries its
+-  // criteria in a JSON body. Matches posts with any keyword in title or
+-  // excerpt; `%` and `_` in a keyword act as SQL LIKE wildcards, which this
+-  // starter treats as a feature.
+   async search(): Promise<Response> {
+     const { keywords, limit } = this.validated('posts.search').body
+ 
+-    const posts = await Post.newQuery()
++    const posts = (await Post.newQuery()
+       .with('author')
+-      // All keyword OR pairs sit inside one callback, keeping this an
+-      // any-keyword match while AND filters added later (a published flag,
+-      // tenancy) apply to every hit instead of being OR'd away.
+-      .where((q) => {
++      .where((q: any) => {
+         for (const keyword of keywords) {
+           const pattern = `%${keyword}%`
+           q.orWhere('title', 'like', pattern).orWhere('excerpt', 'like', pattern)
+@@ -45,17 +108,27 @@ export default class PostController extends Controller {
+       })
+       .orderBy('id', 'desc')
+       .limit(limit)
+-      .get()
++      .get()) as any[]
+ 
+-    return this.json({ data: PostResource.collection(posts) })
++    const tagsByPost = await loadPostTags(posts.map((p) => p.id))
++    const postsWithTags = posts.map((post) => ({
++      ...post,
++      tagNames: tagsByPost.get(post.id) ?? [],
++    }))
++
++    return this.json({ data: PostResource.collection(postsWithTags as any) })
+   }
+ 
    async show(): Promise<Response> {
      const { id } = this.validateParams(PostIdParamSchema)
      const post = await Post.findWithOrFail(id, 'author')
-+    const tags = await Post.getTagsForPost(id)
-+    const postWithTags = Object.assign(post, { tags })
  
++    const tagsByPost = await loadPostTags([post.id])
++    const tagNames = tagsByPost.get(post.id) ?? []
++    const postWithTags = { ...post, tagNames }
++
      return this.inertia(pages.posts.Show, {
 -      post: new PostResource(post).toJSON(),
-+      post: new PostResource(postWithTags).toJSON(),
++      post: new PostResource(postWithTags as any).toJSON(),
      })
    }
  
-@@ -68,9 +87,14 @@ export default class PostController extends Controller {
+@@ -68,9 +141,29 @@ export default class PostController extends Controller {
      await this.authorize('create', Post)
      const author = await this.auth.userOrFail<UserRecord>()
      const { body: data } = this.validated('posts.store')
-+    const { tags, ...postData } = data as any
-     // forceCreate, because `authorId` is deliberately absent from Post.fillable:
-     // it comes from the session, and a request must never be able to set it.
+-    // forceCreate, because `authorId` is deliberately absent from Post.fillable:
+-    // it comes from the session, and a request must never be able to set it.
 -    const post = await Post.forceCreate({ ...data, authorId: author.id })
-+    const post = await Post.forceCreate({ ...postData, authorId: author.id })
++    const tags = (data as any).tags as string[] || []
 +
-+    if (post?.id && tags && tags.length > 0) {
-+      await Post.syncTags(post.id, tags)
++    const postData = { title: data.title, excerpt: data.excerpt, body: data.body, authorId: author.id }
++    const post = await Post.create(postData)
++
++    if (post && tags.length > 0) {
++      const tagRecords = (await (Tag.query() as any)
++        .where((q: any) => {
++          q.whereIn('name', tags)
++        })
++        .get()) as any[]
++
++      const existingTagNames = new Set(tagRecords.map((t) => t.name))
++      const newTags = tags.filter((name) => !existingTagNames.has(name))
++
++      const createdTags = await Promise.all(newTags.map((name) => Tag.create({ name })))
++
++      const allTags = [...tagRecords, ...createdTags]
++
++      for (const tagRecord of allTags) {
++        await PostTag.create({ postId: (post as any).id, tagId: tagRecord.id })
++      }
 +    }
  
      return this.redirect(post?.id ? `/posts/${post.id}` : '/posts')
    }
-@@ -79,9 +103,11 @@ export default class PostController extends Controller {
-     const { id } = this.validateParams(PostIdParamSchema)
+@@ -80,8 +173,17 @@ export default class PostController extends Controller {
      const post = await Post.findOrFail(id)
      await this.authorize('update', [Post, post])
-+    const tags = await Post.getTagsForPost(id)
-+    const postWithTags = Object.assign(post, { tags })
  
++    const tagsByPost = await loadPostTags([post.id])
++    const tagNames = tagsByPost.get(post.id) ?? []
++    const postWithTags = { ...post, tagNames }
++
++    const resourceData = new PostResource(postWithTags as any).toJSON()
++
      return this.inertia(pages.posts.Edit, {
 -      post: new PostResource(post).toJSON(),
-+      post: new PostResource(postWithTags).toJSON(),
++      post: {
++        ...resourceData,
++        tags: resourceData.tags.join(', '),
++      } as any,
      })
    }
  
-@@ -91,7 +117,10 @@ export default class PostController extends Controller {
+@@ -91,7 +193,36 @@ export default class PostController extends Controller {
      await this.authorize('update', [Post, post])
  
      const { body: data } = this.validated('posts.update')
 -    await Post.update({ id: post.id }, data)
-+    const { tags, ...postData } = data as any
++    const tags = (data as any).tags as string[] || []
 +
++    const postData = { title: data.title, excerpt: data.excerpt, body: data.body }
 +    await Post.update({ id: post.id }, postData)
-+    await Post.syncTags(post.id, tags || [])
++
++    const existingPostTags = (await (PostTag.query() as any)
++      .where('postId', '=', (post as any).id)
++      .get()) as any[]
++    for (const pt of existingPostTags) {
++      await PostTag.delete({ postId: pt.postId, tagId: pt.tagId })
++    }
++
++    if (tags.length > 0) {
++      const tagRecords = (await (Tag.query() as any)
++        .where((q: any) => {
++          q.whereIn('name', tags)
++        })
++        .get()) as any[]
++
++      const existingTagNames = new Set(tagRecords.map((t) => t.name))
++      const newTags = tags.filter((name) => !existingTagNames.has(name))
++
++      const createdTags = await Promise.all(newTags.map((name) => Tag.create({ name })))
++
++      const allTags = [...tagRecords, ...createdTags]
++
++      for (const tagRecord of allTags) {
++        await PostTag.create({ postId: (post as any).id, tagId: tagRecord.id })
++      }
++    }
  
      return this.redirect(`/posts/${post.id}`)
    }
 diff --git a/app/Http/Resources/PostResource.ts b/app/Http/Resources/PostResource.ts
-index 679024d..1dc5dc9 100644
+index 679024d..643d290 100644
 --- a/app/Http/Resources/PostResource.ts
 +++ b/app/Http/Resources/PostResource.ts
 @@ -14,6 +14,7 @@ export interface PostResourceData extends Record<string, unknown> {
@@ -176,12 +326,12 @@ index 679024d..1dc5dc9 100644
          id: (post as PostWithAuthor).author?.id,
          name: (post as PostWithAuthor).author?.name,
        })) as PostAuthorSummary | undefined,
-+      tags: (post as any).tags ?? [],
++      tags: (post as any).tagNames ?? [],
      }
    }
  }
 diff --git a/app/Http/Validators/PostValidator.ts b/app/Http/Validators/PostValidator.ts
-index 804642a..26d1081 100644
+index 804642a..34aff2a 100644
 --- a/app/Http/Validators/PostValidator.ts
 +++ b/app/Http/Validators/PostValidator.ts
 @@ -6,6 +6,7 @@ export const PostIdParamSchema = z.object({
@@ -192,159 +342,90 @@ index 804642a..26d1081 100644
  })
  
  export const PostSearchSchema = z.object({
-@@ -16,10 +17,28 @@ export const PostSearchSchema = z.object({
+@@ -16,10 +17,45 @@ export const PostSearchSchema = z.object({
    limit: z.number().int().min(1).max(50).default(10),
  })
  
+-export const PostPayloadSchema = z.object({
+-  title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
+-  excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
+-  body: z.string().trim().min(1, 'Body is required.'),
+-})
 +const parseTagsString = (input: string | undefined): string[] => {
 +  if (!input) return []
-+  const tags = input
++  return input
 +    .split(',')
 +    .map((tag) => tag.trim())
 +    .filter((tag) => tag.length > 0)
-+  return [...new Set(tags)]
 +}
 +
- export const PostPayloadSchema = z.object({
-   title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
-   excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
-   body: z.string().trim().min(1, 'Body is required.'),
-+  tags: z.string().default('').transform(parseTagsString)
-+    .refine(
-+      (tags) => tags.every((tag) => tag.length >= 1 && tag.length <= 30),
-+      'Each tag must be 1–30 characters.',
-+    )
-+    .refine(
-+      (tags) => tags.length <= 5,
-+      'A post may have at most 5 tags.',
-+    ),
- })
++export const PostPayloadSchema = z
++  .object({
++    title: z.string().trim().min(1, 'Title is required.').max(255, 'Title must be 255 characters or fewer.'),
++    excerpt: z.string().trim().min(1, 'Excerpt is required.').max(500, 'Excerpt must be 500 characters or fewer.'),
++    body: z.string().trim().min(1, 'Body is required.'),
++    tags: z.string().optional().transform(parseTagsString),
++  })
++  .superRefine((data, ctx) => {
++    if (data.tags.length > 5) {
++      ctx.addIssue({
++        code: z.ZodIssueCode.custom,
++        path: ['tags'],
++        message: 'Tags must be 5 or fewer.',
++      })
++    }
++
++    for (const tag of data.tags) {
++      if (tag.length < 1 || tag.length > 30) {
++        ctx.addIssue({
++          code: z.ZodIssueCode.custom,
++          path: ['tags'],
++          message: 'Each tag must be 1–30 characters.',
++        })
++        break
++      }
++    }
++
++    const uniqueTags = new Set(data.tags)
++    if (uniqueTags.size !== data.tags.length) {
++      data.tags = Array.from(uniqueTags).sort()
++    }
++  })
  
  export type PostPayload = z.infer<typeof PostPayloadSchema>
-diff --git a/app/Models/Post.ts b/app/Models/Post.ts
-index ca838be..a7ac3df 100644
---- a/app/Models/Post.ts
-+++ b/app/Models/Post.ts
-@@ -1,6 +1,7 @@
- import { defineModel, type BelongsToRecord } from '@guren/core'
- import { posts } from '../../db/schema.js'
- import type { UserRecord } from './User.js'
-+import { Tag } from './Tag.js'
- 
- export type PostRecord = typeof posts.$inferSelect
- export type NewPostRecord = typeof posts.$inferInsert
-@@ -8,11 +9,91 @@ export type PostAuthorSummary = Pick<UserRecord, 'id' | 'name'>
- 
- export class Post extends defineModel(posts, {
-   // `authorId` is set from the signed-in user, never from request input.
-+  // `tags` is handled separately via syncTags.
-   fillable: ['title', 'excerpt', 'body'],
- }) {
-   static override relationTypes: { author: BelongsToRecord<PostAuthorSummary> } = {
-     author: null,
-   }
+diff --git a/app/Models/PostTag.ts b/app/Models/PostTag.ts
+new file mode 100644
+index 0000000..d59f047
+--- /dev/null
++++ b/app/Models/PostTag.ts
+@@ -0,0 +1,8 @@
++import { defineModel } from '@guren/core'
++import { postTags } from '../../db/schema.js'
 +
-+  static async syncTags(postId: number, tagNames: string[]): Promise<void> {
-+    const tagSet = new Set(tagNames)
-+    const tags = await Promise.all(
-+      Array.from(tagSet).map(async (name) => {
-+        // @ts-expect-error - Guren query types are not fully inferred
-+        const existingTag = await Tag.query().where('name', '=', name).first()
-+        if (existingTag) {
-+          return existingTag
-+        }
-+        return await Tag.forceCreate({ name })
-+      }),
-+    )
++export type PostTagRecord = typeof postTags.$inferSelect
 +
-+    const tagIds = tags
-+      .filter((t: any) => t !== null && t !== undefined)
-+      .map((t: any) => t.id)
-+
-+    if (tagIds.length === 0) {
-+      // @ts-expect-error - Guren query types are not fully inferred
-+      await Post.query()
-+        .from('post_tags')
-+        .where('post_id', '=', postId)
-+        .delete()
-+      return
-+    }
-+
-+    // @ts-expect-error - Guren query types are not fully inferred
-+    const existingAssociations = await Tag.query()
-+      .select('tag_id')
-+      .from('post_tags')
-+      .where('post_id', '=', postId)
-+      .get()
-+    const existingTagIds = (existingAssociations as any[]).map((a: any) => a.tag_id)
-+
-+    const toAdd = tagIds.filter((id: any) => !existingTagIds.includes(id))
-+    const toRemove = existingTagIds.filter((id: any) => !tagIds.includes(id))
-+
-+    for (const tagId of toAdd) {
-+      // @ts-expect-error - Guren query types are not fully inferred
-+      await Tag.query().from('post_tags').insert({ post_id: postId, tag_id: tagId })
-+    }
-+
-+    if (toRemove.length > 0) {
-+      // @ts-expect-error - Guren query types are not fully inferred
-+      await Tag.query()
-+        .from('post_tags')
-+        .where('post_id', '=', postId)
-+        .whereIn('tag_id', toRemove)
-+        .delete()
-+    }
-+  }
-+
-+  static async getTagsForPost(postId: number): Promise<string[]> {
-+    // @ts-expect-error - Guren query types are not fully inferred
-+    const postTags = await Tag.query()
-+      .select('name')
-+      .from('tags')
-+      .whereIn('id', (q: any) =>
-+        q.select('tag_id').from('post_tags').where('post_id', '=', postId),
-+      )
-+      .orderBy('name', 'asc')
-+      .get()
-+
-+    return (postTags as any[]).map((t: any) => t.name)
-+  }
-+
-+  static async findPostIdsByTag(tagName: string): Promise<number[]> {
-+    // @ts-expect-error - Guren query types are not fully inferred
-+    const results = await Tag.query()
-+      .select('post_id')
-+      .from('post_tags')
-+      .whereIn('tag_id', (q: any) =>
-+        q.select('id').from('tags').where('name', '=', tagName),
-+      )
-+      .get()
-+
-+    return (results as any[]).map((r: any) => r.post_id)
-+  }
- }
- 
- Post.belongsTo('author', () => import('./User.js').then((module) => module.User), 'authorId', 'id')
++export class PostTag extends defineModel(postTags, {
++  fillable: ['postId', 'tagId'],
++}) {}
 diff --git a/app/Models/Tag.ts b/app/Models/Tag.ts
 new file mode 100644
-index 0000000..d687370
+index 0000000..2f4a722
 --- /dev/null
 +++ b/app/Models/Tag.ts
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,8 @@
 +import { defineModel } from '@guren/core'
 +import { tags } from '../../db/schema.js'
 +
 +export type TagRecord = typeof tags.$inferSelect
-+export type NewTagRecord = typeof tags.$inferInsert
 +
 +export class Tag extends defineModel(tags, {
 +  fillable: ['name'],
 +}) {}
-diff --git a/db/migrations/20260925044850_busy_human_cannonball/migration.sql b/db/migrations/20260925044850_busy_human_cannonball/migration.sql
+diff --git a/db/migrations/20260929195137_numerous_millenium_guard/migration.sql b/db/migrations/20260929195137_numerous_millenium_guard/migration.sql
 new file mode 100644
 index 0000000..21f0642
 --- /dev/null
-+++ b/db/migrations/20260925044850_busy_human_cannonball/migration.sql
++++ b/db/migrations/20260929195137_numerous_millenium_guard/migration.sql
 @@ -0,0 +1,11 @@
 +CREATE TABLE `post_tags` (
 +	`post_id` integer NOT NULL,
@@ -357,16 +438,16 @@ index 0000000..21f0642
 +	`id` integer PRIMARY KEY AUTOINCREMENT,
 +	`name` text NOT NULL UNIQUE
 +);
-diff --git a/db/migrations/20260925044850_busy_human_cannonball/snapshot.json b/db/migrations/20260925044850_busy_human_cannonball/snapshot.json
+diff --git a/db/migrations/20260929195137_numerous_millenium_guard/snapshot.json b/db/migrations/20260929195137_numerous_millenium_guard/snapshot.json
 new file mode 100644
-index 0000000..7cb14ab
+index 0000000..b55a7e7
 --- /dev/null
-+++ b/db/migrations/20260925044850_busy_human_cannonball/snapshot.json
++++ b/db/migrations/20260929195137_numerous_millenium_guard/snapshot.json
 @@ -0,0 +1,287 @@
 +{
 +  "version": "7",
 +  "dialect": "sqlite",
-+  "id": "e1c76f85-55c7-4ba3-bf90-2a9f058a5def",
++  "id": "9599fbf7-f30f-4a13-bc3b-2a83ae643c62",
 +  "prevIds": [
 +    "dce5db2f-81fb-4672-bae0-e7a4ffdb9d3a"
 +  ],
@@ -674,33 +755,27 @@ index 47b96e5..c3c7c84 100644
 +    .references(() => tags.id),
 +})
 diff --git a/resources/js/pages/posts/Edit.tsx b/resources/js/pages/posts/Edit.tsx
-index c5f3d76..8515361 100644
+index c5f3d76..4e50d7e 100644
 --- a/resources/js/pages/posts/Edit.tsx
 +++ b/resources/js/pages/posts/Edit.tsx
-@@ -1,12 +1,13 @@
- import { Head, useForm } from '@inertiajs/react'
- import type { ApiRoutes } from '@/.guren/api-client.gen'
-+import type { PostResourceData } from '@/app/Http/Resources/PostResource'
- import { route } from '@/.guren/routes.gen'
- import Layout from '../../components/Layout.js'
- 
+@@ -6,7 +6,7 @@ import Layout from '../../components/Layout.js'
  type PostFormData = ApiRoutes['posts.store']['body']
  
  interface Props {
 -  post: PostFormData & { id: number }
-+  post: PostResourceData
++  post: PostFormData & { id: number; tags: string[] }
  }
  
  const fieldClass =
-@@ -17,6 +18,7 @@ export default function EditPost({ post }: Props) {
+@@ -17,6 +17,7 @@ export default function EditPost({ post }: Props) {
      title: post.title,
      excerpt: post.excerpt,
      body: post.body,
-+    tags: post.tags?.join(', ') ?? '',
++    tags: post.tags.join(', '),
    })
  
    return (
-@@ -68,6 +70,18 @@ export default function EditPost({ post }: Props) {
+@@ -68,6 +69,18 @@ export default function EditPost({ post }: Props) {
              {form.errors.body ? <p className="mt-1 text-sm text-g-danger">{form.errors.body}</p> : null}
            </div>
  
@@ -710,7 +785,7 @@ index c5f3d76..8515361 100644
 +              type="text"
 +              value={form.data.tags}
 +              onChange={(event) => form.setData('tags', event.target.value)}
-+              placeholder="e.g., bun, webdev"
++              placeholder="bun, webdev"
 +              className={fieldClass}
 +            />
 +            {form.errors.tags ? <p className="mt-1 text-sm text-g-danger">{form.errors.tags}</p> : null}
@@ -720,31 +795,79 @@ index c5f3d76..8515361 100644
              type="submit"
              disabled={form.processing}
 diff --git a/resources/js/pages/posts/Index.tsx b/resources/js/pages/posts/Index.tsx
-index f4731cc..5e904a8 100644
+index f4731cc..df6b5f7 100644
 --- a/resources/js/pages/posts/Index.tsx
 +++ b/resources/js/pages/posts/Index.tsx
-@@ -106,6 +106,19 @@ export default function PostsIndex({ data, pagination }: Props) {
-                 {post.title}
-               </Link>
-               <p className="mt-2 text-sm text-g-text-2">{post.excerpt}</p>
+@@ -6,18 +6,13 @@ import { route } from '@/.guren/routes.gen'
+ import { createApiClient, type ApiRoutes } from '@/.guren/api-client.gen'
+ import Layout from '../../components/Layout.js'
+ 
+-interface Props extends PaginatedPageProps<PostResourceData> {}
+-
+-// posts.search is an HTTP QUERY route (RFC 10008): safe like GET, but the
+-// criteria travel in a JSON body — HTML forms and Inertia navigation cannot
+-// send it, so the page calls it through the generated typed client.
++interface Props extends PaginatedPageProps<PostResourceData> {
++  tag?: string
++}
+ 
+-// The client types the request body from the schema bound to the route, and
+-// json() from the `resource` hint the route declares — both come from the
+-// route definition, so this file never restates the wire shape.
+ const api = createApiClient<ApiRoutes>({ baseUrl: '' })
+ 
+-export default function PostsIndex({ data, pagination }: Props) {
++export default function PostsIndex({ data, pagination, tag }: Props) {
+   const [keywords, setKeywords] = useState('')
+   const [results, setResults] = useState<PostResourceData[] | null>(null)
+   const [searching, setSearching] = useState(false)
+@@ -96,6 +91,15 @@ export default function PostsIndex({ data, pagination }: Props) {
+           </p>
+         )}
+ 
++        {tag && (
++          <p className="text-sm text-g-text-2">
++            Filtered by tag: <strong>{tag}</strong> ·{' '}
++            <Link href={route('posts.index')} className="text-g-accent-text transition hover:underline">
++              Clear
++            </Link>
++          </p>
++        )}
++
+         <div className="space-y-4">
+           {posts.map((post) => (
+             <article key={post.id} className="rounded-g-card border border-g-line bg-g-panel p-5 shadow-g-card">
+@@ -109,6 +113,19 @@ export default function PostsIndex({ data, pagination }: Props) {
+               {post.author ? (
+                 <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
+               ) : null}
 +              {post.tags && post.tags.length > 0 && (
-+                <div className="mt-2 flex flex-wrap gap-2">
-+                  {post.tags.map((tag) => (
++                <div className="mt-3 flex flex-wrap gap-2">
++                  {post.tags.map((tagName) => (
 +                    <Link
-+                      key={tag}
-+                      href={`/posts?tag=${encodeURIComponent(tag)}`}
-+                      className="inline-block rounded-g-ctl bg-g-accent-tint px-2 py-1 text-xs text-g-accent-text transition hover:bg-g-accent-tint-down"
++                      key={tagName}
++                      href={`${route('posts.index')}?tag=${encodeURIComponent(tagName)}`}
++                      className="inline-block rounded-full bg-g-accent-tint px-3 py-1 text-xs font-bold text-g-accent-text transition hover:bg-g-accent-hint"
 +                    >
-+                      {tag}
++                      {tagName}
 +                    </Link>
 +                  ))}
 +                </div>
 +              )}
-               {post.author ? (
-                 <p className="mt-3 font-mono text-xs uppercase tracking-wide text-g-muted">by {post.author.name}</p>
-               ) : null}
+             </article>
+           ))}
+         </div>
+@@ -118,7 +135,7 @@ export default function PostsIndex({ data, pagination }: Props) {
+             {pagination.links.pages.map((page) => (
+               <Link
+                 key={page.page}
+-                href={page.url ?? '#'}
++                href={tag ? `${page.url ?? '#'}?tag=${encodeURIComponent(tag)}` : page.url ?? '#'}
+                 className="rounded-g-ctl border border-g-line px-3 py-1 text-g-text-2 transition hover:border-g-line-strong hover:text-g-heading"
+               >
+                 {page.page}
 diff --git a/resources/js/pages/posts/New.tsx b/resources/js/pages/posts/New.tsx
-index e06958d..058dc45 100644
+index e06958d..6558450 100644
 --- a/resources/js/pages/posts/New.tsx
 +++ b/resources/js/pages/posts/New.tsx
 @@ -9,7 +9,7 @@ const fieldClass =
@@ -766,7 +889,7 @@ index e06958d..058dc45 100644
 +              type="text"
 +              value={form.data.tags}
 +              onChange={(event) => form.setData('tags', event.target.value)}
-+              placeholder="e.g., bun, webdev"
++              placeholder="bun, webdev"
 +              className={fieldClass}
 +            />
 +            {form.errors.tags ? <p className="mt-1 text-sm text-g-danger">{form.errors.tags}</p> : null}
@@ -776,27 +899,35 @@ index e06958d..058dc45 100644
              type="submit"
              disabled={form.processing}
 diff --git a/resources/js/pages/posts/Show.tsx b/resources/js/pages/posts/Show.tsx
-index 537c81e..084e580 100644
+index 537c81e..fb95755 100644
 --- a/resources/js/pages/posts/Show.tsx
 +++ b/resources/js/pages/posts/Show.tsx
-@@ -31,6 +31,20 @@ export default function PostShow({ post }: Props) {
+@@ -9,8 +9,6 @@ interface Props {
+ 
+ export default function PostShow({ post }: Props) {
+   const { props } = usePage<{ auth?: { user?: { id?: number } } }>()
+-  // Mirrors PostPolicy — the server rejects it either way, this only keeps
+-  // controls the viewer cannot use off the page.
+   const canManage = props.auth?.user?.id === post.authorId
+ 
+   return (
+@@ -27,6 +25,19 @@ export default function PostShow({ post }: Props) {
+             {new Date(post.createdAt).toLocaleDateString()}
+           </p>
+           <p className="text-g-text-2">{post.excerpt}</p>
++          {post.tags && post.tags.length > 0 && (
++            <div className="mt-3 flex flex-wrap gap-2">
++              {post.tags.map((tagName) => (
++                <Link
++                  key={tagName}
++                  href={`${route('posts.index')}?tag=${encodeURIComponent(tagName)}`}
++                  className="inline-block rounded-full bg-g-accent-tint px-3 py-1 text-xs font-bold text-g-accent-text transition hover:bg-g-accent-hint"
++                >
++                  {tagName}
++                </Link>
++              ))}
++            </div>
++          )}
+         </header>
  
          <div className="whitespace-pre-wrap text-g-text">{post.body}</div>
- 
-+        {post.tags && post.tags.length > 0 && (
-+          <div className="flex flex-wrap gap-2">
-+            {post.tags.map((tag) => (
-+              <Link
-+                key={tag}
-+                href={`/posts?tag=${encodeURIComponent(tag)}`}
-+                className="inline-block rounded-g-ctl bg-g-accent-tint px-2 py-1 text-xs text-g-accent-text transition hover:bg-g-accent-tint-down"
-+              >
-+                {tag}
-+              </Link>
-+            ))}
-+          </div>
-+        )}
-+
-         <footer className="flex items-center gap-4 border-t border-g-line pt-6 text-sm">
-           <Link href={route('posts.index')} className="text-g-text-2 transition hover:text-g-heading">
-             ← All posts
