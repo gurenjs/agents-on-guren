@@ -14,7 +14,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 RESULTS = os.environ.get('AOG_RESULTS', os.path.join(ROOT, 'results'))
 TASKS = ['post-tags', 'comments-moderation', 'post-revisions', 'scheduled-publish', 'json-api-tokens',
          'locale-switch', 'newsletter-module', 'posts-agent-tool', 'cover-attachment']
-MODELS = [('claude-sonnet-5', 'Sonnet 5'), ('claude-opus-5-5', 'Opus 5.5'),
+MODELS = [('claude-sonnet-5-5', 'Sonnet 5.5'), ('claude-opus-5-5', 'Opus 5.5'),
           ('claude-haiku-4-5-20251001', 'Haiku 4.5'), ('claude-fable-5-1', 'Fable 5.1')]
 CONDS = ['bare', 'shipped', 'shipped+plan']
 
@@ -119,7 +119,7 @@ if plan:
         g = [c for c in plan if c['task'] == task]
         if not g: continue
         md.append(f"| {task} | {len(g)} | {sum(c['passed'] for c in g)} | {sum(1 for c in g if (c['plan_next'] or 0) > 0)} | {med([c['plan_next'] for c in g])} | {med([c['plan_verify'] for c in g])} | {med([c['commits'] for c in g])} | {med([c['turns'] for c in g])} | {med([c['cost'] for c in g], 2)} |")
-    s = [c for c in cells if c['model'] == 'claude-sonnet-5' and c['cond'] == 'shipped' and c['task'] in {c2['task'] for c2 in plan}]
+    s = [c for c in cells if c['model'] == 'claude-sonnet-5-5' and c['cond'] == 'shipped' and c['task'] in {c2['task'] for c2 in plan}]
     md.append(f"\nSame three tasks, Sonnet shipped without a plan: pass {sum(c['passed'] for c in s)}/{len(s)}, med turns {med([c['turns'] for c in s])}, med cost {med([c['cost'] for c in s], 2)}.")
 
 md.append("\n## Totals\n")
