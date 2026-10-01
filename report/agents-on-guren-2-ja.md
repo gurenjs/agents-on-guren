@@ -8,7 +8,7 @@ published: false
 
 ## はじめに
 
-2026年9月9日、Rails Foundationが「Agents on Rails Stage 2」を公開しました。37signalsのカンバンアプリFizzyに対する20本の機能チケットを、各3回ずつモデルに解かせた結果です。
+2026年9月9日、Rails Foundationが「Agents on Rails Stage 2」を公開しました。対象はFizzyで、BasecampやHEYを作っている37signalsの、課題やアイデアをカードで管理するカンバン型ツールです。Railsで書かれていてソースも公開されており、このアプリに対する20本の機能チケットを各3回ずつモデルに解かせています。
 
 https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2
 

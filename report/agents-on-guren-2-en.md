@@ -2,7 +2,7 @@
 
 *guren.dev, 2026-10-01.*
 
-On 9 September the Rails Foundation published [Agents on Rails Stage 2](https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2): 20 feature tickets on Fizzy, 37signals' kanban app, three attempts per ticket. The best model passed 35% (GPT-6 Astra). Fable 5.1 passed 32% at $9.14 per run and Opus 5 passed 25% at $9.85. Stage 1 had stopped telling models apart; in Rails' words, "the tasks were deliberately small, and more than half the time the models reinvented the wheel instead of reaching for the framework".
+On 9 September the Rails Foundation published [Agents on Rails Stage 2](https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2): 20 feature tickets on [Fizzy](https://github.com/basecamp/fizzy), the kanban tool for issues and ideas that 37signals (the makers of Basecamp and HEY) built in Rails and publishes the source of, three attempts per ticket. The best model passed 35% (GPT-6 Astra). Fable 5.1 passed 32% at $9.14 per run and Opus 5 passed 25% at $9.85. Stage 1 had stopped telling models apart; in Rails' words, "the tasks were deliberately small, and more than half the time the models reinvented the wheel instead of reaching for the framework".
 
 On 23 September, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH said 37signals has [stopped writing code by hand](https://youtu.be/V9SxpJpHuus?t=3240) and fixes the factory when an agent fails, that convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020), and that every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
 
