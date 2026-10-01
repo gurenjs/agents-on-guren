@@ -52,7 +52,7 @@ What the table says:
 
 Each tool action in the Sonnet 5.5 cells was classified by heuristic and charged the tokens it cost (its output, its result re-read on later calls, and a share of the shared prefix). The buckets add up to each cell's cost within a cent. It is an attribution model, not a direct measurement.
 
-- Name confusion: looking for which of `@guren/core` and `@guren/server` holds a symbol, the part RFC 0024 would remove.
+- Name confusion: looking for which of `@guren/core` and `@guren/server` holds a symbol, the part merging the two packages would remove.
 - API learning: reading `node_modules/@guren/*`, guidance or generated types, plus guidance loaded at session start.
 - Implementation: the app's own files, edits, codegen, tests, and commands the runner refused.
 
@@ -137,7 +137,7 @@ Rails counted wheel reinvention in Stage 1. The same column here, over passing c
 
 ## Plans: the loop the agents did not run
 
-Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human approves a plan, the agent implements it step by step, and `plan:next`, `plan:verify` and a Stop hook check each step. Three tickets (post-tags, comments-moderation, scheduled-publish) got an approved plan; the plan condition adds the plan files and one line, "implement the plan". Sonnet 5.5, N=3.
+Guren's implementation plans are a factory in DHH's sense: a human approves a plan, the agent implements it step by step, and `plan:next`, `plan:verify` and a Stop hook check each step. Three tickets (post-tags, comments-moderation, scheduled-publish) got an approved plan; the plan condition adds the plan files and one line, "implement the plan". Sonnet 5.5, N=3.
 
 | cell | `plan:next` calls | `plan:verify` calls | commits | turns |
 |---|---|---|---|---|
@@ -147,11 +147,11 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
 
 - Both conditions passed 9 of 9. The plan cells took more effort: 37 turns and $0.70 median, against 27 and $0.55 for the same tickets without a plan.
 - The designed loop (one step, one verification, one commit) ran in no cell. None committed, three never called `plan:next`, and the rest read the plan and implemented it in one pass.
-- The loop lets that happen: the Stop hook judges only the step `plan:next` marked, and the first step passes trivially. RFC 0030 needs the hook to block while unverified steps remain, or a skill that drives the loop.
+- The loop lets that happen: the Stop hook judges only the step `plan:next` marked, and the first step passes trivially. Plans need the hook to block while unverified steps remain, or a skill that drives the loop.
 
 ## What this means for the framework
 
-- RFC 0024 stays parked. Its case was name confusion between `@guren/core` and `@guren/server`, which shows up only without the harness. The remaining cost is guidance loaded at session start, so the levers are the digest and how much guidance loads up front.
+- Merging `@guren/core` and `@guren/server` stays on hold. The name confusion it would remove shows up only without the harness. The remaining cost is guidance loaded at session start, so the levers are the digest and how much guidance loads up front.
 - 22 findings about Guren, most found while writing the tickets. The main ones:
   - Harness: the digest said nothing about API tokens or rate limits; hooks failed after an agent ran `cd`.
   - CLI checks: `guren audit` missed a missing authorization on models with a policy.
@@ -176,7 +176,7 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
 ## Summary
 
 - Guren costs 1.40× plain Hono on Sonnet 5.5 and 1.49× on Opus 5.5 for the same feature, in about the same number of turns. The released cli 2.28 harness brings it to 1.26×.
-- That gap is guidance loaded at session start. Searching for which package exports a symbol, the case for merging `@guren/core` and `@guren/server` (RFC 0024), shows up only without the harness.
+- That gap is guidance loaded at session start. Searching for which of `@guren/core` and `@guren/server` exports a symbol shows up only without the harness.
 - On the nine tickets, the harness cuts turns by 11–27% for every model. Opus 5.5 and Fable 5.1 pass every cell either way, so pass rate no longer separates the top models here.
 - Given an approved plan, no agent ran the step-verify-commit loop it was designed around.
 - The round turned up 22 findings about Guren; ten are fixed and released.
