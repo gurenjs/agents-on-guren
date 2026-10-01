@@ -53,7 +53,9 @@ kept in `results-sonnet5-stage2/`, since Sonnet 5.5 replaced Sonnet 5.
   (`harness/summarize-stage2.py`); calibration cells are kept apart in
   `results-calibration-stage2/`.
 - How the round was run, step by step: [RUNBOOK.md](RUNBOOK.md).
-- Event streams will be attached to the release.
+- Event streams: `agents-on-guren-streams-2026-09-30.tar.zst` on the
+  [v2026.09.30 release](https://github.com/gurenjs/agents-on-guren/releases/tag/v2026.09.30);
+  unpack into the repo root.
 
 ## Layout
 
