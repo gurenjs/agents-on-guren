@@ -10,14 +10,10 @@ Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 - convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020);
 - every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
 
-[Guren](https://guren.dev) is our Laravel-style full-stack TypeScript framework on Bun (Hono, Drizzle, Inertia.js and React). It ships an agent harness (`guren agent:init` installs guidance, hooks and skills) and commands an agent can check its work with (`guren check`, `guren audit`).
-
-This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
+[Guren](https://guren.dev) is our full-stack framework for Bun. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report), from August, introduced it, its agent harness (the guidance, hooks and skills `guren agent:init` installs) and the method. This one covers what changed since and two new sets of results:
 
 - Part A (21 cells): one feature built on Guren and on plain Hono.
 - Part B (225 cells): nine product tickets on a Guren blog, four models, with and without the harness, plus a small experiment with approved implementation plans.
-
-The runner is headless Claude Code; Rails used its own runners, so the two sets of numbers are not on one scale.
 
 ## Summary
 
@@ -96,9 +92,8 @@ Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either wa
 | posts-agent-tool | search and create posts as agent tools over MCP, with correct read-only hints | 11 |
 | cover-attachment | a cover image: PNG or JPEG up to 2 MB, replace, remove, deleted with the post | 9 |
 
-- Pass: the ticket's hidden tests (84 in all) and typecheck. They check behaviour over HTTP, Inertia props and database rows, plus some wiring (the module's location, `guren check` exits 0). An unauthorized delete that succeeds fails the cell. The agent's own tests are reported but not gated.
-- Idiom: a separate column scans passing patches for framework API versus hand-rolled code. It never affects the verdict.
-- Authoring: statements pin table names, routes, status codes and prop keys so the tests are stable. Opus 5.5 subagents wrote the tickets from our briefs. Each was admitted only if its hidden tests failed on the baseline, passed on the reference, and failed on three broken references.
+- Pass rule and authoring are as in round 1 (84 hidden tests across the nine tickets). New this round: an unauthorized delete that succeeds fails the cell, and a ticket was admitted only if its hidden tests also fail on three broken references.
+- Statements pin table names, routes, status codes and prop keys so the tests are stable.
 - Matrix: 9 tickets × {Sonnet 5.5, Opus 5.5, Haiku 4.5, Fable 5.1} × {bare, shipped} × 3 trials, plus a Sonnet plan condition on three tickets. 225 cells on 2026-09-29 and 30, 200-turn cap (never reached), 16.3 hours, $477.84 API-equivalent ($0 cash on a Max subscription).
 
 | model | pass, bare | pass, shipped | median turns | median cost | Δ median cost | Δ mean cost |
