@@ -8,7 +8,9 @@ published: false
 
 ## はじめに
 
-2026年9月9日、Rails Foundationが「Agents on Rails Stage 2」を公開しました。対象はFizzyで、BasecampやHEYを作っている37signalsの、課題やアイデアをカードで管理するカンバン型ツールです。Railsで書かれていてソースも公開されており、このアプリに対する20本の機能チケットを各3回ずつモデルに解かせています。
+2026年9月9日、Rails Foundationが「Agents on Rails Stage 2」を公開しました。対象はFizzyで、BasecampやHEYを作っている37signalsの、課題やアイデアをカードで管理するカンバン型ツールです。Railsで書かれていてソースも公開されています。
+
+このFizzyに対する20本の機能チケットを、各3回ずつモデルに解かせた結果です。
 
 https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2
 
@@ -18,7 +20,13 @@ https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2
 
 https://youtu.be/V9SxpJpHuus
 
-GurenはRailsの規約を借りたフレームワークです。計測に使ったアプリはv2系で、v2は2026年8月1日に出ており、今回のどのモデルが公表している信頼できる知識のカットオフよりも後です。モデルが学習で覚えている見込みの薄いAPIなので、「規約はトークン効率か」も、Stage 2相当のチケットも、Guren上で実測できます。この記事は8月に公開した第1弾の続きで、2部構成です。
+Gurenは筆者が開発しているTypeScriptのフルスタックフレームワークで、Laravel風の構成をBunの上で動かします。HTTPはHono、DBはDrizzle、画面はInertia.jsとReactで、ルート、コントローラー、モデル、マイグレーションはLaravelやRailsの経験者が期待する場所にあります。
+
+エージェント向けには、ガイダンスファイル・フック・スキルをアプリに入れる`guren agent:init`と、作業結果を確かめる`guren check`・`guren audit`などのコマンドを用意しています。最初のリリースは2025年11月で、まだ1年たっていません。
+
+計測に使ったアプリはv2系です。v2は2026年8月1日に出ていて、今回のどのモデルが公表している信頼できる知識のカットオフよりも後です。モデルが学習で覚えている見込みの薄いAPIなので、「規約はトークン効率か」も、Stage 2相当のチケットも、Guren上で実測できます。
+
+この記事は8月に公開した第1弾の続きで、2部構成です。
 
 https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 

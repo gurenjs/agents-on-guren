@@ -6,7 +6,9 @@ On 9 September the Rails Foundation published [Agents on Rails Stage 2](https://
 
 On 23 September, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH said 37signals has [stopped writing code by hand](https://youtu.be/V9SxpJpHuus?t=3240) and fixes the factory when an agent fails, that convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020), and that every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
 
-Guren borrows Rails' conventions, and the apps under test run its v2 line, released on 1 August 2026, after the reliable knowledge cutoff every model here publishes. So both the token claim and a Stage 2 style corpus can be measured on an API the models are unlikely to know from training. This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
+[Guren](https://guren.dev) is a Laravel-style full-stack TypeScript framework on Bun: Hono for HTTP, Drizzle for the database, Inertia.js and React for pages, with routes, controllers, models and migrations where a Laravel or Rails developer expects them. It also ships an agent harness (`guren agent:init` installs guidance files, hooks and skills into an app) and commands an agent can check its work with (`guren check`, `guren audit`). It is ours and under a year old (first release November 2025).
+
+The apps under test run its v2 line, released on 1 August 2026, after the reliable knowledge cutoff every model here publishes. So both the token claim and a Stage 2 style corpus can be measured on an API the models are unlikely to know from training. This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
 
 - Part A: one feature, one spec, one model, built on Guren and on plain Hono. 24 cells.
 - Part B: nine product tickets on a Guren blog, four models, with and without the agent harness `guren agent:init` installs, plus a small experiment with approved implementation plans. 225 cells.
