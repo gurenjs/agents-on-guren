@@ -24,7 +24,7 @@ https://youtu.be/V9SxpJpHuus
 - 設定より規約は、トークン効率につながる
 - アプリには、利用者のエージェントが操作できるCLIを付けるべき
 
-Gurenは筆者が開発しているTypeScriptのフルスタックフレームワークで、Laravel風の構成をBun上で動かします(Hono、Drizzle、Inertia.jsとReact)。最初のリリースは2025年11月です。
+Gurenは筆者が開発しているTypeScriptのフルスタックフレームワークで、Laravel風の構成をBun上で動かします(Hono、Drizzle、Inertia.jsとReact)。
 
 エージェント向けに、ガイダンス・フック・スキルを入れる`guren agent:init`と、作業を確かめる`guren check`・`guren audit`があります。計測に使ったアプリはv2系で、v2は2026年8月1日に出ており、今回のどのモデルが公表している信頼できる知識のカットオフよりも後です。
 

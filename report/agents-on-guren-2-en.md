@@ -10,7 +10,7 @@ Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 - convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020);
 - every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
 
-[Guren](https://guren.dev) is our Laravel-style full-stack TypeScript framework on Bun (Hono, Drizzle, Inertia.js and React), first released in November 2025. It ships an agent harness (`guren agent:init` installs guidance, hooks and skills) and commands an agent can check its work with (`guren check`, `guren audit`). The apps under test run Guren v2, released on 1 August 2026, after every model's published reliable knowledge cutoff.
+[Guren](https://guren.dev) is our Laravel-style full-stack TypeScript framework on Bun (Hono, Drizzle, Inertia.js and React). It ships an agent harness (`guren agent:init` installs guidance, hooks and skills) and commands an agent can check its work with (`guren check`, `guren audit`). The apps under test run Guren v2, released on 1 August 2026, after every model's published reliable knowledge cutoff.
 
 This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
 
