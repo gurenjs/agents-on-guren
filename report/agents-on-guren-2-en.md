@@ -23,7 +23,7 @@ This round:
 
 - The runner is isolated: none of the operator's settings, MCP servers or auto memory are loaded.
 - The Guren app is on the releases current at the time, with a regenerated harness.
-- Controls under the same runner: Hono, and the Guren app as the summer rounds left it.
+- Controls under the same runner: Hono, and the Guren app as of July (cli 2.0), to tell whether any cost change since July comes from Guren's releases.
 - All 21 cells passed.
 
 | arm | model | turns (range) | cost (range) | cost vs Hono |
@@ -31,7 +31,7 @@ This round:
 | Hono | Sonnet 5.5 | 40 (29–42) | $0.41 ($0.38–0.46) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Sonnet 5.5 | 38 (30–41) | $0.57 ($0.56–0.61) | 1.40× |
 | Guren, no harness | Sonnet 5.5 | 51 (47–52) | $0.63 ($0.58–0.69) | 1.54× |
-| Guren, summer app | Sonnet 5.5 | 33 (32–37) | $0.57 ($0.49–0.64) | 1.38× |
+| Guren, July app (cli 2.0) | Sonnet 5.5 | 33 (32–37) | $0.57 ($0.49–0.64) | 1.38× |
 | Guren, shipped harness (cli 2.28) | Sonnet 5.5 | 38 (37–43) | $0.52 ($0.50–0.63) | 1.26× |
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
@@ -45,8 +45,8 @@ What the table says:
 
 - Guren costs more than Hono in about the same number of turns (38 against 40 on Sonnet, 40 each on Opus). For Sonnet the difference is context carried per turn (below); the Opus cells were not broken down.
 - Against no harness, the shipped harness saves 25% of turns and 8–9% of cost, with overlapping ranges.
-- The current app is no cheaper than the summer app (38 turns / $0.57 against 33 / $0.57), so this round claims no improvement over time.
-- Every arm, Hono included, fell from July's dollars ($3.35 Guren, $2.03 Hono) to under a dollar when Sonnet 5 ran on the isolated runner. The summer app fell too, so Guren's releases are not the cause. The runner's isolation is the likely one, but nothing here proves it.
+- The current app is no cheaper than the July app (38 turns / $0.57 against 33 / $0.57), so this round claims no improvement over time.
+- Every arm, Hono included, fell from July's dollars ($3.35 Guren, $2.03 Hono) to under a dollar when Sonnet 5 ran on the isolated runner. The July app fell too, so Guren's releases are not the cause. The runner's isolation is the likely one, but nothing here proves it.
 
 ### Where the gap goes
 
