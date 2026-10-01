@@ -1,6 +1,6 @@
 # Agents on Guren, round 2: what 249 runs say about "convention as token efficiency"
 
-*guren.dev, 2026-09-25.*
+*guren.dev, 2026-10-01.*
 
 On 9 September the Rails Foundation published [Agents on Rails Stage 2](https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2): 20 feature tickets on Fizzy, 37signals' kanban app, three attempts per ticket. The best model passed 35% (GPT-6 Astra). Fable 5.1 passed 32% at $9.14 per run and Opus 5 passed 25% at $9.85. Stage 1 had stopped telling models apart; in Rails' words, "the tasks were deliberately small, and more than half the time the models reinvented the wheel instead of reaching for the framework".
 
