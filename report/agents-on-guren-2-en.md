@@ -21,9 +21,9 @@ The task, from [framework-comparison](https://github.com/gurenjs/framework-compa
 
 This round:
 
-- The runner is isolated: `--strict-mcp-config`, project and local settings only, no web tools, auto memory off.
+- The runner is isolated: none of the operator's settings, MCP servers or auto memory are loaded.
 - The Guren app is on the releases current at the time, with a regenerated harness.
-- Controls under the same runner: Hono, and the Guren app as the summer rounds left it (commit 716117a, cli 2.0).
+- Controls under the same runner: Hono, and the Guren app as the summer rounds left it.
 - All 21 cells passed.
 
 | arm | model | turns (range) | cost (range) | cost vs Hono |
@@ -31,7 +31,7 @@ This round:
 | Hono | Sonnet 5.5 | 40 (29–42) | $0.41 ($0.38–0.46) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Sonnet 5.5 | 38 (30–41) | $0.57 ($0.56–0.61) | 1.40× |
 | Guren, no harness | Sonnet 5.5 | 51 (47–52) | $0.63 ($0.58–0.69) | 1.54× |
-| Guren, summer app (716117a) | Sonnet 5.5 | 33 (32–37) | $0.57 ($0.49–0.64) | 1.38× |
+| Guren, summer app | Sonnet 5.5 | 33 (32–37) | $0.57 ($0.49–0.64) | 1.38× |
 | Guren, shipped harness (cli 2.28) | Sonnet 5.5 | 38 (37–43) | $0.52 ($0.50–0.63) | 1.26× |
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
@@ -39,7 +39,7 @@ This round:
 Medians of three runs; a range is the lowest and highest run, not an interval. Cost is API-equivalent, as the CLI reports it.
 
 - cli 2.28: the next release of the harness, with a fix to how rules load, API token and rate limit sections in the digest, and a plan-writing skill. 1.26× at the median, 1.32× at the mean.
-- Sonnet 5 → 5.5: the Sonnet rows were first run on Sonnet 5, then again when Sonnet 5.5 came out. Ratios moved little (shipped 1.44 → 1.40, no harness 1.68 → 1.54, cli 2.28 1.28 → 1.26). Sonnet 5 is round 7 of [framework-comparison](https://github.com/gurenjs/framework-comparison/blob/main/agent-eval/PILOT.md), Sonnet 5.5 round 8.
+- Sonnet 5 → 5.5: the Sonnet rows were first run on Sonnet 5, then again when Sonnet 5.5 came out. Ratios moved little (shipped 1.44 → 1.40, no harness 1.68 → 1.54, cli 2.28 1.28 → 1.26).
 
 What the table says:
 
@@ -65,7 +65,7 @@ Each tool action in the Sonnet 5.5 cells was classified by heuristic and charged
 The rest of each gap is rule text attached mid-session, assistant text and rounding.
 
 - Shipped: the whole gap is guidance paid up front, 25.5k tokens re-read on 15–18 calls ($0.17–0.19 per cell). The agent reads nothing from `node_modules`, and its implementation costs slightly less than Hono's.
-- No harness: two of three cells hunt for `paginate()`'s options in `@guren/core/dist`, find a re-export, and reach `@guren/server`'s `Paginator.d.ts` four or five actions later. No cell with a harness does (a lower bound: a search hidden in other output goes undetected).
+- No harness: two of three cells hunt for `paginate()` across `@guren/core` and `@guren/server`. No cell with a harness does.
 - cli 2.28: starts from 7.1k tokens and has the smallest gap.
 
 ## Part B: nine product tickets
@@ -86,7 +86,7 @@ Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either wa
 
 - Pass rule and authoring are as in round 1 (84 hidden tests across the nine tickets). New this round: an unauthorized delete that succeeds fails the cell, and a ticket was admitted only if its hidden tests also fail on three broken references.
 - Statements pin table names, routes, status codes and prop keys so the tests are stable.
-- Matrix: 9 tickets × {Sonnet 5.5, Opus 5.5, Haiku 4.5, Fable 5.1} × {bare, shipped} × 3 trials, plus a Sonnet plan condition on three tickets. 225 cells on 2026-09-29 and 30, 200-turn cap (never reached), 16.3 hours, $477.84 API-equivalent ($0 cash on a Max subscription).
+- Matrix: 9 tickets × {Sonnet 5.5, Opus 5.5, Haiku 4.5, Fable 5.1} × {bare, shipped} × 3 trials, plus a Sonnet plan condition on three tickets: 225 cells, $477.84 API-equivalent ($0 cash on a Max subscription).
 
 | model | pass, bare | pass, shipped | median turns | median cost | Δ median cost | Δ mean cost |
 |---|---|---|---|---|---|---|
@@ -153,21 +153,21 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
 
 - RFC 0024 stays parked. Its case was name confusion between `@guren/core` and `@guren/server`, which shows up only without the harness. The remaining cost is guidance loaded at session start, so the levers are the digest and how much guidance loads up front.
 - 22 findings about Guren, most found while writing the tickets. The main ones:
-  - Harness: the digest lacked API tokens, bearer auth and rate limits (#1074); `guren context` never mentions modules or `guren.arch.ts`; scaffolded hooks used relative paths and failed with "Module not found" after an agent ran `cd` (22 times in five shipped cells; #1085).
-  - CLI checks: `guren audit` missed a mutating action that skips a model's policy (#1054); `check --arch` let a directory import through (#1071); `introspect` child processes outlived a crashed parent (#1084).
-  - ORM and API: `where('publishedAt', 'is null')` compared against the string `'is null'` (#1080); `DatabaseApiTokenStore` wrote a `Date` into SQLite text timestamps (#1065); `data.gen.ts` could declare an identifier twice (#1064); an unauthenticated agent-tool call returned a 302 that dispatch treated as success (#1073); `belongsToMany` has no `attach`/`sync`; `@guren/plugin-mcp` answers 500 until a token table exists; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
-  - Plans: no plan element for a console command or a query scope, and the Stop hook gap above.
-- The numbered ones are fixed in v2.27.0; the rest are not yet ticketed.
+  - Harness: the digest said nothing about API tokens or rate limits; hooks failed after an agent ran `cd`.
+  - CLI checks: `guren audit` missed a missing authorization on models with a policy.
+  - ORM and API: `where('publishedAt', 'is null')` compared against a string; an unauthenticated agent-tool call counted as success.
+  - Plans: no element for a console command and the like, and the Stop hook gap above.
+- Ten of them are fixed and released in v2.27.0.
 
 ## Caveats
 
 - One runner: headless Claude Code with project settings only. Rails' numbers are on another scale.
 - Re-run: the first production run had auto memory on, and later cells read notes earlier cells wrote. Opus 5.5, Haiku 4.5 and Fable 5.1 were run again with it off; the earlier run stays in the repository's history.
-- Sonnet 5.5 for Sonnet 5: Sonnet 5.5 came out after that run and replaced Sonnet 5 in both parts. It costs the same per token. The corpus was calibrated on Sonnet 5 and frozen by design criteria, not by pass rate.
+- Sonnet 5.5 for Sonnet 5: Sonnet 5.5 came out after that run and replaced Sonnet 5 in both parts. It costs the same per token.
 - Training data: Sonnet 5.5, Opus 5.5 and Fable 5.1 may have seen Guren from before the v2 used here.
 - N=3: 27 runs per model and condition in Part B (9 for plans), three per arm in Part A. Ranges overlap; directions fit the proposed mechanisms but do not establish an effect.
 - Self-authored tickets that pin their contract, which makes them easier than open tickets.
-- Runner changes from calibration (Sonnet 5, N=1, 21 cells, 20 passes), applied to every condition: the plan line ends in "Implement the plan."; `git` is allowed and patches are diffed from the start commit (no plan cell committed, so this changed nothing here); the preamble asks for Write/Edit over heredocs and `cd` chains, with `env` and `python3` allowed. Part A predates the last change, which costs its arms $0.05–0.14 per cell each, so absolute costs do not carry from Part A to Part B.
+- Part A and Part B differ in small runner settings, so their absolute costs are not comparable.
 - Hooks fired: unlike round 1, the session-start, after-edit and Stop hooks ran in every shipped cell. The Stop hook (`guren gate`) blocked three Sonnet stops and one Haiku stop.
 - Opus 5.5 is not Opus 5, which round 1 and Rails' Stage 2 used.
 - Fable 5.1 costs $5.42–6.27 per cell, about 4.2× Opus 5.5. In the set-aside run it cost $3.51–4.01 at the same per-token price; Opus barely moved and Haiku passed more (41%, 56%). Why Fable did more work this time is not established.
