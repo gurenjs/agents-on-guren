@@ -10,7 +10,7 @@ Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 - convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020);
 - every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
 
-[Guren](https://guren.dev) is our Laravel-style full-stack TypeScript framework on Bun (Hono, Drizzle, Inertia.js and React). It ships an agent harness (`guren agent:init` installs guidance, hooks and skills) and commands an agent can check its work with (`guren check`, `guren audit`). The apps under test run Guren v2, released on 1 August 2026, after every model's published reliable knowledge cutoff.
+[Guren](https://guren.dev) is our Laravel-style full-stack TypeScript framework on Bun (Hono, Drizzle, Inertia.js and React). It ships an agent harness (`guren agent:init` installs guidance, hooks and skills) and commands an agent can check its work with (`guren check`, `guren audit`).
 
 This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
 
@@ -33,8 +33,8 @@ The task, from [framework-comparison](https://github.com/gurenjs/framework-compa
 
 This round:
 
-- The runner is isolated: `--strict-mcp-config`, project and local settings only, no web tools, auto memory off. Each cell records CLI version (Claude Code 2.1.284 for Sonnet 5.5, 2.1.281 for Opus 5.5), model and app commit.
-- The Guren app is on the releases current at the time (cli 2.27.0, core 1.21.0, server 2.26.0, orm 2.12.0) with a regenerated harness.
+- The runner is isolated: `--strict-mcp-config`, project and local settings only, no web tools, auto memory off.
+- The Guren app is on the releases current at the time, with a regenerated harness.
 - Controls under the same runner: Hono, and the Guren app as the summer rounds left it (commit 716117a, cli 2.0).
 - All 24 cells passed.
 
@@ -86,7 +86,7 @@ The rest of each gap is rule text attached mid-session, assistant text and round
 
 ## Part B: nine product tickets
 
-Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either way). Stage 2 makes the tasks bigger, as Rails did: each ticket reads like a product owner's request (what and why, never which API) and touches at least three subsystems of a fresh `create-guren-app@1.17.2` blog.
+Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either way). Stage 2 makes the tasks bigger, as Rails did: each ticket reads like a product owner's request (what and why, never which API) and touches at least three subsystems of a fresh `create-guren-app` blog.
 
 | ticket | what it asks for | hidden tests |
 |---|---|---|
@@ -174,14 +174,14 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
   - CLI checks: `guren audit` missed a mutating action that skips a model's policy (#1054); `check --arch` let a directory import through (#1071); `introspect` child processes outlived a crashed parent (#1084).
   - ORM and API: `where('publishedAt', 'is null')` compared against the string `'is null'` (#1080); `DatabaseApiTokenStore` wrote a `Date` into SQLite text timestamps (#1065); `data.gen.ts` could declare an identifier twice (#1064); an unauthenticated agent-tool call returned a 302 that dispatch treated as success (#1073); `belongsToMany` has no `attach`/`sync`; `@guren/plugin-mcp` answers 500 until a token table exists; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
   - Plans: no plan element for a console command or a query scope, and the Stop hook gap above.
-- The ten numbered ones are fixed in v2.27.0 (cli 2.28.0, server 2.27.0, core 1.22.0, orm 2.13.0); the rest are not yet ticketed.
+- The ten numbered ones are fixed in v2.27.0; the rest are not yet ticketed.
 
 ## Caveats
 
 - One runner: headless Claude Code with project settings only. Rails' numbers are on another scale.
 - Re-run: the first production run had auto memory on, and later cells read notes earlier cells wrote. Opus 5.5, Haiku 4.5 and Fable 5.1 were run again with it off; the earlier run stays in the repository's history.
 - Sonnet 5.5 for Sonnet 5: Sonnet 5.5 came out after that run and replaced Sonnet 5 in both parts. It costs the same per token. The corpus was calibrated on Sonnet 5 and frozen by design criteria, not by pass rate.
-- Training data: Sonnet 5.5, Opus 5.5 and Fable 5.1 list a reliable knowledge cutoff of June 2026 (Haiku 4.5: February 2025), so three models may have seen pre-v2 Guren. Training data cutoffs are not published and can be later; Fable 5.1 was released in September 2026.
+- Training data: Sonnet 5.5, Opus 5.5 and Fable 5.1 may have seen Guren from before the v2 used here.
 - N=3: 27 runs per model and condition in Part B (9 for plans), three per arm in Part A. Ranges overlap; directions fit the proposed mechanisms but do not establish an effect.
 - Self-authored tickets that pin their contract, which makes them easier than open tickets.
 - Runner changes from calibration (Sonnet 5, N=1, 21 cells, 20 passes), applied to every condition: the plan line ends in "Implement the plan."; `git` is allowed and patches are diffed from the start commit (no plan cell committed, so this changed nothing here); the preamble asks for Write/Edit over heredocs and `cd` chains, with `env` and `python3` allowed. Part A predates the last change, which costs its arms $0.05–0.14 per cell each, so absolute costs do not carry from Part A to Part B.
