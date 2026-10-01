@@ -59,7 +59,7 @@ Each tool action in the Sonnet 5.5 cells was classified by heuristic and charged
 | arm | gap to Hono (mean) | name confusion | API learning | implementation |
 |---|---|---|---|---|
 | Guren shipped | $0.167 | 0% | 107% | −8% |
-| Guren bare | $0.220 | 6% (10% if removed) | 44% | 42% |
+| Guren bare | $0.220 | 6% | 44% | 42% |
 | Guren shipped (cli 2.28) | $0.135 | 0% | 55% | 21% |
 
 The rest of each gap is rule text attached mid-session, assistant text and rounding.
@@ -111,7 +111,7 @@ Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either wa
 | posts-agent-tool | 3/3 | 3/3 | 3/3 · 3/3 | 0/3 | 0/3 | 3/3 · 3/3 |
 | cover-attachment | 3/3 | 3/3 | 3/3 · 3/3 | 0/3 | 0/3 | 3/3 · 3/3 |
 
-- Sonnet's one failure is a mass-assignment defect: `update({ id }, { confirmedAt })` on a model whose `fillable` excludes `confirmedAt`, so the confirmation link answers 500. The agent's own tests passed; the hidden tests caught it. The shipped guidance covers `fillable` in three places, but one failure in three is no evidence the harness prevents it.
+- Sonnet's one failure is a mass-assignment defect: `update({ id }, { confirmedAt })` on a model whose `fillable` excludes `confirmedAt`, so the confirmation link answers 500. The agent's own tests passed, but the hidden grading tests failed. The shipped guidance covers `fillable` in three places, but one failure in three is no evidence the harness prevents it.
 - Haiku fails locale-switch, newsletter-module, posts-agent-tool and cover-attachment in every cell.
 - posts-agent-tool, the closest ticket to DHH's CLI claim (two routes exposed as agent tools over MCP): Sonnet, Opus and Fable pass every cell, Haiku none.
 - Saturation: as in Rails' Stage 1, the top models pass everything (Opus and Fable 100%, Sonnet 96–100%). Here the harness shows up in effort, not pass rate. Rails' 35% is not comparable: another runner, a larger app, and our tickets pin their contract.
