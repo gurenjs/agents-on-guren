@@ -1,4 +1,4 @@
-# Agents on Guren, round 2: what 249 runs say about "convention as token efficiency"
+# Agents on Guren, round 2: what 246 runs say about "convention as token efficiency"
 
 *guren.dev, 2026-10-01.*
 
@@ -14,7 +14,7 @@ Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 
 This follows [the first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) from August, in two parts:
 
-- Part A (24 cells): one feature built on Guren and on plain Hono.
+- Part A (21 cells): one feature built on Guren and on plain Hono.
 - Part B (225 cells): nine product tickets on a Guren blog, four models, with and without the harness, plus a small experiment with approved implementation plans.
 
 The runner is headless Claude Code; Rails used its own runners, so the two sets of numbers are not on one scale.
@@ -36,7 +36,7 @@ This round:
 - The runner is isolated: `--strict-mcp-config`, project and local settings only, no web tools, auto memory off.
 - The Guren app is on the releases current at the time, with a regenerated harness.
 - Controls under the same runner: Hono, and the Guren app as the summer rounds left it (commit 716117a, cli 2.0).
-- All 24 cells passed.
+- All 21 cells passed.
 
 | arm | model | turns (range) | cost (range) | cost vs Hono |
 |---|---|---|---|---|
@@ -44,16 +44,14 @@ This round:
 | Guren, shipped harness (cli 2.27) | Sonnet 5.5 | 38 (30–41) | $0.57 ($0.56–0.61) | 1.40× |
 | Guren, no harness | Sonnet 5.5 | 51 (47–52) | $0.63 ($0.58–0.69) | 1.54× |
 | Guren, summer app (716117a) | Sonnet 5.5 | 33 (32–37) | $0.57 ($0.49–0.64) | 1.38× |
-| Guren, shipped, rule frontmatter fixed | Sonnet 5.5 | 33 (29–41) | $0.57 ($0.47–0.70) | 1.39× |
 | Guren, shipped harness (cli 2.28) | Sonnet 5.5 | 38 (37–43) | $0.52 ($0.50–0.63) | 1.26× |
 | Hono | Opus 5.5 | 40 (38–41) | $0.88 ($0.83–0.91) | 1.00× |
 | Guren, shipped harness (cli 2.27) | Opus 5.5 | 40 (38–45) | $1.32 ($1.31–1.55) | 1.49× |
 
 Medians of three runs; a range is the lowest and highest run, not an interval. Cost is API-equivalent, as the CLI reports it.
 
-- Frontmatter fixed: the harness's rule files used `globs:`, a key Claude Code ignores, so every rule loaded at session start. This arm uses `paths:` instead ([#1056](https://github.com/gurenjs/guren/pull/1056)).
-- cli 2.28: the released harness with that fix plus other changes (API token and rate limit sections in the digest, a plan-writing skill). 1.26× at the median, 1.32× at the mean.
-- Sonnet 5 → 5.5: the Sonnet rows were first run on Sonnet 5, then again when Sonnet 5.5 came out. Ratios moved little (shipped 1.44 → 1.40, no harness 1.68 → 1.54, cli 2.28 1.28 → 1.26). The exception is the frontmatter fix: the cheapest Guren arm on Sonnet 5 (1.27×), level with the unfixed harness on Sonnet 5.5. Sonnet 5 is round 7 of [framework-comparison](https://github.com/gurenjs/framework-comparison/blob/main/agent-eval/PILOT.md), Sonnet 5.5 round 8.
+- cli 2.28: the next release of the harness, with a fix to how rules load, API token and rate limit sections in the digest, and a plan-writing skill. 1.26× at the median, 1.32× at the mean.
+- Sonnet 5 → 5.5: the Sonnet rows were first run on Sonnet 5, then again when Sonnet 5.5 came out. Ratios moved little (shipped 1.44 → 1.40, no harness 1.68 → 1.54, cli 2.28 1.28 → 1.26). Sonnet 5 is round 7 of [framework-comparison](https://github.com/gurenjs/framework-comparison/blob/main/agent-eval/PILOT.md), Sonnet 5.5 round 8.
 
 What the table says:
 
@@ -64,7 +62,7 @@ What the table says:
 
 ### Where the gap goes
 
-Each tool action in the 18 Sonnet 5.5 cells was classified by heuristic and charged the tokens it cost (its output, its result re-read on later calls, and a share of the shared prefix). The buckets add up to each cell's cost within a cent. It is an attribution model, not a direct measurement.
+Each tool action in the Sonnet 5.5 cells was classified by heuristic and charged the tokens it cost (its output, its result re-read on later calls, and a share of the shared prefix). The buckets add up to each cell's cost within a cent. It is an attribution model, not a direct measurement.
 
 - Name confusion: looking for which of `@guren/core` and `@guren/server` holds a symbol, the part RFC 0024 would remove.
 - API learning: reading `node_modules/@guren/*`, guidance or generated types, plus guidance loaded at session start.
@@ -74,14 +72,12 @@ Each tool action in the 18 Sonnet 5.5 cells was classified by heuristic and char
 |---|---|---|---|---|
 | Guren shipped | $0.167 | 0% | 107% | −8% |
 | Guren bare | $0.220 | 6% (10% if removed) | 44% | 42% |
-| Guren shipped, frontmatter fixed | $0.164 | 0% | 53% | 32% |
 | Guren shipped (cli 2.28) | $0.135 | 0% | 55% | 21% |
 
 The rest of each gap is rule text attached mid-session, assistant text and rounding.
 
 - Shipped: the whole gap is guidance paid up front, 25.5k tokens re-read on 15–18 calls ($0.17–0.19 per cell). The agent reads nothing from `node_modules`, and its implementation costs slightly less than Hono's.
 - No harness: two of three cells hunt for `paginate()`'s options in `@guren/core/dist`, find a re-export, and reach `@guren/server`'s `Paginator.d.ts` four or five actions later. No cell with a harness does (a lower bound: a search hidden in other output goes undetected).
-- Frontmatter fixed: guidance at start falls to 9.2k tokens, $0.11 less per cell, but the $0.11 went elsewhere: about $0.04 to refused commands (5–7 per cell against 4–5), and $0.02 each to rules attached later, implementation and on-demand guidance reads. A path-scoped rule loads when a matching file is touched, so part of the guidance moved later instead of going away.
 - cli 2.28: starts from 7.1k tokens and has the smallest gap.
 
 ## Part B: nine product tickets
@@ -170,11 +166,11 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
 
 - RFC 0024 stays parked. Its case was name confusion between `@guren/core` and `@guren/server`, which shows up only without the harness. The remaining cost is guidance loaded at session start, so the levers are the digest and how much guidance loads up front.
 - 22 findings about Guren, most found while writing the tickets. The main ones:
-  - Harness: rule files used `globs:` instead of `paths:`, so all six loaded every session (#1056); the digest lacked API tokens, bearer auth and rate limits (#1074); `guren context` never mentions modules or `guren.arch.ts`; scaffolded hooks used relative paths and failed with "Module not found" after an agent ran `cd` (22 times in five shipped cells; #1085).
+  - Harness: the digest lacked API tokens, bearer auth and rate limits (#1074); `guren context` never mentions modules or `guren.arch.ts`; scaffolded hooks used relative paths and failed with "Module not found" after an agent ran `cd` (22 times in five shipped cells; #1085).
   - CLI checks: `guren audit` missed a mutating action that skips a model's policy (#1054); `check --arch` let a directory import through (#1071); `introspect` child processes outlived a crashed parent (#1084).
   - ORM and API: `where('publishedAt', 'is null')` compared against the string `'is null'` (#1080); `DatabaseApiTokenStore` wrote a `Date` into SQLite text timestamps (#1065); `data.gen.ts` could declare an identifier twice (#1064); an unauthenticated agent-tool call returned a 302 that dispatch treated as success (#1073); `belongsToMany` has no `attach`/`sync`; `@guren/plugin-mcp` answers 500 until a token table exists; attachments lack a MIME allowlist and per-collection size limits; codegen types `z.file()` as `unknown`; the test client has no cookie jar or `arrayBuffer()`.
   - Plans: no plan element for a console command or a query scope, and the Stop hook gap above.
-- The ten numbered ones are fixed in v2.27.0; the rest are not yet ticketed.
+- The numbered ones are fixed in v2.27.0; the rest are not yet ticketed.
 
 ## Caveats
 
