@@ -15,14 +15,6 @@ Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH
 - Part A (21 cells): one feature built on Guren and on plain Hono.
 - Part B (225 cells): nine product tickets on a Guren blog, four models, with and without the harness, plus a small experiment with approved implementation plans.
 
-## Summary
-
-- Guren costs 1.40× plain Hono on Sonnet 5.5 and 1.49× on Opus 5.5 for the same feature, in about the same number of turns. The released cli 2.28 harness brings it to 1.26×.
-- That gap is guidance loaded at session start. Searching for which package exports a symbol, the case for merging `@guren/core` and `@guren/server` (RFC 0024), shows up only without the harness.
-- On the nine tickets, the harness cuts turns by 11–27% for every model. Opus 5.5 and Fable 5.1 pass every cell either way, so pass rate no longer separates the top models here.
-- Given an approved plan, no agent ran the step-verify-commit loop it was designed around.
-- The round turned up 22 findings about Guren; ten are fixed and released.
-
 ## Part A: the same feature on Guren and on plain Hono
 
 The task, from [framework-comparison](https://github.com/gurenjs/framework-comparison): add tags to a small blog (schema, forms, display, a `?tag=` filter, validation, tests). A cell passes typecheck, the app's tests and a hidden HTTP smoke of the filter. In July, with Sonnet 5 on a non-isolated runner, Guren cost 1.65× Hono.
@@ -180,5 +172,13 @@ Guren's implementation plans (RFC 0030) are a factory in DHH's sense: a human ap
 - Opus 5.5 is not Opus 5, which round 1 and Rails' Stage 2 used.
 - Fable 5.1 costs $5.42–6.27 per cell, about 4.2× Opus 5.5. In the set-aside run it cost $3.51–4.01 at the same per-token price; Opus barely moved and Haiku passed more (41%, 56%). Why Fable did more work this time is not established.
 - Saturation: on these tickets the top models pass everything; telling them apart needs harder tickets.
+
+## Summary
+
+- Guren costs 1.40× plain Hono on Sonnet 5.5 and 1.49× on Opus 5.5 for the same feature, in about the same number of turns. The released cli 2.28 harness brings it to 1.26×.
+- That gap is guidance loaded at session start. Searching for which package exports a symbol, the case for merging `@guren/core` and `@guren/server` (RFC 0024), shows up only without the harness.
+- On the nine tickets, the harness cuts turns by 11–27% for every model. Opus 5.5 and Fable 5.1 pass every cell either way, so pass rate no longer separates the top models here.
+- Given an approved plan, no agent ran the step-verify-commit loop it was designed around.
+- The round turned up 22 findings about Guren; ten are fixed and released.
 
 Everything is public: the Stage 2 corpus (statements, hidden tests, reference solutions, plans), the harness, and per-cell patches and verdicts are in [agents-on-guren](https://github.com/gurenjs/agents-on-guren), with the event streams on its [v2026.09.30 release](https://github.com/gurenjs/agents-on-guren/releases/tag/v2026.09.30). Part A's runner, logs and token accounting are in [framework-comparison](https://github.com/gurenjs/framework-comparison) under `agent-eval/`, with streams on [its release](https://github.com/gurenjs/framework-comparison/releases/tag/v2026.09.30).
