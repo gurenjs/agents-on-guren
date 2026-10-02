@@ -57,14 +57,15 @@ Each tool action in the Sonnet 5.5 cells was classified by heuristic and charged
 - Name confusion: looking for which of `@guren/core` and `@guren/server` holds a symbol, the part merging the two packages would remove.
 - API learning: reading `node_modules/@guren/*`, guidance or generated types, plus guidance loaded at session start.
 - Implementation: the app's own files, edits, codegen, tests, and commands the runner refused.
+- Other: rule text attached mid-session, assistant text and rounding.
 
-| arm | gap to Hono (mean) | name confusion | API learning | implementation |
-|---|---|---|---|---|
-| Guren shipped | $0.167 | 0% | 107% | −8% |
-| Guren bare | $0.220 | 6% | 44% | 42% |
-| Guren shipped (cli 2.28) | $0.135 | 0% | 55% | 21% |
+The table splits how much more Guren cost than Hono per run, on average, by kind of work. A negative value means Guren spent less than Hono on it.
 
-The rest of each gap is rule text attached mid-session, assistant text and rounding.
+| arm | gap to Hono | name confusion | API learning | implementation | other |
+|---|---|---|---|---|---|
+| Guren shipped | $0.167 | $0.000 | $0.179 | −$0.012 | $0.001 |
+| Guren bare | $0.220 | $0.012 | $0.097 | $0.093 | $0.017 |
+| Guren shipped (cli 2.28) | $0.135 | $0.000 | $0.074 | $0.028 | $0.033 |
 
 - Shipped: the whole gap is guidance paid up front, 25.5k tokens re-read on 15–18 calls ($0.17–0.19 per cell). The agent reads nothing from `node_modules`, and its implementation costs slightly less than Hono's.
 - No harness: two of three cells hunt for `paginate()` across `@guren/core` and `@guren/server`. No cell with a harness does.
