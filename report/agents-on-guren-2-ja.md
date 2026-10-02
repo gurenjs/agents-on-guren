@@ -33,7 +33,7 @@ https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 - Part A(21セル): 同じ機能をGurenと素のHonoに実装させた比較
 - Part B(225セル): Gurenのブログに対する9本のプロダクトチケット。4モデル、ハーネスあり・なし、承認済み計画を渡す副実験付き
 
-## 1. Part A: 同じ機能をGurenと素のHonoで
+## 1. Part A: GurenとHonoの実装コスト比較
 
 ### 計測方法
 
