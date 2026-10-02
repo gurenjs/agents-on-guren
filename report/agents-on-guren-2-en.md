@@ -4,11 +4,11 @@
 
 On 9 September the Rails Foundation published [Agents on Rails Stage 2](https://rubyonrails.org/2026/9/9/agents-on-rails-stage-2): 20 feature tickets on [Fizzy](https://github.com/basecamp/fizzy), 37signals' open-source kanban tool for issues and ideas, built in Rails. The best model passed 35% (GPT-6 Astra); Fable 5.1 passed 32% at $9.14 per run, Opus 5 25% at $9.85. Rails moved to feature-size tickets because in Stage 1 "more than half the time the models reinvented the wheel instead of reaching for the framework".
 
-Two weeks later, in his Rails World [keynote](https://youtu.be/V9SxpJpHuus), DHH said:
+Two weeks later, in his Rails World [keynote](https://www.youtube.com/watch?v=vDjW_dRyKXY), DHH said:
 
-- 37signals has [stopped writing code by hand](https://youtu.be/V9SxpJpHuus?t=3240) and fixes the factory when an agent fails;
-- convention over configuration [pays off as token efficiency](https://youtu.be/V9SxpJpHuus?t=4020);
-- every app should ship [a CLI](https://youtu.be/V9SxpJpHuus?t=4740) for its users' own agents.
+- 37signals has [stopped writing code by hand](https://youtu.be/vDjW_dRyKXY?t=1245) and fixes the factory when an agent fails;
+- convention over configuration [pays off as token efficiency](https://youtu.be/vDjW_dRyKXY?t=1984);
+- every app should ship [a CLI](https://youtu.be/vDjW_dRyKXY?t=2723) for its users' own agents.
 
 [Guren](https://guren.dev) is our full-stack framework for Bun. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report), from August, introduced it, its agent harness (the guidance, hooks and skills `guren agent:init` installs) and the method. This one covers what changed since and two new sets of results:
 

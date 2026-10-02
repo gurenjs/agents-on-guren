@@ -18,7 +18,7 @@ Stage 1では、半分以上の解答がフレームワークを使わずに車�
 
 9月23日のRails World基調講演では、DHHが次の3つを話しました。
 
-https://youtu.be/V9SxpJpHuus
+https://www.youtube.com/watch?v=vDjW_dRyKXY
 
 - 37signalsは手でコードを書くのをやめた。エージェントが失敗したら、工場の側を直す
 - 設定より規約は、トークン効率につながる
