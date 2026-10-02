@@ -164,10 +164,18 @@ Guren's implementation plans are a factory in DHH's sense: a human approves a pl
 
 ## Summary
 
-- Guren costs 1.40× plain Hono on Sonnet 5.5 and 1.49× on Opus 5.5 for the same feature, in about the same number of turns. The released cli 2.28 harness brings it to 1.26×.
-- That gap is guidance loaded at session start. Searching for which of `@guren/core` and `@guren/server` exports a symbol shows up only without the harness.
-- On the nine tickets, the harness cuts turns by 11–27% for every model. Opus 5.5 and Fable 5.1 pass every cell either way, so pass rate no longer separates the top models here.
-- Given an approved plan, no agent ran the step-verify-commit loop it was designed around.
+- The top models (Opus 5.5, Fable 5.1, and Sonnet 5.5 with the harness) passed all nine feature tickets, which span authorization, API tokens, localization, modules, MCP tools and file attachments.
+- Almost every passing patch used features Guren already has. Only six wrote the feature by hand.
+- The harness cut Opus's and Fable's turns by 21–27%.
+- The ticket that exposes app routes to agents as MCP tools passed in every run of the top three models.
+- Conventions on top of Hono cost 1.26× plain Hono with the released harness, in the same number of turns. The difference is guidance loaded at session start.
+- Given an approved plan, no agent went step by step. That loop is still to fix.
 - The round turned up 22 findings about Guren; ten are fixed and released.
+
+To try it, scaffold an app with the agent harness included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent:
+
+```bash
+bunx create-guren-app my-app --agents claude
+```
 
 Everything is public: the Stage 2 corpus (statements, hidden tests, reference solutions, plans), the harness, and per-cell patches and verdicts are in [agents-on-guren](https://github.com/gurenjs/agents-on-guren), with the event streams on its [v2026.09.30 release](https://github.com/gurenjs/agents-on-guren/releases/tag/v2026.09.30). Part A's runner, logs and token accounting are in [framework-comparison](https://github.com/gurenjs/framework-comparison) under `agent-eval/`, with streams on [its release](https://github.com/gurenjs/framework-comparison/releases/tag/v2026.09.30).
