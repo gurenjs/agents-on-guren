@@ -89,7 +89,7 @@ Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either wa
 
 - Pass rule and authoring are as in round 1 (84 hidden tests across the nine tickets). New this round: an unauthorized delete that succeeds fails the cell, and a ticket was admitted only if its hidden tests also fail on three broken references.
 - Statements pin table names, routes, status codes and prop keys so the tests are stable.
-- Matrix: 9 tickets × {Sonnet 5.5, Opus 5.5, Haiku 4.5, Fable 5.1} × {bare, shipped} × 3 trials, plus a Sonnet plan condition on three tickets: 225 cells, $477.84 API-equivalent ($0 cash on a Max subscription).
+- Matrix: 9 tickets × {Sonnet 5.5, Opus 5.5, Haiku 4.5, Fable 5.1} × {bare, shipped} × 3 trials, plus a Sonnet plan condition on three tickets: 225 cells, $477.84 API-equivalent.
 
 | model | pass, bare | pass, shipped | median turns | median cost | Δ median cost | Δ mean cost |
 |---|---|---|---|---|---|---|
