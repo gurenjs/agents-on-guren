@@ -152,16 +152,6 @@ Guren's implementation plans are a factory in DHH's sense: a human approves a pl
 - The designed loop (one step, one verification, one commit) ran in no cell. None committed, three never called `plan:next`, and the rest read the plan and implemented it in one pass.
 - The loop lets that happen: the Stop hook judges only the step `plan:next` marked, and the first step passes trivially. Plans need the hook to block while unverified steps remain, or a skill that drives the loop.
 
-## What this means for the framework
-
-- Merging `@guren/core` and `@guren/server` stays on hold. The name confusion it would remove shows up only without the harness. The remaining cost is guidance loaded at session start, so the levers are the digest and how much guidance loads up front.
-- 22 findings about Guren, most found while writing the tickets. The main ones:
-  - Harness: the digest said nothing about API tokens or rate limits; hooks failed after an agent ran `cd`.
-  - CLI checks: `guren audit` missed a missing authorization on models with a policy.
-  - ORM and API: `where('publishedAt', 'is null')` compared against a string; an unauthenticated agent-tool call counted as success.
-  - Plans: no element for a console command and the like, and the Stop hook gap above.
-- Ten of them are fixed and released in v2.27.0.
-
 ## Caveats
 
 - One runner: headless Claude Code with project settings only. Rails' numbers are on another scale.
