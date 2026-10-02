@@ -155,15 +155,11 @@ Guren's implementation plans are a factory in DHH's sense: a human approves a pl
 ## Caveats
 
 - One runner: headless Claude Code with project settings only. Rails' numbers are on another scale.
-- Re-run: the first production run had auto memory on, and later cells read notes earlier cells wrote. Opus 5.5, Haiku 4.5 and Fable 5.1 were run again with it off; the earlier run stays in the repository's history.
-- Sonnet 5.5 for Sonnet 5: Sonnet 5.5 came out after that run and replaced Sonnet 5 in both parts. It costs the same per token.
-- Training data: Sonnet 5.5, Opus 5.5 and Fable 5.1 may have seen Guren from before the v2 used here.
 - N=3: 27 runs per model and condition in Part B (9 for plans), three per arm in Part A. Ranges overlap; directions fit the proposed mechanisms but do not establish an effect.
 - Self-authored tickets that pin their contract, which makes them easier than open tickets.
 - Part A and Part B differ in small runner settings, so their absolute costs are not comparable.
 - Hooks fired: unlike round 1, the session-start, after-edit and Stop hooks ran in every shipped cell. The Stop hook (`guren gate`) blocked three Sonnet stops and one Haiku stop.
 - Opus 5.5 is not Opus 5, which round 1 and Rails' Stage 2 used.
-- Fable 5.1 costs $5.42–6.27 per cell, about 4.2× Opus 5.5. In the set-aside run it cost $3.51–4.01 at the same per-token price; Opus barely moved and Haiku passed more (41%, 56%). Why Fable did more work this time is not established.
 - Saturation: on these tickets the top models pass everything; telling them apart needs harder tickets.
 
 ## Summary
