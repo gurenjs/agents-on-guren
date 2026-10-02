@@ -119,11 +119,11 @@ Round 1's 20 atomic tasks saturated for Sonnet and Opus (58–60 of 60 either wa
 - posts-agent-tool, the closest ticket to DHH's CLI claim (two routes exposed as agent tools over MCP): Sonnet, Opus and Fable pass every cell, Haiku none.
 - Saturation: as in Rails' Stage 1, the top models pass everything (Opus and Fable 100%, Sonnet 96–100%). Here the harness shows up in effort, not pass rate. Rails' 35% is not comparable: another runner, a larger app, and our tickets pin their contract.
 
-### Idiom
+### Did agents use the framework?
 
-Rails counted wheel reinvention in Stage 1. The same column here, over passing cells:
+For each passing run, we checked whether the agent used the framework feature the ticket calls for (attachments, rate limiting and so on) or wrote the same thing by hand. Rails calls the latter reinventing the wheel.
 
-| model | condition | passing | framework API only | mixed | hand-rolled |
+| model | condition | passing | used the feature | both | hand-rolled |
 |---|---|---|---|---|---|
 | Sonnet 5.5 | bare | 26 | 13 | 10 | 3 |
 | Sonnet 5.5 | shipped | 27 | 15 | 9 | 3 |
@@ -135,8 +135,8 @@ Rails counted wheel reinvention in Stage 1. The same column here, over passing c
 | Fable 5.1 | shipped | 27 | 21 | 6 | 0 |
 
 - Hand-rolled patches are rare: all six are Sonnet's cover-attachment, writing files by hand instead of using attachments.
-- The harness barely moves the column (framework-only 22 → 20 for Opus, 19 → 21 for Fable, 13 → 15 for Sonnet).
-- It is a coarse scan: one marker makes a patch "mixed", and some fire on code the ticket asks for (`new Response(null, { status: 204 })` on endpoints pinned as 204; a required `Retry-After` header set inside the framework rate limiter's callback).
+- The harness barely moves this (used the feature: 22 → 20 for Opus, 19 → 21 for Fable, 13 → 15 for Sonnet).
+- It is a coarse scan: one hand-rolled-looking line makes a patch "both", and some fire on code the ticket asks for (`new Response(null, { status: 204 })` on endpoints pinned as 204; a required `Retry-After` header set inside the framework rate limiter's callback).
 
 ## Plans: the loop the agents did not run
 
