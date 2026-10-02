@@ -226,11 +226,3 @@ bunx create-guren-app my-app --agents claude
 ドキュメントや、エージェントと一緒にアプリを作るコースはguren.devにあります。
 
 https://guren.dev
-
-今回の課題一式(課題文、隠しテスト、模範解答、計画)、実行スクリプト、225セル分の結果はリポジトリで公開しています。全ログはリリースv2026.09.30に添付しました。
-
-https://github.com/gurenjs/agents-on-guren
-
-Part Aのスクリプトとログは、framework-comparisonのリポジトリにあります。英語版のレポートはguren.devに掲載しています。
-
-https://guren.dev/blog/agents-on-guren-round-2
