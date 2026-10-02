@@ -24,7 +24,7 @@ https://www.youtube.com/watch?v=vDjW_dRyKXY
 - 設定より規約は、トークン効率につながる
 - アプリには、利用者のエージェントが使えるCLIを付けるべき
 
-Gurenは、筆者が開発しているBun向けのフルスタックフレームワークです。Gurenとハーネス(エージェント向けの設定一式)、計測の方法は、8月の第1弾で紹介しました。
+Gurenは、筆者が開発しているBun向けのフルスタックフレームワークです。Gurenとハーネス(エージェント向けの設定一式)、計測の方法は、8月に実施した第1弾で紹介しました。
 
 https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 
@@ -36,6 +36,8 @@ https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 ## 1. Part A: GurenとHonoの実装コスト比較
 
 ### 計測方法
+
+Gurenは、Honoの上に作ったフレームワークです。そのため、この比較ではGurenの層がエージェントのコストをどれだけ増やすかを見ています。
 
 小さなブログに、タグ機能を足すタスクです。スキーマ、フォーム、表示、`?tag=`の絞り込み、検証、テストまで含みます。typecheck、アプリのテスト、隠しHTTPスモークがすべて通れば合格です。
 

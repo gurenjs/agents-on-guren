@@ -17,6 +17,8 @@ Two weeks later, in his Rails World [keynote](https://www.youtube.com/watch?v=vD
 
 ## Part A: the same feature on Guren and on plain Hono
 
+Guren is built on Hono, so this measures what Guren's layer adds to an agent's cost.
+
 The task, from [framework-comparison](https://github.com/gurenjs/framework-comparison): add tags to a small blog (schema, forms, display, a `?tag=` filter, validation, tests). A cell passes typecheck, the app's tests and a hidden HTTP smoke of the filter. In July, with Sonnet 5 on a non-isolated runner, Guren cost 1.65× Hono.
 
 This round:
