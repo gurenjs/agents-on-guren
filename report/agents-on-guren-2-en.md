@@ -12,14 +12,16 @@ Two weeks later, in his Rails World [keynote](https://www.youtube.com/watch?v=vD
 
 [Guren](https://guren.dev) is our full-stack framework for Bun. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report), from August, introduced it, its agent harness (the guidance, hooks and skills `guren agent:init` installs) and the method. This one covers what changed since and two new sets of results:
 
-- Part A (21 cells): one feature built on Guren and on plain Hono.
+- Part A (21 cells): the cost of adding one feature to the same blog app on Guren and on Hono.
 - Part B (225 cells): nine product tickets on a Guren blog, four models, with and without the harness, plus a small experiment with approved implementation plans.
 
-## Part A: the same feature on Guren and on plain Hono
+## Part A: the same feature on Guren and on Hono
 
-Guren is built on Hono, so this measures what Guren's layer adds to an agent's cost.
+[framework-comparison](https://github.com/gurenjs/framework-comparison) implements one small blog spec on several frameworks: login, posts, comments, validation, a notification and tests. Part A asks an agent to add tags to the Guren and Hono implementations: a new table and migration, React forms and display, a `?tag=` filter, validation and tests. A cell passes typecheck, the app's tests and a hidden HTTP smoke of the filter.
 
-The task, from [framework-comparison](https://github.com/gurenjs/framework-comparison): add tags to a small blog (schema, forms, display, a `?tag=` filter, validation, tests). A cell passes typecheck, the app's tests and a hidden HTTP smoke of the filter. In July, with Sonnet 5 on a non-isolated runner, Guren cost 1.65× Hono.
+The Hono implementation is Hono, Drizzle and a React SPA wired together by hand. Guren is built on the same three, so this measures what Guren's conventions add to an agent's cost.
+
+The task adds a feature to a finished app; it does not include building the app. In the same repository's measurement, the whole app took 632 handwritten lines on Guren and 977 on Hono. In July, with Sonnet 5 on a non-isolated runner, Guren cost 1.65× Hono.
 
 This round:
 
@@ -168,7 +170,7 @@ Guren's implementation plans are a factory in DHH's sense: a human approves a pl
 - Almost every passing patch used features Guren already has. Only six wrote the feature by hand.
 - The harness cut Opus's and Fable's turns by 21–27%.
 - The ticket that exposes app routes to agents as MCP tools passed in every run of the top three models.
-- Conventions on top of Hono cost 1.26× plain Hono with the released harness, in the same number of turns. The difference is guidance loaded at session start.
+- Adding a feature to a finished app costs 1.26× the hand-wired Hono stack with the released harness, in the same number of turns. The difference is guidance loaded at session start. Building the app itself takes about a third fewer handwritten lines on Guren.
 - Given an approved plan, no agent went step by step. That loop is still to fix.
 - The round turned up 22 findings about Guren; ten are fixed and released.
 
