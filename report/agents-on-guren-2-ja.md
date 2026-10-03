@@ -14,7 +14,7 @@ https://www.youtube.com/watch?v=vDjW_dRyKXY
 
 ただ、Railsの規約は、モデルが学習データで何度も見ているものです。モデルがよく知らない規約でも、同じことが言えるのでしょうか。
 
-Gurenは、筆者が開発しているBun向けのフルスタックフレームワークです。Laravel風の規約を持ちますが、まだ新しいので、モデルはほとんど知りません。そこで、規約はガイダンス(CLAUDE.mdやrulesなど、エージェント向けの説明一式)で教えています。第1弾では、ガイダンスの有無でエージェントの手数が変わることを紹介しました。
+Gurenは、筆者が開発しているBun向けのフルスタックフレームワークです。Hono、Drizzle、Reactの上に、Laravel風の規約を載せています。まだ新しいので、モデルはこの規約をほとんど知りません。そこで、規約はガイダンス(CLAUDE.mdやrulesなど、エージェント向けの説明一式)で教えています。第1弾では、ガイダンスの有無でエージェントの手数が変わることを紹介しました。
 
 https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 
@@ -27,13 +27,15 @@ https://zenn.dev/7nohe/articles/agents-on-guren-benchmark
 
 ### 計測方法
 
+GurenはHonoの上に作ったフレームワークです。そこで、規約のないHonoの構成と比べれば、規約を教えるコストだけを取り出せると考えました。
+
 framework-comparisonリポジトリには、同じ仕様の小さなブログが、複数のフレームワークで実装されています。ログイン、投稿、コメント、検証、テストまでそろったアプリです。
 
 https://github.com/gurenjs/framework-comparison
 
 このアプリにタグ機能を足すタスクを、GurenとHonoの実装に解かせました。DBのテーブル追加とマイグレーション、Reactのフォームと表示、`?tag=`の絞り込み、検証、テストまで含みます。typecheck、アプリのテスト、隠しHTTPスモークがすべて通れば合格です。
 
-Honoの実装は、Hono、Drizzle、ReactのSPAを手で組み合わせた構成です。GurenもHono、Drizzle、Reactの上に作っているので、違いはGurenの規約だけになります。
+Honoの実装は、Hono、Drizzle、ReactのSPAを手で組み合わせた構成です。土台の部品はGurenと同じなので、違いはGurenの規約だけになります。
 
 ### 結果
 

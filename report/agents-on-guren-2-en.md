@@ -6,16 +6,18 @@ In his Rails World 2026 [keynote](https://www.youtube.com/watch?v=vDjW_dRyKXY), 
 
 Rails' conventions, though, are ones models have seen many times in training. Does the claim hold for conventions a model barely knows?
 
-[Guren](https://guren.dev) is our full-stack framework for Bun, with Laravel-style conventions. It is new enough that models know little of it, so we teach its conventions through guidance: CLAUDE.md, rules and the other files an agent reads. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that guidance changes how much work an agent does. This one asks two questions:
+[Guren](https://guren.dev) is our full-stack framework for Bun: Laravel-style conventions on top of Hono, Drizzle and React. It is new enough that models know little of it, so we teach its conventions through guidance: CLAUDE.md, rules and the other files an agent reads. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that guidance changes how much work an agent does. This one asks two questions:
 
 - What does teaching an unfamiliar convention cost?
 - Do agents actually use the conventions they are taught?
 
 ## What teaching a convention costs
 
+Guren is built on Hono, so comparing it with a Hono stack that has no conventions isolates what teaching the conventions costs.
+
 [framework-comparison](https://github.com/gurenjs/framework-comparison) implements one small blog spec on several frameworks: login, posts, comments, validation and tests. We asked an agent to add tags to the Guren and Hono implementations: a new table and migration, React forms and display, a `?tag=` filter, validation and tests. A run passes typecheck, the app's tests and a hidden HTTP check of the filter.
 
-The Hono implementation is Hono, Drizzle and a React SPA wired together by hand. Guren is built on the same three, so the only difference is Guren's conventions.
+The Hono implementation is Hono, Drizzle and a React SPA wired together by hand. The parts underneath are Guren's own, so the only difference is Guren's conventions.
 
 | setup | model | turns | cost | vs Hono |
 |---|---|---|---|---|
