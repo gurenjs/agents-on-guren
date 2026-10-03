@@ -45,21 +45,13 @@ We wrote nine feature tickets for a fresh Guren blog, each as a product owner's 
 - Guidance cut turns by 11–27% for every model. Cost fell where sessions are long (Opus, Fable).
 - Of 181 passing runs, 175 used Guren's own features for the job (attachments, rate limiting, policies and so on). Six wrote one by hand, all of them the same file upload in Sonnet runs.
 
-## What we fixed
-
-Writing and running these tickets turned up 22 problems in Guren. Ten are fixed and shipped in v2.27.0 (cli 2.28.0, server 2.27.0, core 1.22.0, orm 2.13.0):
-
-- Agent guidance: rules load only for the files they cover ([#1056](https://github.com/gurenjs/guren/pull/1056)); the API digest covers API tokens, bearer auth and rate limits ([#1074](https://github.com/gurenjs/guren/pull/1074)); the Claude Code hooks no longer fail after an agent runs `cd` ([#1085](https://github.com/gurenjs/guren/pull/1085)).
-- Checks: `guren audit` warns when a mutating action skips a model's policy ([#1054](https://github.com/gurenjs/guren/pull/1054)); `guren check --arch` resolves directory imports ([#1071](https://github.com/gurenjs/guren/pull/1071)); the introspection child process ends with the CLI ([#1084](https://github.com/gurenjs/guren/pull/1084)).
-- Runtime: `where(field, 'is null')` is refused instead of comparing against the string ([#1080](https://github.com/gurenjs/guren/pull/1080)); the database API token store handles SQLite timestamps ([#1065](https://github.com/gurenjs/guren/pull/1065)); an unauthenticated agent tool call gets a JSON refusal instead of a login redirect ([#1073](https://github.com/gurenjs/guren/pull/1073)); generated `data.gen.ts` no longer declares a name twice ([#1064](https://github.com/gurenjs/guren/pull/1064)).
-
 ## What's next
 
-We also gave Sonnet 5.5 approved implementation plans for three tickets. All nine runs passed, but none followed the plan step by step: agents read the plan and implemented it in one go. The Stop hook checks only the step `plan:next` handed out, so it never stopped them. We plan to make it hold while unverified steps remain, and to work through the remaining problems from this round.
+We also gave Sonnet 5.5 approved implementation plans for three tickets. All nine runs passed, but none followed the plan step by step: agents read the plan and implemented it in one go. The Stop hook checks only the step `plan:next` handed out, so it never stopped them. We plan to make it hold while unverified steps remain.
 
 ## Update your app
 
-To pick up the smaller guidance and the fixes, upgrade the `@guren/*` packages and refresh the harness:
+To pick up the smaller guidance, upgrade the `@guren/*` packages and refresh the harness:
 
 ```bash
 bunx guren agent:sync
