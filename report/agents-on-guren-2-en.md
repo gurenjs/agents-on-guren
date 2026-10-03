@@ -1,142 +1,80 @@
-# Agents on Guren, round 2: is convention token-efficient when the model doesn't know it?
+# Agents on Guren, round 2: teaching agents a framework they have never seen
 
 *guren.dev, 2026-10-01.*
 
-In his Rails World 2026 [keynote](https://www.youtube.com/watch?v=vDjW_dRyKXY), DHH said that convention over configuration [pays off as token efficiency](https://youtu.be/vDjW_dRyKXY?t=1984).
+At Rails World 2026, DHH said that convention over configuration [pays off as token efficiency](https://youtu.be/vDjW_dRyKXY?t=1984). Rails can count on models knowing its conventions from training. Guren cannot: it is new, and no model has seen much of it. Every Guren app that works with an agent depends on the guidance we ship (the CLAUDE.md, rules and skills that `create-guren-app --agents claude` and `guren agent:init` install) to teach those conventions.
 
-Rails' conventions, though, are ones models have seen many times in training. Does the claim hold for conventions a model barely knows?
+[The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that this guidance cuts an agent's work by about a quarter. This round asks two harder questions:
 
-[Guren](https://guren.dev) is our full-stack framework for Bun: Laravel-style conventions on top of Hono, Drizzle and React. It is new enough that models know little of it, so we teach its conventions through guidance: CLAUDE.md, rules, skills and the other files an agent reads. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that guidance changes how much work an agent does. This one asks two questions:
+- What does teaching our conventions cost, compared with a stack that has none?
+- On feature-size tickets, do agents actually use what we teach?
 
-- What does teaching an unfamiliar convention cost?
-- Do agents actually use the conventions they are taught?
+## What teaching costs
 
-## What teaching a convention costs
-
-Guren is built on Hono, so comparing it with a Hono stack that has no conventions isolates what teaching the conventions costs.
-
-[framework-comparison](https://github.com/gurenjs/framework-comparison) implements one small blog spec on several frameworks: login, posts, comments, validation and tests. We asked an agent to add tags to the Guren and Hono implementations: a new table and migration, React forms and display, a `?tag=` filter, validation and tests. A run passes typecheck, the app's tests and a hidden HTTP check of the filter.
-
-The Hono implementation is Hono, Drizzle and a React SPA wired together by hand. The parts underneath are Guren's own, so the only difference is Guren's conventions.
-
-A Guren app lists posts like this. The controller lives in `app/Http/Controllers`, validates the query with `validateQuery()`, fetches a page with the model's `paginate()`, wraps it with `paginate()` from `@guren/core` for page links, and hands it to an Inertia page (`app/Http/Controllers/PostController.ts`):
-
-```ts
-export default class PostController extends Controller {
-  async index() {
-    const { page } = this.validateQuery(ListPostsQuerySchema)
-    const result = await Post.paginate({ page, perPage: 10, orderBy: ['createdAt', 'desc'] })
-    const paginator = paginate(result, { path: this.request.path ?? '/posts' })
-
-    return this.inertia(pages.posts.Index, {
-      data: result.data.map((post) => new PostResource(post).toJSON()),
-      pagination: { meta: paginator.meta(), links: paginator.links() },
-    })
-  }
-}
-```
-
-The guidance teaches this in its rule files. On pagination, `.claude/rules/orm-models.md` says:
-
-```md
-For Inertia/HTTP pagination links wrap it with `paginate` from `@guren/core`:
-`paginate(result, { path?, query?, fragment? })` — those three fields are `PaginatorOptions`.
-```
-
-Without guidance the agent has to find this in type definitions. In two of three runs without it, the agent did exactly that, reading through declarations to find how `paginate()` takes its options.
+Guren is built on Hono, Drizzle and React, so the fairest baseline is those three wired together by hand. [framework-comparison](https://github.com/gurenjs/framework-comparison) has the same small blog (login, posts, comments, validation, tests) implemented both ways. We asked an agent to add tags to each: a new table and migration, React forms and display, a `?tag=` filter, validation and tests.
 
 | setup | model | turns | cost | vs Hono |
 |---|---|---|---|---|
-| Hono | Sonnet 5.5 | 40 | $0.41 | 1.00× |
+| Hono, Drizzle, React by hand | Sonnet 5.5 | 40 | $0.41 | 1.00× |
 | Guren, no guidance | Sonnet 5.5 | 51 | $0.63 | 1.54× |
-| Guren, guidance (25.5k tokens) | Sonnet 5.5 | 38 | $0.57 | 1.40× |
-| Guren, trimmed guidance (7.1k tokens) | Sonnet 5.5 | 38 | $0.52 | 1.26× |
-| Hono | Opus 5.5 | 40 | $0.88 | 1.00× |
-| Guren, guidance (25.5k tokens) | Opus 5.5 | 40 | $1.32 | 1.49× |
+| Guren, guidance in cli 2.27 (25.5k tokens) | Sonnet 5.5 | 38 | $0.57 | 1.40× |
+| Guren, guidance in cli 2.28 (7.1k tokens) | Sonnet 5.5 | 38 | $0.52 | 1.26× |
+| Hono, Drizzle, React by hand | Opus 5.5 | 40 | $0.88 | 1.00× |
+| Guren, guidance in cli 2.27 | Opus 5.5 | 40 | $1.32 | 1.49× |
 
-Medians of three runs; cost is API-equivalent, as the CLI reports it.
+Medians of three runs; cost is API-equivalent, as Claude Code reports it.
 
-- Without guidance, Guren takes the most turns, partly spent finding which package exports a function.
-- With guidance, Guren takes as many turns as Hono. Taught the conventions, the agent does not hesitate.
-- It still costs 1.26–1.49× Hono.
+With guidance, an agent on Guren takes as many turns as on the hand-wired stack. It still costs more, and the logs show why. With the cli 2.27 guidance, all of the difference is the guidance itself, which is re-read on every model call; the implementation work cost slightly less than on Hono.
 
-Where the difference comes from, splitting each Sonnet 5.5 run's actions by kind (an attribution from the logs, not a direct measurement):
+That makes the size of what always loads the thing to optimize. In cli 2.28, rules load only when the agent touches the files they cover, and the guidance at session start fell from 25.5k to 7.1k tokens. With the cli 2.28 harness as a whole, the gap to Hono is 1.26×.
 
-| setup | gap to Hono | reading guidance | implementation | other |
-|---|---|---|---|---|
-| Guren, no guidance | $0.220 | $0.109 | $0.093 | $0.017 |
-| Guren, guidance (25.5k) | $0.167 | $0.179 | −$0.012 | $0.001 |
-| Guren, trimmed guidance (7.1k) | $0.135 | $0.074 | $0.028 | $0.033 |
+This compares adding one feature to a finished app. It leaves out what Guren takes on before that: Inertia between server and React, generated types for pages and routes, validation errors returned to forms, policies, jobs, and security defaults such as security headers and session-bound CSRF tokens. The hand-wired stack writes most of these itself or settles for a simpler version.
 
-"Reading guidance" includes reading type definitions under `node_modules`. A negative value means Guren spent less than Hono.
+## Do agents use what we teach?
 
-- With guidance, the whole gap is reading guidance. The implementation itself costs slightly less than on Hono.
-- Guidance is re-read on every model call: 25.5k tokens of it cost $0.17–0.19 per run.
-- Trimmed to 7.1k tokens, the gap shrinks to $0.135.
+We wrote nine feature tickets for a fresh Guren blog, each as a product owner's request that names no API: tags, comment moderation, post revisions, scheduled publishing, personal API tokens with rate limiting, a Japanese locale, a newsletter module, posts as MCP agent tools, and cover images. Four models ran each ticket three times with and without guidance; a run passes when 84 hidden tests and typecheck pass.
 
-This is the cost of adding one feature to a finished app. It does not show how much more of the app's foundation the framework takes on.
-
-## Do agents use the conventions they are taught?
-
-Nine feature tickets on a Guren blog, each written as a product owner's request that names no API. Four models, with and without guidance, three runs each. A run passes when its hidden tests (84 in all) and typecheck pass.
-
-| ticket | what it asks for |
-|---|---|
-| post-tags | tags on posts, a `?tag=` filter, at most five per post |
-| comments-moderation | comments; author or post author may delete; three reports hide a comment |
-| post-revisions | a revision per edit, list and restore, author only |
-| scheduled-publish | publish later, hidden until then, a command listing the schedule |
-| json-api-tokens | personal API tokens, a bearer JSON API, 60 requests per minute per token |
-| locale-switch | Japanese, a persisted language switch |
-| newsletter-module | a newsletter sign-up as a separate module |
-| posts-agent-tool | search and create posts as agent tools over MCP |
-| cover-attachment | a cover image, PNG or JPEG up to 2 MB, replace and remove |
-
-| model | pass (none → guidance) | turns | cost |
+| model | pass (no guidance → guidance) | turns | cost |
 |---|---|---|---|
 | Sonnet 5.5 | 26/27 → 27/27 | 37 → 29 (−22%) | $0.57 → $0.61 |
 | Opus 5.5 | 27/27 → 27/27 | 59 → 43 (−27%) | $1.51 → $1.29 |
 | Haiku 4.5 | 8/27 → 12/27 | 90 → 80 (−11%) | $0.79 → $0.89 |
 | Fable 5.1 | 27/27 → 27/27 | 99 → 78 (−21%) | $6.27 → $5.42 |
 
-- Opus, Fable and Sonnet with guidance passed every ticket, on a framework they barely know.
-- Guidance cut turns by 11–27% for every model.
-- Cost fell for Opus and Fable, whose sessions are long. Sonnet's barely moved and Haiku's rose.
-- Only Haiku's pass rate moved (30% to 44%).
+- Opus 5.5, Fable 5.1 and Sonnet 5.5 with guidance passed every ticket.
+- Guidance cut turns by 11–27% for every model. Cost fell where sessions are long (Opus, Fable).
+- Of 181 passing runs, 175 used Guren's own features for the job (attachments, rate limiting, policies and so on). Six wrote one by hand, all of them the same file upload in Sonnet runs.
 
-Of the 181 passing runs, only six wrote by hand something Guren already provides (attachments, rate limiting and so on). The other 175 used Guren's features.
+## What we fixed
 
-- That held without guidance too: agents found the features on their own.
-- Going by the breakdown above, what guidance saves is the search for them, which is where the turns go.
+Writing and running these tickets turned up 22 problems in Guren. Ten are fixed and shipped in v2.27.0 (cli 2.28.0, server 2.27.0, core 1.22.0, orm 2.13.0):
 
-## For anyone writing a CLAUDE.md
+- Agent guidance: rules load only for the files they cover ([#1056](https://github.com/gurenjs/guren/pull/1056)); the API digest covers API tokens, bearer auth and rate limits ([#1074](https://github.com/gurenjs/guren/pull/1074)); the Claude Code hooks no longer fail after an agent runs `cd` ([#1085](https://github.com/gurenjs/guren/pull/1085)).
+- Checks: `guren audit` warns when a mutating action skips a model's policy ([#1054](https://github.com/gurenjs/guren/pull/1054)); `guren check --arch` resolves directory imports ([#1071](https://github.com/gurenjs/guren/pull/1071)); the introspection child process ends with the CLI ([#1084](https://github.com/gurenjs/guren/pull/1084)).
+- Runtime: `where(field, 'is null')` is refused instead of comparing against the string ([#1080](https://github.com/gurenjs/guren/pull/1080)); the database API token store handles SQLite timestamps ([#1065](https://github.com/gurenjs/guren/pull/1065)); an unauthenticated agent tool call gets a JSON refusal instead of a login redirect ([#1073](https://github.com/gurenjs/guren/pull/1073)); generated `data.gen.ts` no longer declares a name twice ([#1064](https://github.com/gurenjs/guren/pull/1064)).
 
-The same pattern likely applies to teaching an agent your own project's conventions.
+## What's next
 
-- Guidance is a fixed cost paid on every call. Its size is its cost, so keep what always loads small.
-- Its payoff is in turns. Here, longer sessions also saw lower cost, so long tasks seem to earn the fixed cost back.
-- For the top models, guidance did not change whether a ticket passed. It changed how much work it took.
-- Agents found the framework's features without guidance. What guidance should carry is what saves the search.
+We also gave Sonnet 5.5 approved implementation plans for three tickets. All nine runs passed, but none followed the plan step by step: agents read the plan and implemented it in one go. The Stop hook checks only the step `plan:next` handed out, so it never stopped them. We plan to make it hold while unverified steps remain, and to work through the remaining problems from this round.
 
-## Caveats
+## Update your app
 
-- One runner: headless Claude Code.
-- Three runs per condition: enough to see a direction, not to establish an effect.
-- We wrote the tickets and pinned their specs, which makes them easier than real ones.
-- The two experiments used slightly different runner settings, so their dollar figures are not comparable.
-- This is not a measurement on Rails, so it says nothing about how much Rails' own conventions help.
+To pick up the smaller guidance and the fixes, upgrade the `@guren/*` packages and refresh the harness:
 
-## Summary
+```bash
+bunx guren agent:sync
+```
 
-- Convention pays off as token efficiency when the model knows the convention.
-- An unfamiliar convention can be taught, and agents use it: the top models passed all nine feature tickets, almost always through the framework's own features.
-- Teaching costs tokens on every call. Adding a feature cost 1.26–1.49× Hono.
-- The less guidance always loads, the smaller that cost.
-
-Guren takes on much of an app's foundation out of the box: Inertia to connect server and frontend, generated types, validation errors returned to forms, policies for authorization, jobs, and security defaults such as security headers. The Hono stack in this comparison wrote most of these by hand or settled for a simpler version. In this round, agents built all nine tickets with Guren's features. Give it a try: scaffold an app with the agent guidance (CLAUDE.md, rules, skills and hooks) included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
+New apps get it from the start:
 
 ```bash
 bunx create-guren-app my-app --agents claude
 ```
+
+## Caveats
+
+- One runner (headless Claude Code) and three runs per condition: enough to see a direction, not to settle an effect.
+- We wrote the tickets and pinned their specs, which makes them easier than real ones.
+- The two experiments used slightly different runner settings, so their dollar figures are not comparable.
 
 The tickets, hidden tests, harness and per-run results are in [agents-on-guren](https://github.com/gurenjs/agents-on-guren), with the full logs on its [v2026.09.30 release](https://github.com/gurenjs/agents-on-guren/releases/tag/v2026.09.30). The Guren and Hono comparison lives in [framework-comparison](https://github.com/gurenjs/framework-comparison) under `agent-eval/`.
