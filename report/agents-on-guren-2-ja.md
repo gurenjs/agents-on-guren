@@ -37,6 +37,34 @@ https://github.com/gurenjs/framework-comparison
 
 Honoの実装は、Hono、Drizzle、ReactのSPAを手で組み合わせた構成です。土台の部品はGurenと同じなので、違いはGurenの規約だけになります。
 
+### 規約とガイダンスの例
+
+たとえば、Gurenアプリの投稿一覧は次のように書きます。コントローラーは`app/Http/Controllers`に置き、クエリは`validateQuery()`で検証します。一覧はモデルの`paginate()`で取り出し、`@guren/core`の`paginate()`でページ送りのリンクを付けて、Inertiaのページに渡します。
+
+```ts:app/Http/Controllers/PostController.ts
+export default class PostController extends Controller {
+  async index() {
+    const { page } = this.validateQuery(ListPostsQuerySchema)
+    const result = await Post.paginate({ page, perPage: 10, orderBy: ['createdAt', 'desc'] })
+    const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+
+    return this.inertia(pages.posts.Index, {
+      data: result.data.map((post) => new PostResource(post).toJSON()),
+      pagination: { meta: paginator.meta(), links: paginator.links() },
+    })
+  }
+}
+```
+
+この書き方は、ガイダンスのルールファイルで教えています。たとえばページ送りについては、次のように書いてあります。
+
+```md:.claude/rules/orm-models.md(抜粋)
+For Inertia/HTTP pagination links wrap it with `paginate` from `@guren/core`:
+`paginate(result, { path?, query?, fragment? })` — those three fields are `PaginatorOptions`.
+```
+
+ガイダンスがないと、エージェントはこうした書き方を型定義から探すことになります。実際、ガイダンスなしの3回中2回は、この`paginate()`の使い方を探して型定義を読み回っていました。
+
 ### 結果
 
 | 構成 | モデル | ターン | コスト | Hono比 |

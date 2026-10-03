@@ -19,6 +19,32 @@ Guren is built on Hono, so comparing it with a Hono stack that has no convention
 
 The Hono implementation is Hono, Drizzle and a React SPA wired together by hand. The parts underneath are Guren's own, so the only difference is Guren's conventions.
 
+A Guren app lists posts like this. The controller lives in `app/Http/Controllers`, validates the query with `validateQuery()`, fetches a page with the model's `paginate()`, wraps it with `paginate()` from `@guren/core` for page links, and hands it to an Inertia page (`app/Http/Controllers/PostController.ts`):
+
+```ts
+export default class PostController extends Controller {
+  async index() {
+    const { page } = this.validateQuery(ListPostsQuerySchema)
+    const result = await Post.paginate({ page, perPage: 10, orderBy: ['createdAt', 'desc'] })
+    const paginator = paginate(result, { path: this.request.path ?? '/posts' })
+
+    return this.inertia(pages.posts.Index, {
+      data: result.data.map((post) => new PostResource(post).toJSON()),
+      pagination: { meta: paginator.meta(), links: paginator.links() },
+    })
+  }
+}
+```
+
+The guidance teaches this in its rule files. On pagination, `.claude/rules/orm-models.md` says:
+
+```md
+For Inertia/HTTP pagination links wrap it with `paginate` from `@guren/core`:
+`paginate(result, { path?, query?, fragment? })` — those three fields are `PaginatorOptions`.
+```
+
+Without guidance the agent has to find this in type definitions. In two of three runs without it, the agent did exactly that, reading through declarations to find how `paginate()` takes its options.
+
 | setup | model | turns | cost | vs Hono |
 |---|---|---|---|---|
 | Hono | Sonnet 5.5 | 40 | $0.41 | 1.00× |
