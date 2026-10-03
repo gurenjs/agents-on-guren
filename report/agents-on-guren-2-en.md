@@ -74,7 +74,7 @@ Where the difference comes from, splitting each Sonnet 5.5 run's actions by kind
 - Guidance is re-read on every model call: 25.5k tokens of it cost $0.17–0.19 per run.
 - Trimmed to 7.1k tokens, the gap shrinks to $0.135.
 
-This is the cost of adding one feature to a finished app. Building the app itself took 759 handwritten lines on Guren (not counting generator output) and 977 on Hono.
+This is the cost of adding one feature to a finished app. It does not show how much more of the app's foundation the framework takes on.
 
 ## Do agents use the conventions they are taught?
 
@@ -133,7 +133,7 @@ The same pattern likely applies to teaching an agent your own project's conventi
 - Teaching costs tokens on every call. Adding a feature cost 1.26–1.49× Hono.
 - The less guidance always loads, the smaller that cost.
 
-Guren ships the features an app needs out of the box: authentication, authorization, file attachments, rate limiting, exposing routes as MCP tools and more. In this round, agents built all nine tickets with them, and the app itself takes about a fifth fewer handwritten lines than Hono and React wired by hand. Give it a try: scaffold an app with the agent guidance (CLAUDE.md, rules, skills and hooks) included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
+Guren takes on much of an app's foundation out of the box: Inertia to connect server and frontend, generated types, validation errors returned to forms, policies for authorization, jobs, and security defaults such as security headers. The Hono stack in this comparison wrote most of these by hand or settled for a simpler version. In this round, agents built all nine tickets with Guren's features. Give it a try: scaffold an app with the agent guidance (CLAUDE.md, rules, skills and hooks) included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
 
 ```bash
 bunx create-guren-app my-app --agents claude
