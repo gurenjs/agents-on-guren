@@ -187,4 +187,4 @@ bunx create-guren-app my-app --agents claude
 
 ドキュメントや、エージェントと一緒にアプリを作るコースはGuren公式サイトにあります。
 
-https://guren.dev
+https://guren.dev/?ref=zenn
