@@ -107,7 +107,7 @@ The same pattern likely applies to teaching an agent your own project's conventi
 - Teaching costs tokens on every call. Adding a feature cost 1.26–1.49× Hono.
 - The less guidance always loads, the smaller that cost.
 
-To try Guren with the agent guidance included, and for the docs and a course on building an app with an agent, see [guren.dev](https://guren.dev):
+Guren ships the features an app needs out of the box: authentication, authorization, file attachments, rate limiting, exposing routes as MCP tools and more. In this round, agents built all nine tickets with them, and the app itself takes about a third fewer handwritten lines than Hono and React wired by hand. Give it a try: scaffold an app with the agent guidance included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
 
 ```bash
 bunx create-guren-app my-app --agents claude
