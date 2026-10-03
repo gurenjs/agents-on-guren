@@ -6,7 +6,7 @@ In his Rails World 2026 [keynote](https://www.youtube.com/watch?v=vDjW_dRyKXY), 
 
 Rails' conventions, though, are ones models have seen many times in training. Does the claim hold for conventions a model barely knows?
 
-[Guren](https://guren.dev) is our full-stack framework for Bun: Laravel-style conventions on top of Hono, Drizzle and React. It is new enough that models know little of it, so we teach its conventions through guidance: CLAUDE.md, rules and the other files an agent reads. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that guidance changes how much work an agent does. This one asks two questions:
+[Guren](https://guren.dev) is our full-stack framework for Bun: Laravel-style conventions on top of Hono, Drizzle and React. It is new enough that models know little of it, so we teach its conventions through guidance: CLAUDE.md, rules, skills and the other files an agent reads. [The first report](https://guren.dev/blog/agents-on-guren-the-first-benchmark-report) showed that guidance changes how much work an agent does. This one asks two questions:
 
 - What does teaching an unfamiliar convention cost?
 - Do agents actually use the conventions they are taught?
@@ -107,7 +107,7 @@ The same pattern likely applies to teaching an agent your own project's conventi
 - Teaching costs tokens on every call. Adding a feature cost 1.26–1.49× Hono.
 - The less guidance always loads, the smaller that cost.
 
-Guren ships the features an app needs out of the box: authentication, authorization, file attachments, rate limiting, exposing routes as MCP tools and more. In this round, agents built all nine tickets with them, and the app itself takes about a third fewer handwritten lines than Hono and React wired by hand. Give it a try: scaffold an app with the agent guidance included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
+Guren ships the features an app needs out of the box: authentication, authorization, file attachments, rate limiting, exposing routes as MCP tools and more. In this round, agents built all nine tickets with them, and the app itself takes about a third fewer handwritten lines than Hono and React wired by hand. Give it a try: scaffold an app with the agent guidance (CLAUDE.md, rules, skills and hooks) included, and see [guren.dev](https://guren.dev) for the docs and a course on building an app with an agent.
 
 ```bash
 bunx create-guren-app my-app --agents claude
